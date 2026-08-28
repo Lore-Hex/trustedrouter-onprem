@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+.exp/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ty_cache/
+.DS_Store
+
+# Rust extension build artifacts (PoC gateway data plane).
+exp/runtime/gateway/native/target/
+
+# Local-only design notes; not committed.
+DESIGN.md
+
+demos/
+
+# baseline-grid run scratch (not artifacts)
+.exp-rebuild/
+logs/
+
+.exp-fixed/
+
+# Local per-project settings (telemetry ids etc.) — never committed, wherever the root is.
+settings.toml
+
+# Claude Code local state (skills ARE committed; local settings/locks are not).
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/projects/
+
+# wandb run directories (local mirrors of what is already on the server)
+wandb/
+
+# External clones land in the working directory, never in git.
+.tau2-bench/
+
+# Local agent scratchpads: never tracked, never in PRs (AGENTS.md, Repository layout).
+.agents/

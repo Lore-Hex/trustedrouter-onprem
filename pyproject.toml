@@ -1,0 +1,102 @@
+[project]
+name = "trustedrouter-onprem"
+version = "0.7.0"
+description = "Run an on-premises model gateway with TrustedRouter as its managed backend."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+    # Cross-platform advisory locking for durable registries edited in place. Declared directly
+    # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
+    "exp-gateway-native>=0.3.0,<0.4",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
+    "filelock>=3.12",
+    "typer>=0.16",
+    "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
+    "pydantic>=2.6",
+    "numpy>=1.26",
+    "httpx>=0.27",
+    "rich>=14.1",
+    "tomli-w>=1.0",  # writing project and telemetry TOML; every `exp build` needs it
+    "posthog>=7.0",
+    # Public router request and response types follow the official OpenAI-generated schemas.
+    "openai>=3.0,<4",
+    # Bedrock uses the official AWS runtime client. Imports stay lazy inside the Bedrock adapter.
+    "boto3>=1.35,<2",
+    "botocore>=1.35,<2",
+    # Vertex mints OAuth tokens from service-account JSON through Google's official credential
+    # library. Imports stay lazy inside the Vertex adapter, mirroring the Bedrock boundary.
+    "google-auth>=2.35,<3",
+]
+
+[project.optional-dependencies]
+# Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
+sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
+dev = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.8",
+    "ruff>=0.5",
+    "ty>=0.0.1a1",
+    "trustedrouter-onprem[sft]",
+    # Builds the optional Rust gateway data-plane extension (exp_gateway_native).
+    "maturin>=1.7,<2",
+]
+
+[project.scripts]
+tr-onprem = "exp.cli:main"
+trustedrouter-onprem = "exp.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["exp"]
+# Test-only code is named for pytest discovery, and `exp/conftest.py` is a pytest fixture module.
+# The Rust crate's local build artifacts never enter the wheel; its sources do,
+# as ordinary tracked package files.
+exclude = ["**/*_test.py", "exp/conftest.py", "exp/runtime/gateway/native/target"]
+
+[tool.hatch.build.targets.sdist]
+# One flagship distribution: everything importable lives under /exp.
+include = [
+    "/exp",
+    "/assets",
+    "/docs/reference/gateway-architecture.md",
+    "/docs/release-scope.md",
+    "/docs/usage.md",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/conftest.py",
+]
+exclude = ["exp/runtime/gateway/native/target"]
+
+[tool.pytest.ini_options]
+# Tests live inline next to the modules they cover (foo.py -> foo_test.py), or in a package's tests
+# directory when they cover the package as a whole.
+python_files = ["*_test.py"]
+# One root gate over the single package.
+testpaths = ["exp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
+extend-select = ["D100", "D101", "D102", "D103", "D104"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Test modules are fixtures and assertions rather than public package APIs. Production modules
+# still require a module docstring and Google-style public API documentation.
+"**/*_test.py" = ["D"]
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.uv.sources]
+# The one permitted path source (AGENTS.md "One package"): repo checkouts rebuild the
+# extension from source; published metadata keeps the normal PyPI requirement (--no-sources).
+exp-gateway-native = { path = "exp/runtime/gateway/native" }

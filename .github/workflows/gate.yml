@@ -1,0 +1,117 @@
+name: gate
+
+# Whole-repository quality, architecture, and non-live behavior gate.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: exp/runtime/gateway/native
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: Crate changes require a crate version bump
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Published wheels are immutable per version, so any change under the
+          # crate must move the crate version. GitHub's merge-base file list is
+          # authoritative and needs no local history (the checkout is shallow).
+          files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            --paginate -q '.[].filename')" || {
+            echo "could not list the pull request's files; failing closed" >&2
+            exit 1
+          }
+          changed="$(printf '%s\n' "${files}" | grep -c '^exp/runtime/gateway/native/' || true)"
+          if [ "${changed}" = "0" ]; then
+            echo "crate untouched"
+            exit 0
+          fi
+          head_version="$(grep -m1 '^version = ' exp/runtime/gateway/native/Cargo.toml)"
+          base_version="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/exp/runtime/gateway/native/Cargo.toml?ref=${GITHUB_BASE_REF}" \
+            -q .content | base64 -d | grep -m1 '^version = ')"
+          if [ "${head_version}" != "${base_version}" ]; then
+            echo "crate changed and version moved: ${base_version} -> ${head_version}"
+            exit 0
+          fi
+          echo "exp/runtime/gateway/native/ changed without moving the crate version" >&2
+          echo "(${head_version}); bump Cargo.toml and the crate pyproject together" >&2
+          echo "so the release can publish fresh wheels." >&2
+          exit 1
+      - name: cargo fmt
+        run: cargo fmt --check --manifest-path exp/runtime/gateway/native/Cargo.toml
+      - name: cargo clippy
+        run: >-
+          cargo clippy --manifest-path exp/runtime/gateway/native/Cargo.toml
+          --no-default-features -- -D warnings
+      - name: Install libpython for the crate's unit-test binary
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-dev
+      - name: cargo test
+        run: >-
+          cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml
+          --no-default-features
+      - name: Native parity tests are present, not skipped
+        run: >-
+          uv run pytest -q exp/runtime/gateway/native_bridge_test.py
+          -k "rust" -rs --no-header
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format
+        run: uv run ruff format --check .
+      - name: ty check
+        run: uv run ty check
+      - name: Tinker SDK adapter tests
+        run: >-
+          uv run pytest -q -k "not live"
+          exp/optimize/model/sft/tinker_test.py
+      - name: non-live tests
+        run: >-
+          uv run pytest -n 4 --dist worksteal -q -k "not live"
+          exp
+          --ignore=exp/optimize/model/sft/tinker_test.py
+          --ignore=exp/optimize/router/tests/composition_evidence_test.py
+          --ignore=exp/simulation/tests/comparison_evidence_test.py
+          --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
+
+  w16-darwin-evidence:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: W16 router and bounded local-process evidence
+        env:
+          EXP_RELEASE_REVISION: ${{ github.sha }}
+          EXP_RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/w17-release-evidence
+        run: >-
+          uv run pytest -q
+          --junitxml=w16-darwin-evidence.xml
+          exp/optimize/router/tests/composition_evidence_test.py
+          exp/simulation/tests/comparison_evidence_test.py
+      - name: Upload W16 Darwin evidence result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: w16-darwin-evidence
+          path: |
+            w16-darwin-evidence.xml
+            ${{ runner.temp }}/w17-release-evidence/*.json

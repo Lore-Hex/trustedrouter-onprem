@@ -1,0 +1,48 @@
+# W16 router and sandbox evidence
+
+W16 verifies the current public router workflow and the text-versus-sandbox comparison path with
+deterministic injected clients. The evidence invokes no hosted provider, E2B, Tinker, credential,
+or paid service. It does not claim provider quality or cloud-environment parity.
+
+The exact-checkout gate resolves and validates the full 40-hex Git revision, writes it into every
+persisted W16 artifact, recursively verifies manifest inputs and nested artifact envelopes, and
+uploads machine-readable JSON plus JUnit output. Symbolic or mismatched revision labels fail closed.
+
+## Router workflow
+
+`exp/optimize/router/tests/composition_evidence_test.py` drives `exp.compose_router` from 100 normalized traces.
+The build produces 50 fit tasks and 20 sealed held-out tasks. A reviewed rubric and calibration,
+two frozen candidates, one pricing snapshot, ten production overlaps, and one frozen embedder feed
+the real text `WorldModelSimulator`, W10 fit lock and held-out report, and W11 HTTP runtime.
+
+The exact deterministic run retains these denominators:
+
+- 140 planned candidate-task cells, with 10 observed fit cells and 130 simulated cells
+- 40 held-out report rows, with zero failed, not-run, or missing-cost rows
+- 140 persisted judgments under one workflow ceiling of 200
+- one shared simulation ceiling of $2.00 and exactly $0.00 observed fake-client spend
+
+Exact replay adds no model, world-model, judge, or telemetry delivery; crash-and-resume at
+both durable phase boundaries is pinned by exp/optimize/router/composition_test.py. Two HTTP turns
+with one episode ID retain one hashed episode identity and one sticky routed alias without exposing
+the raw episode ID.
+
+## Text and local process comparison
+
+`exp/simulation/tests/comparison_evidence_test.py` runs both the real text simulator and the bounded
+Darwin `LocalProcessEnvironmentRuntime` through `SandboxSimulator`. Two exact post-lock pairs are
+retained: both are paired, one is usable, and one records an explicit malformed sandbox response.
+The report therefore keeps one sandbox failure in the denominator instead of silently dropping it.
+Replay performs zero additional model, world-model, or local-process dispatches and leaves no
+workspace process directory. Terminal agreement is structural, not a task-quality judgment.
+
+Run the evidence with:
+
+```console
+uv run pytest -q exp/optimize/router/tests/composition_evidence_test.py \
+  exp/simulation/tests/comparison_evidence_test.py
+```
+
+The local process case is intentionally skipped outside Darwin because that runtime's containment
+contract is Darwin-only. Release tests separately require every public W16 owner in the wheel and
+resolve the public APIs without importing test modules.

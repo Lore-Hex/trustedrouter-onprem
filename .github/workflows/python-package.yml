@@ -1,0 +1,215 @@
+name: python package
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/python-package.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "README.md"
+      - "exp/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/python-package.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "README.md"
+      - "exp/**"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Source to build for a release replay or an exact-ref verification
+        required: true
+        type: choice
+        default: latest-release
+        options:
+          - latest-release
+          - selected-ref
+      publish:
+        description: "Publish the built distribution to PyPI"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  native-wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: linux-aarch64
+          # Cross-compiled from the arm runner; macos-13 (the last intel
+          # runner) is being retired and queues for hours.
+          - runner: macos-14
+            target: macos-x86_64
+            cargo-target: x86_64-apple-darwin
+          - runner: macos-14
+            target: macos-arm64
+          - runner: windows-latest
+            target: windows-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Resolve the latest published release
+        id: release
+        if: github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          published_tag="$(
+            gh release view --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,publishedAt,tagName \
+              --jq 'select(.isDraft == false and .publishedAt != null) | .tagName'
+          )"
+          test -n "$published_tag"
+          echo "tag=$published_tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
+      - name: Build the abi3 extension wheel
+        uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8  # v1.51.0
+        with:
+          command: build
+          args: --release --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
+          manylinux: auto
+          target: ${{ matrix.cargo-target || '' }}
+      - name: Build the extension sdist
+        if: matrix.target == 'linux-x86_64'
+        uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8  # v1.51.0
+        with:
+          command: sdist
+          args: --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
+      - uses: astral-sh/setup-uv@v6
+      - name: Smoke test the wheel on its own platform
+        # The cross-compiled intel-mac wheel cannot import on the arm runner.
+        if: matrix.cargo-target == null
+        shell: bash
+        run: |
+          uv venv --python 3.12 native-smoke
+          venv_python="native-smoke/bin/python"
+          [ -x "$venv_python" ] || venv_python="native-smoke/Scripts/python.exe"
+          uv pip install --python "$venv_python" native-dist/*.whl
+          "$venv_python" -c "import exp_gateway_native as n; assert n.__version__; assert callable(n.serve)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-dist-${{ matrix.target }}
+          path: native-dist/
+
+  build:
+    needs: native-wheels
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the latest published release
+        id: release
+        if: github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          published_tag="$(
+            gh release view --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,publishedAt,tagName \
+              --jq 'select(.isDraft == false and .publishedAt != null) | .tagName'
+          )"
+          test -n "$published_tag"
+          echo "tag=$published_tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
+      - name: Resolve the checked-out revision
+        id: source_revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@v6
+      - name: Build the TrustedRouterOnPrem distribution
+        run: uv build --package trustedrouter-onprem --no-sources
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-dist-linux-x86_64
+          path: native-dist
+      - name: Smoke test the wheel
+        run: |
+          uv venv /tmp/exp-wheel-smoke
+          uv pip install --python /tmp/exp-wheel-smoke/bin/python dist/*.whl native-dist/*.whl "openai==3.0.0"
+          cd /tmp
+          /tmp/exp-wheel-smoke/bin/python - <<'PY'
+          import exp
+          import exp.common.models
+          import exp.runtime.models
+          from exp.runtime.environments import LocalProcessEnvironmentRuntime
+          from exp.runtime.openai_protocol import completed_body, decode_chat
+          from exp.runtime.router import RouterRuntime
+          from exp.simulation import compare_text_and_sandbox
+          from exp.simulation.engines import SandboxSimulator
+          from exp.optimize.router import RouterCompositionResult
+          from exp.simulation import SimulationSpec
+
+          assert callable(exp.compose_router)
+          assert callable(exp.load_project_router)
+          assert callable(exp.load_router)
+          assert callable(decode_chat)
+          assert callable(completed_body)
+          assert exp.RouterRuntime is RouterRuntime
+          assert exp.RouterCompositionResult is RouterCompositionResult
+          assert "create_project_router_app" not in exp.__all__
+          assert callable(compare_text_and_sandbox)
+          assert SimulationSpec.__module__ == "exp.simulation.specs.simulation"
+          assert SandboxSimulator.__module__ == "exp.simulation.engines.sandbox"
+          assert LocalProcessEnvironmentRuntime.__module__ == "exp.runtime.environments.local"
+
+          import exp_gateway_native
+
+          assert exp_gateway_native.__version__
+          assert callable(exp_gateway_native.serve)
+          PY
+          /tmp/exp-wheel-smoke/bin/tr-onprem --help
+      - name: Installed-wheel no-spend release evidence
+        env:
+          PYTHONNOUSERSITE: "1"
+          TERM: xterm-256color
+          EXP_INSTALLED_RELEASE_EVIDENCE: "1"
+          EXP_RELEASE_REVISION: ${{ steps.source_revision.outputs.sha }}
+          EXP_SOURCE_CHECKOUT: ${{ github.workspace }}
+          EXP_TELEMETRY: "0"
+        run: |
+          cp exp/tests/release_test.py /tmp/exp-wheel-smoke/installed_release_evidence.py
+          cd /tmp/exp-wheel-smoke
+          ./bin/python installed_release_evidence.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+  publish:
+    if: >-
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.source == 'latest-release' &&
+      inputs.publish)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-dist-*
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI with trusted publishing
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
