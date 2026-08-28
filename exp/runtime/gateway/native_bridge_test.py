@@ -3170,3 +3170,51 @@ def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
     with pytest.raises(NativeBridgeError) as repeated:
         admit_keyed(reasoning_body("blob-one=="))
     assert json.loads(repeated.value.public_error_json)["code"] != "idempotency_conflict"
+
+
+def test_capability_rejection_names_the_unsupported_capability(tmp_path: Path) -> None:
+    """A pre-dispatch capability rejection names the exact capability.
+
+    A Responses request with instructions decodes to a developer message; a
+    route that cannot preserve developer messages must say so by name, not
+    with a flattened generic sentence, so a production 400 is triageable.
+    The message carries only the stable internal capability literal, never
+    request content.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "instructions": "Follow the sync-lane policy canary-instructions.",
+            "input": "hello canary-input",
+        }
+    )
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit_responses(control, raw_key, body)
+    payload = json.loads(raised.value.public_error_json)
+    assert payload["status_code"] == 400
+    assert payload["code"] == "unsupported_capability"
+    assert payload["error_type"] == "invalid_request_error"
+    assert "developer_messages" in payload["message"]
+    assert "canary" not in json.dumps(payload)
+
+
+def test_reasoning_context_reflects_in_the_envelope_only_when_sent() -> None:
+    """The response envelope echoes reasoning.context, and only when present,
+    so context-free bodies stay byte-identical to the committed goldens."""
+    from exp.runtime.gateway.native_responses import responses_envelope
+
+    with_context = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "reasoning": {"effort": "high", "context": "all_turns"},
+        }
+    ).request
+    assert responses_envelope(with_context)["reasoning"] == {
+        "effort": "high",
+        "summary": None,
+        "context": "all_turns",
+    }
+    without = decode_responses({"model": "coding", "input": "hi"}).request
+    assert responses_envelope(without)["reasoning"] == {"effort": None, "summary": None}
