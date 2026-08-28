@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import typer
 from rich.console import Console
+from rich.text import Text
 
 from exp.cli import auth
 from exp.cli.providers.trustedrouter import hosted_credential_binding
@@ -60,9 +61,10 @@ def test_login_uses_environment_key_without_printing_it(tmp_path: Path) -> None:
         "anthropic/claude-sonnet-4.8",
     }
     assert {record.billing_source.value for record in catalog.models.values()} == {"host_managed"}
-    assert key not in transcript.getvalue()
-    assert "Synced TrustedRouter: 2 models." in transcript.getvalue()
-    assert "Logged in to TrustedRouter." in transcript.getvalue()
+    rendered = Text.from_ansi(transcript.getvalue()).plain
+    assert key not in rendered
+    assert "Synced TrustedRouter: 2 models." in rendered
+    assert "Logged in to TrustedRouter." in rendered
 
 
 def test_login_prompts_when_environment_key_is_missing(tmp_path: Path) -> None:
