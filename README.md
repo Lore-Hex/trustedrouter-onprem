@@ -6,7 +6,7 @@
 
 TrustedRouterOnPrem is an open source model gateway for teams that want routing, identity,
 budgets, and agent evaluation under their own control. It runs locally or on infrastructure you
-operate. TrustedRouter is its only first-party hosted model backend.
+operate.
 
 The gateway provides:
 

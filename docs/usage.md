@@ -16,7 +16,7 @@ The root surface is deliberately small:
 | `tr-onprem config gateway call ALIAS PROMPT [--json]` | Send one chat completion to a live gateway as a caller, streaming text to stdout. | One HTTP request against the running gateway; no local state. |
 | `tr-onprem config gateway models [--json]` | List the aliases a live gateway grants to the presented key (caller view of `GET /v1/models`). | One HTTP request against the running gateway; no local state. |
 | `tr-onprem config gateway key check [--json]` | Validate one raw virtual key against a live gateway and print its granted aliases without storing the key. | One HTTP request against the running gateway; no local state. |
-| `tr-onprem config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. `trustedrouter` is the only first-party hosted router and reuses the credential from `tr-onprem login`. Setup also supports explicit customer-controlled BYOK and local connections. | Local `.exp/models.toml` plus optional records in the user-data credential file. |
+| `tr-onprem config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. `trustedrouter` reuses the credential from `tr-onprem login`. Setup also supports explicit customer-controlled BYOK and local connections. | Local `.exp/models.toml` plus optional records in the user-data credential file. |
 | `tr-onprem config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command (default `$50.00`). | Local `.exp/settings.toml`. |
 | `tr-onprem config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.exp/settings.toml`. |
 

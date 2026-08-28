@@ -1,4 +1,4 @@
-"""TrustedRouter first-party provider tests."""
+"""TrustedRouter native provider tests."""
 
 from exp.cli.providers.trustedrouter import (
     CATALOG_PROVIDER,
@@ -12,7 +12,7 @@ from exp.cli.providers.trustedrouter import (
 
 
 def test_trustedrouter_identity_is_canonical() -> None:
-    """The product exposes one stable first-party hosted provider identity."""
+    """The product exposes one stable native TrustedRouter provider identity."""
     assert SETUP_PICKER_NAME == "trustedrouter"
     assert SETUP_PICKER_LABEL == "TrustedRouter"
     assert CATALOG_PROVIDER == "trustedrouter"

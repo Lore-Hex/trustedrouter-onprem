@@ -6,14 +6,12 @@ or prices. Every completion or embedding alias must declare the protocol feature
 it uses.
 
 Configure connections with `tr-onprem config providers` or the first `tr-onprem build` on a clean
-checkout. The first-party hosted provider is `trustedrouter`. It is fixed to
-`https://api.trustedrouter.com/v1` and uses `TRUSTEDROUTER_API_KEY`. Another public router cannot be
-selected through setup and is never used as an automatic fallback.
+checkout. The native `trustedrouter` provider is fixed to `https://api.trustedrouter.com/v1` and
+uses `TRUSTEDROUTER_API_KEY`.
 
 Direct OpenAI, Anthropic, Gemini, Azure, Bedrock, and Vertex connections are customer-controlled
 BYOK lanes. `openai-compatible` is for an explicitly configured endpoint, including a local or
-private-network model server. These explicit connections are not first-party hosted backends and
-never replace TrustedRouter silently.
+private-network model server. These explicit connections never replace TrustedRouter silently.
 
 Agents can skip the interactive provider list with repeatable `--provider` flags:
 `trustedrouter`, `openai`, `anthropic`, `gemini`, `openai-compatible`, `azure`, or `bedrock`.

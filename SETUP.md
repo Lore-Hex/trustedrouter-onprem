@@ -60,7 +60,7 @@ assert "Paris" in (result.choices[0].message.content or "")
 
 ## Managed Backend Policy
 
-TrustedRouter is the only first-party hosted model backend. The setup flow does not offer another
-public model router. Customer-controlled direct provider keys remain available as BYOK
-connections, and `openai-compatible` can target a server on infrastructure the customer controls.
-Neither path is an automatic fallback from TrustedRouter.
+TrustedRouter model access uses the native provider at `https://api.trustedrouter.com/v1`.
+Customer-controlled direct provider keys remain available as BYOK connections, and
+`openai-compatible` can target a server on infrastructure the customer controls. Neither path is
+an automatic fallback from TrustedRouter.

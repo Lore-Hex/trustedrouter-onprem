@@ -116,8 +116,8 @@ provider omits.
 
 ## TrustedRouter
 
-TrustedRouter is the only first-party hosted router lane. Customers call
-`https://api.trustedrouter.com/v1` with a durable `sk-tr-v1-` key resolved from
+The native TrustedRouter lane calls `https://api.trustedrouter.com/v1` with a durable `sk-tr-v1-`
+key resolved from
 `TRUSTEDROUTER_API_KEY` or the user-data credential file. Setup does not prompt for a base URL and does not write a local `gateway.db`
 authority for this path. Run `tr-onprem login` to read the key from the environment or hidden input,
 store it, and synchronize account models.
