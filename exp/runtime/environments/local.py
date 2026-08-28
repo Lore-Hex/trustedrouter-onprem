@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -258,6 +258,7 @@ def _require_containment_support() -> _DarwinKqueueBindings:
         )
 
     def binding(name: str) -> object:
+        """Read one required Darwin-only ``select`` attribute."""
         return getattr(select, name)
 
     try:
@@ -503,10 +504,8 @@ class _LocalProcessContext(AbstractContextManager[EnvironmentSession]):
         try:
             session.start(self._task)
         except BaseException:
-            try:
+            with suppress(LocalProcessCleanupError):
                 session.close()
-            except LocalProcessCleanupError:
-                pass
             raise
         return session
 
@@ -867,10 +866,8 @@ class _LocalProcessSession:
             if remaining <= 0:
                 return False
             if not leader_exited:
-                try:
+                with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=min(0.01, remaining))
-                except subprocess.TimeoutExpired:
-                    pass
             else:
                 time.sleep(min(0.005, remaining))
 
