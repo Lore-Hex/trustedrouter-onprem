@@ -33,7 +33,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 
-FIREWORKS_REASONING_CONTENT_PREFIX = "x-experiential-fireworks-reasoning-v2:"
+FIREWORKS_REASONING_CONTENT_PREFIX = "x-trustedrouter-onprem-fireworks-reasoning-v2:"
 """Public marker for a gateway-authenticated, caller-opaque Fireworks carrier."""
 
 MAXIMUM_REASONING_CONTENT_BYTES = 8 * 1024 * 1024
@@ -45,8 +45,8 @@ MAXIMUM_REASONING_CARRIER_BYTES = 4 * ((_MAXIMUM_ENVELOPE_BYTES + 2) // 3) + 512
 """Maximum caller-supplied carrier size before any base64 or AEAD work."""
 
 _NONCE_BYTES = 12
-_KEY_DERIVATION_DOMAIN = b"experiential/fireworks-reasoning-carrier/aes256gcm/v2\0"
-_CREDENTIAL_IDENTITY_DOMAIN = b"experiential/fireworks-reasoning-credential/v2\0"
+_KEY_DERIVATION_DOMAIN = b"trustedrouter-onprem/fireworks-reasoning-carrier/aes256gcm/v2\0"
+_CREDENTIAL_IDENTITY_DOMAIN = b"trustedrouter-onprem/fireworks-reasoning-credential/v2\0"
 
 
 class ReasoningCarrierClaims(ContractModel):

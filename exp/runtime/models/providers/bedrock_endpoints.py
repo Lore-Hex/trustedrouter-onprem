@@ -42,7 +42,7 @@ def resolve_bedrock_runtime_endpoint(region_name: str) -> BedrockRuntimeEndpoint
     try:
         from botocore.regions import EndpointResolver
     except ImportError as exc:
-        raise RuntimeError("Bedrock requires botocore; install experiential") from exc
+        raise RuntimeError("Bedrock requires botocore; install trustedrouter-onprem") from exc
     resolver = cast(
         "_EndpointResolver",
         EndpointResolver(built_in_botocore_loader().load_data("endpoints")),
@@ -93,7 +93,7 @@ def built_in_botocore_loader() -> BotocoreLoader:
     try:
         from botocore.loaders import Loader
     except ImportError as exc:
-        raise RuntimeError("Bedrock requires botocore; install experiential") from exc
+        raise RuntimeError("Bedrock requires botocore; install trustedrouter-onprem") from exc
     return cast(
         "BotocoreLoader",
         Loader(

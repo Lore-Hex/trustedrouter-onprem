@@ -770,7 +770,7 @@ def _import_botocore_unsigned() -> object:
     try:
         from botocore import UNSIGNED
     except ImportError as exc:
-        raise RuntimeError("Bedrock requires botocore; install experiential") from exc
+        raise RuntimeError("Bedrock requires botocore; install trustedrouter-onprem") from exc
     return UNSIGNED
 
 
@@ -780,7 +780,7 @@ def _import_isolated_botocore_session() -> _BotocoreSession:
         from botocore.configprovider import BOTOCORE_DEFAUT_SESSION_VARIABLES, ConstantProvider
         from botocore.session import get_session
     except ImportError as exc:
-        raise RuntimeError("Bedrock requires botocore; install experiential") from exc
+        raise RuntimeError("Bedrock requires botocore; install trustedrouter-onprem") from exc
     session = cast("_BotocoreSession", get_session())
     config_store = cast("_ConfigValueStore", session.get_component("config_store"))
     for logical_name, (

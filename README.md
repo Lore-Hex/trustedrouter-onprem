@@ -85,8 +85,8 @@ name.
 ## Upstream
 
 TrustedRouterOnPrem is derived from
-[Experiential](https://github.com/experientiallabs/experiential) at upstream commit
-`c8220b0543ad6d5f426f831377f9efcd67be0aa1`. Experiential is Copyright 2026 Experiential Labs and
+[Experiential](https://github.com/experientiallabs/experiential) and synchronized through upstream
+commit `9f08e1aac7011c4be310f0fd2787366f1aec399d`. Experiential is Copyright 2026 Experiential Labs and
 licensed under the Apache License 2.0. This derivative preserves the upstream license and records
 reviewed upstream synchronization in [the upstream sync policy](docs/reference/upstream-sync.md).
 

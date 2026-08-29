@@ -27,7 +27,11 @@ from exp.cli.providers.bedrock_credentials import (
 from exp.cli.providers.connection_reuse import reused_connection
 from exp.cli.providers.trustedrouter import (
     SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
+)
+from exp.cli.providers.trustedrouter import (
     SETUP_PICKER_NAME as HOSTED_SETUP_PICKER,
+)
+from exp.cli.providers.trustedrouter import (
     hosted_connection,
 )
 from exp.cli.shared.picker import (

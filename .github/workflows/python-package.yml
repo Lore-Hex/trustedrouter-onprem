@@ -213,7 +213,7 @@ jobs:
           merge-multiple: true
       - name: Drop files whose exact filename is already on PyPI
         # A release can carry a native package whose version did not change
-        # (for example an experiential-only bump). The native build is not
+        # (for example a TrustedRouterOnPrem-only bump). The native build is not
         # byte-reproducible, so a rebuilt wheel with an already-published
         # filename would fail uv publish's hash check. PyPI treats filenames
         # as immutable, so the published copy is authoritative; drop the
