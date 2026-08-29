@@ -487,6 +487,52 @@ def test_azure_connection_requires_endpoint_key_and_api_version() -> None:
         api_key_env="AZURE_OPENAI_API_KEY",
         api_version="v1",
     )
+    assert connection.azure_api_surface is None
+    inference = ConnectionConfig(
+        provider="azure",
+        base_url="https://resource.services.ai.azure.com/models",
+        api_key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+        azure_api_surface="model_inference",
+    )
+    inference_root = inference.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com"}
+    )
+    assert inference.identity_sha256() == inference_root.identity_sha256()
+    inference_redundant_terminal = inference.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com//models"}
+    )
+    assert inference_redundant_terminal.identity_sha256() == inference_root.identity_sha256()
+    inference_internal_separator = inference.model_copy(
+        update={"base_url": "https://gateway.example.test/tenant-a//azure/models"}
+    )
+    inference_collapsed_separator = inference_internal_separator.model_copy(
+        update={"base_url": "https://gateway.example.test/tenant-a/azure/models"}
+    )
+    assert (
+        inference_internal_separator.identity_sha256()
+        != inference_collapsed_separator.identity_sha256()
+    )
+    assert inference.identity_sha256() != connection.identity_sha256()
+    explicit_classic = connection.model_copy(update={"azure_api_surface": "openai_deployments"})
+    assert explicit_classic.identity_sha256() == connection.identity_sha256()
+    assert connection.identity_sha256() == sha256_json(
+        {
+            "provider": "azure",
+            "base_url": "https://resource.openai.azure.com",
+            "api_version": "v1",
+        }
+    )
+    with pytest.raises(ValueError, match="azure_api_surface"):
+        ConnectionConfig(provider="openai", azure_api_surface="model_inference")
+    with pytest.raises(ValueError, match="dated api_version"):
+        ConnectionConfig(
+            provider="azure",
+            base_url="https://resource.services.ai.azure.com",
+            api_key_env="AZURE_FOUNDRY_API_KEY",
+            api_version="v1",
+            azure_api_surface="model_inference",
+        )
 
     assert (
         connection.identity_sha256()

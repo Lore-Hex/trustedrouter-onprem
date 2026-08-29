@@ -130,6 +130,150 @@ def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
     assert payload["model"] == "exact-deployment"
 
 
+def test_model_inference_route_keeps_deployment_in_body() -> None:
+    """Azure AI Model Inference uses the shared /models route, not deployment-in-path."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://resource.services.ai.azure.com/models",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    url, headers, payload = transport.requests[0]
+    assert url == (
+        "https://resource.services.ai.azure.com/models/chat/completions"
+        "?api-version=2024-05-01-preview"
+    )
+    assert headers["api-key"] == _SECRET
+    assert payload["model"] == "DeepSeek-V4-Flash"
+    assert payload["max_tokens"] == 128
+    assert "max_completion_tokens" not in payload
+
+
+def test_model_inference_appends_models_to_a_resource_root() -> None:
+    """A Foundry resource root and its explicit /models root resolve identically."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "FW-GLM-5.2"),
+        endpoint="https://resource.services.ai.azure.com",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0].startswith(
+        "https://resource.services.ai.azure.com/models/chat/completions?"
+    )
+
+
+def test_model_inference_canonicalizes_terminal_models_path_case() -> None:
+    """Equivalent endpoint spelling emits one lowercase provider wire path."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://resource.services.ai.azure.com/MODELS",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0].startswith(
+        "https://resource.services.ai.azure.com/models/chat/completions?"
+    )
+
+
+def test_model_inference_canonicalizes_redundant_resource_path_separators() -> None:
+    """An identity-equivalent root cannot emit a divergent double-slash wire path."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://resource.services.ai.azure.com//models",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0].startswith(
+        "https://resource.services.ai.azure.com/models/chat/completions?"
+    )
+
+
+def test_model_inference_preserves_identity_distinct_internal_separators() -> None:
+    """Only separators adjacent to the equivalent terminal models suffix collapse."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://gateway.example.test/tenant-a//azure/models",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0].startswith(
+        "https://gateway.example.test/tenant-a//azure/models/chat/completions?"
+    )
+
+
+def test_classic_surface_preserves_endpoint_path_authority() -> None:
+    """Classic custom endpoint paths remain byte-distinct from collapsed credentials."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "deployment-name"),
+        endpoint="https://gateway.example.test/tenant-a//azure",
+        api_key=_SECRET,
+        api_version="v1",
+        api_surface="openai_deployments",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0] == (
+        "https://gateway.example.test/tenant-a//azure/openai/v1/chat/completions"
+    )
+
+
+def test_model_inference_rejects_v1_without_a_supported_api_version_query() -> None:
+    """The model-inference surface never silently omits its required api-version query."""
+    with pytest.raises(ValueError, match="dated api_version"):
+        AzureClient(
+            model=_snapshot("azure", "DeepSeek-V4-Flash"),
+            endpoint="https://resource.services.ai.azure.com",
+            api_key=_SECRET,
+            api_version="v1",
+            api_surface="model_inference",
+        )
+
+
 def test_embeddings_use_the_configured_deployment_alias() -> None:
     """Embedding aliases send their own deployment ID rather than a guessed base model."""
     transport = ScriptedJsonTransport(
@@ -173,6 +317,16 @@ def test_trusted_azure_key_is_not_sent_to_a_different_endpoint() -> None:
             api_key_env=AZURE_OPENAI_API_KEY_ENV,
             api_key=_SECRET,
             environment={AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT + "/"},
+        )
+        == _SECRET
+    )
+    assert (
+        bind_azure_api_key(
+            endpoint="https://resource.services.ai.azure.com/models",
+            api_key_env=AZURE_OPENAI_API_KEY_ENV,
+            api_key=_SECRET,
+            environment={AZURE_OPENAI_ENDPOINT_ENV: "https://resource.services.ai.azure.com"},
+            api_surface="model_inference",
         )
         == _SECRET
     )

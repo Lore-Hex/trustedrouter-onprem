@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import ClassVar
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from exp.common.models import ChatMaxTokensField, ModelSnapshot
 from exp.runtime.models.credentials import ModelCredentialError
@@ -19,7 +19,12 @@ _V1_API_VERSION = "v1"
 _V1_ROOT_SUFFIX = "/openai/v1"
 
 
-def same_azure_endpoint(left: str, right: str | None) -> bool:
+def same_azure_endpoint(
+    left: str,
+    right: str | None,
+    *,
+    api_surface: str = "openai_deployments",
+) -> bool:
     """Compare two Azure resource endpoints after canonical host and path normalization.
 
     Scheme and hostname are compared case-insensitively. Default HTTPS and HTTP ports are
@@ -30,13 +35,17 @@ def same_azure_endpoint(left: str, right: str | None) -> bool:
     Args:
         left: Catalog or request endpoint.
         right: Endpoint to compare, often ``AZURE_OPENAI_ENDPOINT``.
+        api_surface: Azure wire surface whose equivalent root spellings are accepted.
 
     Returns:
         ``True`` when both values name the same Azure resource after canonicalization.
     """
     if right is None:
         return False
-    return _canonical_azure_endpoint(left) == _canonical_azure_endpoint(right)
+    return _canonical_azure_endpoint(
+        left,
+        api_surface=api_surface,
+    ) == _canonical_azure_endpoint(right, api_surface=api_surface)
 
 
 def bind_azure_api_key(
@@ -45,6 +54,7 @@ def bind_azure_api_key(
     api_key_env: str,
     api_key: str,
     environment: Mapping[str, str],
+    api_surface: str = "openai_deployments",
 ) -> str:
     """Return the connection key only when it is paired with this exact Azure endpoint.
 
@@ -56,6 +66,7 @@ def bind_azure_api_key(
         api_key_env: Environment-variable name configured on the connection.
         api_key: Credential already read from ``api_key_env``.
         environment: Process or injected environment mapping.
+        api_surface: Azure wire surface used to normalize equivalent endpoint roots.
 
     Returns:
         The same non-empty API key when the pairing is valid.
@@ -68,7 +79,11 @@ def bind_azure_api_key(
         raise ValueError("Azure clients require a non-empty API key")
     if api_key_env == AZURE_OPENAI_API_KEY_ENV:
         trusted_endpoint = environment.get(AZURE_OPENAI_ENDPOINT_ENV)
-        if trusted_endpoint and not same_azure_endpoint(endpoint, trusted_endpoint):
+        if trusted_endpoint and not same_azure_endpoint(
+            endpoint,
+            trusted_endpoint,
+            api_surface=api_surface,
+        ):
             raise ModelCredentialError(
                 "AZURE_OPENAI_API_KEY is bound to AZURE_OPENAI_ENDPOINT and cannot be sent to a "
                 "different Azure resource"
@@ -76,7 +91,13 @@ def bind_azure_api_key(
     return api_key
 
 
-def _azure_base_url(endpoint: str, *, deployment: str, api_version: str) -> str:
+def _azure_base_url(
+    endpoint: str,
+    *,
+    deployment: str,
+    api_version: str,
+    api_surface: str,
+) -> str:
     """Build the Azure request root for the configured API surface.
 
     ``v1`` uses the Foundry and Azure OpenAI ``/openai/v1`` root and places the deployment in
@@ -91,6 +112,13 @@ def _azure_base_url(endpoint: str, *, deployment: str, api_version: str) -> str:
         Absolute request root. The root never includes a credential or query string.
     """
     root = endpoint.rstrip("/")
+    if api_surface == "model_inference":
+        parsed = urlsplit(endpoint)
+        path = parsed.path.rstrip("/")
+        if path.lower().endswith("/models"):
+            path = path[:-7].rstrip("/")
+        model_path = f"{path}/models" if path else "/models"
+        return urlunsplit((parsed.scheme, parsed.netloc, model_path, "", ""))
     if api_version == _V1_API_VERSION:
         if root.lower().endswith(_V1_ROOT_SUFFIX):
             return root
@@ -114,6 +142,7 @@ class AzureClient(OpenAICompatibleClient):
         endpoint: str,
         api_key: str,
         api_version: str,
+        api_surface: str = "openai_deployments",
         transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
@@ -132,7 +161,8 @@ class AzureClient(OpenAICompatibleClient):
             model: Resolved identity whose ``model_id`` is the exact Azure deployment name.
             endpoint: Explicit Azure resource endpoint from the catalog.
             api_key: Credential already paired with ``endpoint``.
-            api_version: ``v1`` or a dated Azure OpenAI API version.
+            api_version: ``v1`` or a dated Azure API version.
+            api_surface: Azure ``openai_deployments`` or Foundry ``model_inference`` wire API.
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
             timeout_seconds: Per-attempt timeout floor. Completion calls scale above it from the
@@ -145,10 +175,21 @@ class AzureClient(OpenAICompatibleClient):
             raise ValueError("Azure clients require an explicit resource endpoint")
         if not api_version:
             raise ValueError("Azure clients require an explicit api_version")
+        if api_surface not in {"openai_deployments", "model_inference"}:
+            raise ValueError("Azure clients require a supported api_surface")
+        if api_surface == "model_inference" and api_version == _V1_API_VERSION:
+            raise ValueError("Azure model_inference requires a dated api_version")
+        if api_surface == "model_inference":
+            chat_max_tokens_field = "max_tokens"
         super().__init__(
             model=model,
             api_key=api_key,
-            base_url=_azure_base_url(endpoint, deployment=model.model_id, api_version=api_version),
+            base_url=_azure_base_url(
+                endpoint,
+                deployment=model.model_id,
+                api_version=api_version,
+                api_surface=api_surface,
+            ),
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
@@ -162,6 +203,7 @@ class AzureClient(OpenAICompatibleClient):
             sampling_requires_reasoning_none=sampling_requires_reasoning_none,
         )
         self._api_version = api_version
+        self._api_surface = api_surface
 
     def _headers(self) -> dict[str, str]:
         """Return Azure ``api-key`` authentication headers without a Bearer token."""
@@ -179,16 +221,21 @@ class AzureClient(OpenAICompatibleClient):
         Returns:
             Wire path with the configured API version when required.
         """
-        if self._api_version != _V1_API_VERSION:
+        if self._api_surface == "model_inference" or self._api_version != _V1_API_VERSION:
             path = f"{path}?api-version={self._api_version}"
         return path
 
 
-def _canonical_azure_endpoint(value: str) -> tuple[str, str, int | None, str]:
+def _canonical_azure_endpoint(
+    value: str,
+    *,
+    api_surface: str,
+) -> tuple[str, str, int | None, str]:
     """Return the comparable scheme, host, port, and path for one Azure endpoint.
 
     Default HTTPS port 443 and HTTP port 80 are treated as omitted so catalog identity and key
-    pairing stay aligned. A non-default port is part of the resource identity.
+    pairing stay aligned. A non-default port is part of the resource identity. Model-inference
+    resource roots and their terminal ``/models`` form share one authority.
     """
     parsed = urlsplit(value)
     hostname = (parsed.hostname or "").lower()
@@ -199,4 +246,7 @@ def _canonical_azure_endpoint(value: str) -> tuple[str, str, int | None, str]:
     scheme = parsed.scheme.lower()
     default_port = 443 if scheme == "https" else 80
     comparable_port = None if port in {None, default_port} else port
-    return (scheme, hostname, comparable_port, parsed.path.rstrip("/"))
+    path = parsed.path.rstrip("/")
+    if api_surface == "model_inference" and path.lower().endswith("/models"):
+        path = path[:-7].rstrip("/")
+    return (scheme, hostname, comparable_port, path)

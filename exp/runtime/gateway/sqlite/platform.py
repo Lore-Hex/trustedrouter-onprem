@@ -207,6 +207,7 @@ class SQLiteGatewayPlatform:
                     base_url=command.base_url,
                     api_key_env=(None if secret_reference is None else secret_reference.reference),
                     api_version=command.api_version,
+                    azure_api_surface=command.azure_api_surface,
                     region=command.region,
                 ),
                 replace=command.replace,
@@ -424,6 +425,7 @@ class SQLiteGatewayPlatform:
                 provider=str(row["provider"]),
                 base_url=None if row["base_url"] is None else str(row["base_url"]),
                 api_version=None if row["api_version"] is None else str(row["api_version"]),
+                azure_api_surface=row["azure_api_surface"],
                 region=None if row["region"] is None else str(row["region"]),
                 secret_reference=(
                     None
