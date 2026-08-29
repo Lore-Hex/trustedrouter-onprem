@@ -1,6 +1,6 @@
 """Tests for launch-provider streaming request payload translation."""
 
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
@@ -17,6 +17,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
@@ -58,6 +59,96 @@ def _chat_request(
         stream=True,
         include_usage=True,
     )
+
+
+def _fireworks_responses_request(
+    *,
+    tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None,
+) -> GatewayRequest:
+    """Build a store-disabled Fireworks Responses request that declares one tool."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        tool_choice=tool_choice,
+        response_store=False,
+        stream=True,
+        include_usage=True,
+    )
+
+
+def _fireworks_profile() -> GatewayWireProfile:
+    """Return the exact public Fireworks Chat endpoint profile."""
+    return GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
+    )
+
+
+def test_fireworks_tools_disabled_needs_no_continuation_channel() -> None:
+    """Declared tools plus tool_choice none remains a guaranteed text-only turn."""
+    profile = _fireworks_profile()
+    request = _fireworks_responses_request(tool_choice="none")
+
+    route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, request)
+
+    assert payload["tool_choice"] == "none"
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    (None, "auto", "required", GatewayNamedToolChoice(name="lookup")),
+)
+def test_fireworks_tools_that_can_run_require_continuation(
+    tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None,
+) -> None:
+    """Every selector able to emit a tool call still fails closed without retention."""
+    profile = _fireworks_profile()
+    request = _fireworks_responses_request(tool_choice=tool_choice)
+
+    with pytest.raises(ProviderParameterError, match="continuation"):
+        route_generation_parameter_requests((profile,), request)
+    with pytest.raises(ProviderCapabilityError, match="reasoning_continuation"):
+        dialect_stream_payload(profile, request)
+
+
+def test_fireworks_continuation_gate_accepts_no_tools() -> None:
+    """A request without tools needs no continuation channel."""
+    profile = _fireworks_profile()
+    request = _fireworks_responses_request()
+
+    safe = request.model_copy(update={"tools": ()})
+    route_generation_parameter_requests((profile,), safe)
+    assert dialect_stream_payload(profile, safe)["stream"] is True
+
+
+@pytest.mark.parametrize(
+    "update",
+    ({"response_store": True}, {"include_encrypted_reasoning": True}),
+)
+def test_fireworks_unimplemented_continuation_channels_still_fail_closed(
+    update: dict[str, bool],
+) -> None:
+    """Storage flags cannot claim retention before the carrier PR lands."""
+    profile = _fireworks_profile()
+    request = _fireworks_responses_request().model_copy(update=update)
+
+    with pytest.raises(ProviderParameterError, match="unavailable"):
+        route_generation_parameter_requests((profile,), request)
+
+
+def test_fireworks_encrypted_reasoning_waits_for_the_authenticated_carrier() -> None:
+    """This small gate never claims the incompatible Chat wire preserves encrypted state."""
+    profile = _fireworks_profile()
+    request = _fireworks_responses_request().model_copy(
+        update={"include_encrypted_reasoning": True}
+    )
+
+    with pytest.raises(ProviderParameterError, match="unavailable") as raised:
+        route_generation_parameter_requests((profile,), request)
+    assert raised.value.param == "tool_choice"
 
 
 def test_openai_compatible_stream_payload_forwards_top_p_and_usage() -> None:
