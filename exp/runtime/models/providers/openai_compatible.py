@@ -40,6 +40,10 @@ from exp.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
+from exp.runtime.models.providers.fireworks import (
+    is_fireworks_base_url,
+    reasoning_content_route_sha256,
+)
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -303,6 +307,9 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._reasoning_effort = reasoning_effort
         self._token_limit_key: ChatMaxTokensField = chat_max_tokens_field or self.token_limit_key
         self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
+        self._fireworks_reasoning_route_sha256 = (
+            reasoning_content_route_sha256(model) if is_fireworks_base_url(self._base_url) else None
+        )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
         """Return the Chat Completions wire profile for this connection."""
@@ -321,6 +328,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_effort=self._reasoning_effort,
             token_limit_key=self._token_limit_key,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
+            fireworks_reasoning_route_sha256=self._fireworks_reasoning_route_sha256,
         )
 
     def _completion_path(self) -> str:
