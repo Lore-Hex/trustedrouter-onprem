@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import threading
 import time
 from collections import OrderedDict
@@ -13,7 +14,7 @@ from typing import Protocol
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, Sha256
+from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
@@ -353,16 +354,75 @@ class BoundedReplayStore:
             self._response_bytes -= entry.size_bytes
 
 
+class ContinuationRouteBinding(ContractModel):
+    """Secret-free authority binding for retained encrypted reasoning."""
+
+    deployment_id: ArtifactId
+    connection_sha256: Sha256
+    wire_authority_sha256: Sha256
+
+
 class ContinuationState(ContractModel):
     """Bounded content-bearing Responses continuation retained only in memory."""
 
     episode_key: Sha256
     messages: tuple[GatewayMessage, ...]
+    route_binding: ContinuationRouteBinding | None = None
 
     @property
     def size_bytes(self) -> int:
-        """Return deterministic serialized bytes used for retention accounting."""
-        return len(self.model_dump_json().encode())
+        """Return serialized bytes including provider replay fields excluded from artifacts."""
+        size = len(self.model_dump_json().encode())
+        replay_authority: list[dict[str, object]] = []
+        for message_index, message in enumerate(self.messages):
+            authority: dict[str, object] = {"message_index": message_index}
+            if message.provider_item_id is not None:
+                authority["provider_item_id"] = message.provider_item_id
+                authority["provider_output_index"] = message.provider_output_index
+                authority["provider_status"] = message.provider_status
+                authority["provider_phase"] = message.provider_phase
+            if message.provider_reasoning:
+                blocks: list[dict[str, object]] = []
+                for block in message.provider_reasoning:
+                    serialized = block.model_dump(mode="json")
+                    if block.kind == "encrypted_reasoning":
+                        serialized["output_index"] = block.output_index
+                        serialized["status"] = block.status
+                    blocks.append(serialized)
+                authority["provider_reasoning"] = blocks
+            retained_calls: list[dict[str, object]] = []
+            for call in message.tool_calls:
+                if (
+                    call.raw_arguments is None
+                    and call.provider_item_id is None
+                    and call.provider_output_index is None
+                    and call.provider_status is None
+                ):
+                    continue
+                retained_calls.append(
+                    {
+                        "call_id": call.call_id,
+                        "raw_arguments": call.raw_arguments,
+                        "provider_item_id": call.provider_item_id,
+                        "provider_output_index": call.provider_output_index,
+                        "provider_status": call.provider_status,
+                    }
+                )
+            if retained_calls:
+                authority["tool_calls"] = retained_calls
+            if message.tool_is_error:
+                authority["tool_is_error"] = True
+            if len(authority) > 1:
+                replay_authority.append(authority)
+        if replay_authority:
+            size += len(
+                json.dumps(
+                    replay_authority,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode()
+            )
+        return size
 
 
 class _ContinuationEntry:

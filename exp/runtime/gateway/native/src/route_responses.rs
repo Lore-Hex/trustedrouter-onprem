@@ -19,19 +19,19 @@ use crate::admission::{
     acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
     wire_drift_response, Admission,
 };
-use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::compact_json;
 use crate::encode_responses::{completed_responses_body, ResponsesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
-use crate::events::{CompletedToolCall, Event, Usage};
+use crate::events::{Event, Usage};
 use crate::metrics::{classify_escalation, METRICS};
-use crate::relay::{collect_committed, collection_public_error, event_retained_bytes, track_event};
+use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, complete_visible_refusal, error_response,
     escalation_error, finish_stream_terminal, json_response, latin1_header, read_body,
     send_bounded, settle_stream_end, sse_body_response,
 };
+use crate::responses_retention::{remember_argument, ResponsesRetention};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
@@ -263,60 +263,6 @@ pub(crate) async fn responses(
     }
 }
 
-/// Aggregated assistant output tracked while relaying one Responses stream,
-/// mirroring `assistant_message` inputs for continuation retention.
-#[derive(Default)]
-struct ResponsesRetention {
-    text: String,
-    refusal: bool,
-    tool_calls: Vec<CompletedToolCall>,
-    retained_bytes: usize,
-    overflowed: bool,
-}
-
-impl ResponsesRetention {
-    fn track(&mut self, event: &Event) {
-        if self.overflowed {
-            return;
-        }
-        self.retained_bytes = self
-            .retained_bytes
-            .saturating_add(event_retained_bytes(event));
-        if self.retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
-            // Retention is bounded like the python service's aggregation:
-            // the stream keeps flowing but nothing oversize is remembered.
-            self.overflowed = true;
-            self.text.clear();
-            self.tool_calls.clear();
-            return;
-        }
-        match event {
-            Event::TextDelta(delta) => self.text.push_str(delta),
-            Event::RefusalDelta(_) => self.refusal = true,
-            Event::ToolCallCompleted { call, .. } => self.tool_calls.push(call.clone()),
-            _ => {}
-        }
-    }
-}
-
-/// Build the retention payload consumed by the control plane's `remember`.
-fn remember_argument(request_id: &str, retention: &ResponsesRetention) -> String {
-    compact_json(&json!({
-        "request_id": request_id,
-        "text": retention.text,
-        "refusal": retention.refusal,
-        "tool_calls": retention
-            .tool_calls
-            .iter()
-            .map(|call| json!({
-                "call_id": call.call_id,
-                "name": call.name,
-                "arguments": call.raw_arguments,
-            }))
-            .collect::<Vec<Value>>(),
-    }))
-}
-
 /// Retain one completed Responses continuation before the terminal frames
 /// flush, mirroring the python service's ordering. Returns the public error
 /// when bounded retention fails closed.
@@ -325,10 +271,7 @@ async fn remember_continuation(
     request_id: &str,
     retention: &ResponsesRetention,
 ) -> Result<(), PublicError> {
-    if retention.overflowed
-        || retention.refusal
-        || (retention.text.is_empty() && retention.tool_calls.is_empty())
-    {
+    if retention.overflowed || retention.refusal() || retention.is_empty() {
         return Ok(());
     }
     state
@@ -491,12 +434,10 @@ async fn respond_from_responses_events(
     // Retention runs while the attempt row is still in flight so the control
     // plane can resolve its namespaced continuation context, and before the
     // body is answered so an oversize continuation fails closed like python.
-    let retention = ResponsesRetention {
-        text: aggregated.text.clone(),
-        refusal: !aggregated.refusal.is_empty() || refusal_completed.is_some(),
-        tool_calls: aggregated.tool_calls.clone(),
-        ..ResponsesRetention::default()
-    };
+    let mut retention = ResponsesRetention::default();
+    for event in &events {
+        retention.track(event);
+    }
     let remembered = remember_continuation(state, &admission.request_id, &retention).await;
     let settled = if let Some(refusal) = &refusal_completed {
         guard
@@ -823,7 +764,10 @@ async fn stream_responses(
             };
             track_event(&event, &mut usage, &mut tool_names);
             retention.track(&event);
-            if matches!(event, Event::RefusalDelta(_)) {
+            if matches!(
+                event,
+                Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+            ) {
                 visible_refusal = true;
             }
             let outward = match &event {

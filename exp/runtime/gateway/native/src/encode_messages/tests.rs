@@ -66,6 +66,8 @@ fn completed_body_orders_text_before_tool_use_blocks() {
             call: CompletedToolCall {
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
+                provider_item_id: None,
+                provider_status: None,
                 raw_arguments: "{\"b\":1,\"a\":2}".to_string(),
             },
         },
@@ -96,6 +98,8 @@ fn completed_body_preserves_interleaved_block_order() {
             call: CompletedToolCall {
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
+                provider_item_id: None,
+                provider_status: None,
                 raw_arguments: "{}".to_string(),
             },
         },
@@ -131,6 +135,8 @@ fn deferred_tool_completion_keeps_the_started_block_position() {
             call: CompletedToolCall {
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
+                provider_item_id: None,
+                provider_status: None,
                 raw_arguments: "{}".to_string(),
             },
         },
@@ -186,6 +192,8 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
             call: CompletedToolCall {
                 call_id: "call-a".to_string(),
                 name: "alpha".to_string(),
+                provider_item_id: None,
+                provider_status: None,
                 raw_arguments: "{\"a\": 1}".to_string(),
             },
         },
@@ -194,6 +202,8 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
             call: CompletedToolCall {
                 call_id: "call-b".to_string(),
                 name: "beta".to_string(),
+                provider_item_id: None,
+                provider_status: None,
                 raw_arguments: "{\"b\": 2}".to_string(),
             },
         },
@@ -370,6 +380,8 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
             call: CompletedToolCall {
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
+                provider_item_id: None,
+                provider_status: None,
                 raw_arguments: "{}".to_string(),
             },
         },

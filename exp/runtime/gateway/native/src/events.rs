@@ -25,8 +25,69 @@ impl Usage {
 pub struct CompletedToolCall {
     pub call_id: String,
     pub name: String,
+    pub provider_item_id: Option<String>,
+    pub provider_status: Option<ProviderOutputItemStatus>,
     /// Raw provider-order JSON argument text, already validated as one object.
     pub raw_arguments: String,
+}
+
+/// Provider-owned Responses output-item kind whose identity must remain exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderOutputItemKind {
+    Reasoning,
+    FunctionCall,
+    Message,
+}
+
+/// Provider-owned Responses item lifecycle status preserved byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderOutputItemStatus {
+    InProgress,
+    Completed,
+    Incomplete,
+}
+
+impl ProviderOutputItemStatus {
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "in_progress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "incomplete" => Some(Self::Incomplete),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// Optional phase attached to an OpenAI Responses assistant message item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAssistantMessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+impl ProviderAssistantMessagePhase {
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "commentary" => Some(Self::Commentary),
+            "final_answer" => Some(Self::FinalAnswer),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Commentary => "commentary",
+            Self::FinalAnswer => "final_answer",
+        }
+    }
 }
 
 /// One ordered provider-neutral stream event.
@@ -34,9 +95,38 @@ pub struct CompletedToolCall {
 pub enum Event {
     TextDelta(String),
     RefusalDelta(String),
+    /// One text delta for a specific provider-owned assistant message item.
+    ProviderTextDelta {
+        output_index: u32,
+        item_id: String,
+        delta: String,
+    },
+    /// One refusal delta for a specific provider-owned assistant message item.
+    ProviderRefusalDelta {
+        output_index: u32,
+        item_id: String,
+        delta: String,
+    },
+    /// Reserve a public Responses slot at the provider's item-start boundary.
+    ProviderOutputItemStarted {
+        output_index: u32,
+        item_id: Option<String>,
+        kind: ProviderOutputItemKind,
+        status: Option<ProviderOutputItemStatus>,
+        phase: Option<ProviderAssistantMessagePhase>,
+    },
+    /// Close one provider-owned output item with its exact lifecycle metadata.
+    ProviderOutputItemCompleted {
+        output_index: u32,
+        item_id: Option<String>,
+        kind: ProviderOutputItemKind,
+        status: Option<ProviderOutputItemStatus>,
+        phase: Option<ProviderAssistantMessagePhase>,
+    },
     ReasoningSummaryDelta {
         output_index: u32,
         summary_index: u32,
+        item_id: String,
         delta: String,
     },
     /// Verbatim Anthropic extended-thinking text for one provider block.
@@ -59,6 +149,7 @@ pub enum Event {
     /// provider output-item index.
     EncryptedReasoning {
         output_index: u32,
+        item_id: String,
         encrypted_content: String,
     },
     ToolCallStarted {
@@ -96,14 +187,74 @@ pub fn simplified_event(event: &Event) -> Value {
     match event {
         Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
         Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),
+        Event::ProviderTextDelta {
+            output_index,
+            item_id,
+            delta,
+        } => serde_json::json!({
+            "kind": "provider_text_delta",
+            "output_index": output_index,
+            "item_id": item_id,
+            "text": delta,
+        }),
+        Event::ProviderRefusalDelta {
+            output_index,
+            item_id,
+            delta,
+        } => serde_json::json!({
+            "kind": "provider_refusal_delta",
+            "output_index": output_index,
+            "item_id": item_id,
+            "text": delta,
+        }),
+        Event::ProviderOutputItemStarted {
+            output_index,
+            item_id,
+            kind,
+            status,
+            phase,
+        } => {
+            let mut payload = serde_json::json!({
+                "kind": "provider_output_item_started",
+                "output_index": output_index,
+                "item_type": match kind {
+                    ProviderOutputItemKind::Reasoning => "reasoning",
+                    ProviderOutputItemKind::FunctionCall => "function_call",
+                    ProviderOutputItemKind::Message => "message",
+                },
+            });
+            add_provider_item_metadata(&mut payload, item_id, *status, *phase);
+            payload
+        }
+        Event::ProviderOutputItemCompleted {
+            output_index,
+            item_id,
+            kind,
+            status,
+            phase,
+        } => {
+            let mut payload = serde_json::json!({
+                "kind": "provider_output_item_completed",
+                "output_index": output_index,
+                "item_type": match kind {
+                ProviderOutputItemKind::Reasoning => "reasoning",
+                ProviderOutputItemKind::FunctionCall => "function_call",
+                ProviderOutputItemKind::Message => "message",
+                },
+            });
+            add_provider_item_metadata(&mut payload, item_id, *status, *phase);
+            payload
+        }
         Event::ReasoningSummaryDelta {
             output_index,
             summary_index,
+            item_id,
             delta,
         } => serde_json::json!({
             "kind": "reasoning_summary_delta",
             "output_index": output_index,
             "summary_index": summary_index,
+            "item_id": item_id,
             "text": delta,
         }),
         Event::ThinkingDelta { index, delta } => serde_json::json!({
@@ -123,10 +274,12 @@ pub fn simplified_event(event: &Event) -> Value {
         }),
         Event::EncryptedReasoning {
             output_index,
+            item_id,
             encrypted_content,
         } => serde_json::json!({
             "kind": "encrypted_reasoning",
             "output_index": output_index,
+            "item_id": item_id,
             "encrypted_content": encrypted_content,
         }),
         Event::ToolCallStarted {
@@ -144,13 +297,22 @@ pub fn simplified_event(event: &Event) -> Value {
             "index": index,
             "text": delta,
         }),
-        Event::ToolCallCompleted { index, call } => serde_json::json!({
-            "kind": "tool_call_completed",
-            "index": index,
-            "call_id": call.call_id,
-            "name": call.name,
-            "raw_arguments": call.raw_arguments,
-        }),
+        Event::ToolCallCompleted { index, call } => {
+            let mut payload = serde_json::json!({
+                "kind": "tool_call_completed",
+                "index": index,
+                "call_id": call.call_id,
+                "name": call.name,
+                "raw_arguments": call.raw_arguments,
+            });
+            if let Some(item_id) = &call.provider_item_id {
+                payload["item_id"] = Value::String(item_id.clone());
+            }
+            if let Some(status) = call.provider_status {
+                payload["status"] = Value::String(status.as_str().to_string());
+            }
+            payload
+        }
         Event::Usage(usage) => serde_json::json!({
             "kind": "usage",
             "input_tokens": usage.input_tokens,
@@ -168,6 +330,23 @@ pub fn simplified_event(event: &Event) -> Value {
     }
 }
 
+fn add_provider_item_metadata(
+    payload: &mut Value,
+    item_id: &Option<String>,
+    status: Option<ProviderOutputItemStatus>,
+    phase: Option<ProviderAssistantMessagePhase>,
+) {
+    if let Some(item_id) = item_id {
+        payload["item_id"] = Value::String(item_id.clone());
+    }
+    if let Some(status) = status {
+        payload["status"] = Value::String(status.as_str().to_string());
+    }
+    if let Some(phase) = phase {
+        payload["phase"] = Value::String(phase.as_str().to_string());
+    }
+}
+
 /// Validate one raw tool-argument accumulation as a single JSON object.
 pub fn require_json_object_text(raw: &str) -> Result<(), String> {
     match serde_json::from_str::<Value>(raw) {
@@ -182,6 +361,8 @@ pub fn require_json_object_text(raw: &str) -> Result<(), String> {
 pub struct ToolAccumulator {
     pub call_id: String,
     pub name: String,
+    pub provider_item_id: Option<String>,
+    pub provider_status: Option<ProviderOutputItemStatus>,
     pub raw_arguments: String,
     pub completed: bool,
 }
@@ -191,6 +372,8 @@ impl ToolAccumulator {
         Self {
             call_id,
             name,
+            provider_item_id: None,
+            provider_status: None,
             raw_arguments: String::new(),
             completed: false,
         }
@@ -212,6 +395,8 @@ impl ToolAccumulator {
         Ok(CompletedToolCall {
             call_id: self.call_id.clone(),
             name: self.name.clone(),
+            provider_item_id: self.provider_item_id.clone(),
+            provider_status: self.provider_status,
             raw_arguments: self.raw_arguments.clone(),
         })
     }
@@ -410,6 +595,23 @@ pub fn require_string(
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("{label} must be text"))
+}
+
+/// Fetch a required provider identity with the public contract's character bound.
+pub fn require_bounded_string(
+    object: &Map<String, Value>,
+    key: &str,
+    label: &str,
+    maximum_chars: usize,
+) -> Result<String, String> {
+    let value = require_string(object, key, label)?;
+    let length = value.chars().count();
+    if length == 0 || length > maximum_chars {
+        return Err(format!(
+            "{label} must contain between 1 and {maximum_chars} characters"
+        ));
+    }
+    Ok(value)
 }
 
 /// Fetch a required non-negative integer field from a provider JSON object,

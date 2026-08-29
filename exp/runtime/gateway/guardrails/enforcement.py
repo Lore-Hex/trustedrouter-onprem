@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
 from exp.runtime.gateway.guardrails.client import InternalClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
@@ -21,6 +21,59 @@ from exp.runtime.gateway.guardrails.contracts import (
 from exp.runtime.gateway.guardrails.store import GuardrailPolicyStore
 
 _logger = logging.getLogger(__name__)
+
+
+def _restored_provider_authority(
+    original: Sequence[GatewayMessage],
+    replacement: Sequence[GatewayMessage],
+) -> tuple[GatewayMessage, ...] | None:
+    """Validate visible edits and restore hidden provider replay authority.
+
+    Hosted classifiers receive only the normal serialized message projection,
+    because replay-only reasoning, raw arguments, provider identity, status,
+    and phase are excluded from that contract. A valid replacement must keep
+    the classifier-visible authenticated prefix exact. The gateway then uses
+    the original prefix objects, reattaching every hidden field without asking
+    the classifier to receive or echo it.
+    """
+
+    def has_authority(message: GatewayMessage) -> bool:
+        """Identify fields that must replay byte-exact on a provider continuation."""
+        return bool(
+            message.provider_reasoning
+            or message.provider_item_id is not None
+            or message.provider_output_index is not None
+            or message.provider_status is not None
+            or message.provider_phase is not None
+            or message.tool_is_error
+            or any(
+                call.raw_arguments is not None
+                or call.provider_item_id is not None
+                or call.provider_output_index is not None
+                or call.provider_status is not None
+                for call in message.tool_calls
+            )
+        )
+
+    original_carrier_indexes = tuple(
+        index for index, message in enumerate(original) if has_authority(message)
+    )
+    if not original_carrier_indexes:
+        return (
+            None if any(has_authority(message) for message in replacement) else tuple(replacement)
+        )
+    bound = original_carrier_indexes[-1]
+    if len(replacement) <= bound:
+        return None
+    original_visible = tuple(message.model_dump(mode="json") for message in original[: bound + 1])
+    replacement_visible = tuple(
+        message.model_dump(mode="json") for message in replacement[: bound + 1]
+    )
+    if replacement_visible != original_visible:
+        return None
+    if any(has_authority(message) for message in replacement[bound + 1 :]):
+        return None
+    return (*original[: bound + 1], *replacement[bound + 1 :])
 
 
 class GuardrailEngine:
@@ -213,7 +266,15 @@ class GuardrailEngine:
                 raise GuardrailRejected(
                     guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
                 )
-            return request.model_copy(update={"messages": verdict.replacement_messages})
+            restored = _restored_provider_authority(
+                request.messages,
+                verdict.replacement_messages,
+            )
+            if restored is None:
+                raise GuardrailRejected(
+                    guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
+                )
+            return request.model_copy(update={"messages": restored})
         raise GuardrailRejected(guardrail_failure(action=check.action, check_id=check.check_id))
 
     def _apply_output(

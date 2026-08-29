@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from collections.abc import Coroutine
 
+import httpx
 import pytest
 
+from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import (
+    EncryptedReasoningBlock,
     GatewayApiSurface,
     GatewayFailureClass,
     GatewayMessage,
@@ -36,6 +40,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     request_content_bytes,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.http_json import HttpJsonClassifier
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 
 
@@ -274,6 +279,210 @@ def test_input_chain_runs_once_and_can_transform_the_request() -> None:
     assert result.messages == replacement
     assert classifier.input_calls == 1
     assert engine.input_invocations == 1
+
+
+def _reasoning_request() -> GatewayRequest:
+    """Build one provider-reasoning tool continuation."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="Use a tool"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-one",
+                        name="lookup",
+                        arguments={"query": "safe"},
+                        raw_arguments='{"query":"safe"}',
+                        provider_item_id="fc-one",
+                        provider_output_index=1,
+                    ),
+                ),
+                provider_reasoning=(
+                    EncryptedReasoningBlock(
+                        id="rs-one",
+                        encrypted_content="authenticated hidden state",
+                        output_index=0,
+                    ),
+                ),
+            ),
+            GatewayMessage(role="tool", tool_call_id="call-one", content="secret result"),
+        ),
+    )
+
+
+def test_input_modify_can_redact_only_history_after_authenticated_reasoning() -> None:
+    """A modifier may redact tool output without rebinding the authenticated prefix."""
+    request = _reasoning_request()
+    replacement = (
+        *request.messages[:2],
+        GatewayMessage(role="tool", tool_call_id="call-one", content="[REDACTED]"),
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    result = _awaited(
+        engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0)
+    )
+    assert result.messages == replacement
+
+
+def test_input_modify_rejects_removing_provider_reasoning_with_bound_history() -> None:
+    """A modifier cannot truncate authenticated provider history to a new user turn."""
+    request = _reasoning_request()
+    replacement = (GatewayMessage(role="user", content="fully redacted"),)
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    with pytest.raises(GuardrailRejected):
+        _awaited(engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0))
+
+
+def test_hosted_input_modify_restores_exact_hidden_continuation_authority() -> None:
+    """Hosted visible edits are validated before exact hidden authority is reattached."""
+    request = _reasoning_request()
+    check = _check("hosted-input", action=GuardrailAction.MODIFY, adapter_id="hosted")
+    policy = GuardrailPolicy(
+        policy_id="member-policy",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        protected=True,
+        checks=(check,),
+    )
+
+    def handler(outbound: httpx.Request) -> httpx.Response:
+        """Redact classifier-visible tool output without receiving hidden authority."""
+        payload = json.loads(outbound.content)
+        visible = payload["request"]["messages"]
+        assistant = visible[1]
+        assert "provider_reasoning" not in assistant
+        assert "raw_arguments" not in assistant["tool_calls"][0]
+        assert "provider_item_id" not in assistant["tool_calls"][0]
+        visible[2]["content"] = "[REDACTED]"
+        return httpx.Response(
+            200,
+            json={"flagged": True, "replacement_messages": visible},
+        )
+
+    async def scenario() -> GatewayRequest:
+        """Run one hosted adapter through the complete guardrail engine."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = HttpJsonClassifier(
+                adapter_id="hosted",
+                url="https://classifier.example.invalid/v1/inspect",
+                client=client,
+            )
+            engine = GuardrailEngine(
+                store=MappingGuardrailStore((policy,)),
+                client=DirectClassifierClient(ClassifierRegistry({"hosted": adapter})),
+                monotonic=_Clock(),
+            )
+            return await engine.enforce_input(
+                policy=policy,
+                request=request,
+                deadline_monotonic=200.0,
+            )
+
+    result = asyncio.run(scenario())
+    assert result.messages[:2] == request.messages[:2]
+    assert result.messages[2].content == "[REDACTED]"
+    original_call = request.messages[1].tool_calls[0]
+    restored_call = result.messages[1].tool_calls[0]
+    assert restored_call.raw_arguments == original_call.raw_arguments
+    assert restored_call.provider_item_id == original_call.provider_item_id
+    assert restored_call.provider_output_index == original_call.provider_output_index
+    assert result.messages[1].provider_reasoning == request.messages[1].provider_reasoning
+
+
+def test_input_modify_restores_carrier_omitted_from_classifier_projection() -> None:
+    """A visible-only replacement receives the original authenticated carrier."""
+    request = _reasoning_request()
+    replacement = (
+        request.messages[0],
+        request.messages[1].model_copy(update={"provider_reasoning": ()}),
+        request.messages[2],
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    result = _awaited(
+        engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0)
+    )
+    assert result.messages == request.messages
+
+
+def test_input_modify_restores_hidden_tool_authority_without_reasoning() -> None:
+    """Raw call bytes and provider identity are restored after visible validation."""
+    original = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="Use a tool"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-one",
+                        name="lookup",
+                        arguments={"query": "safe"},
+                        raw_arguments='{"query":"safe"}',
+                        provider_item_id="fc-one",
+                        provider_output_index=0,
+                        provider_status="completed",
+                    ),
+                ),
+            ),
+            GatewayMessage(role="tool", tool_call_id="call-one", content="result"),
+        ),
+    )
+    stripped_call = (
+        original.messages[1]
+        .tool_calls[0]
+        .model_copy(
+            update={
+                "raw_arguments": None,
+                "provider_item_id": None,
+                "provider_output_index": None,
+                "provider_status": None,
+            }
+        )
+    )
+    replacement = (
+        original.messages[0],
+        original.messages[1].model_copy(update={"tool_calls": (stripped_call,)}),
+        original.messages[2],
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    result = _awaited(
+        engine.enforce_input(policy=policy, request=original, deadline_monotonic=200.0)
+    )
+    assert result.messages == original.messages
 
 
 def test_input_block_is_terminal_and_content_free() -> None:

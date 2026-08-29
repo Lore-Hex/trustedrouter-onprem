@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Collection
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
@@ -136,6 +136,9 @@ class _Message(_WireModel):
             raise ValueError("tool_call_id is valid only for tool messages")
         if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
+        call_ids = tuple(call.id for call in self.history_tool_calls)
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("assistant tool call IDs must be unique")
         return self
 
 
@@ -150,6 +153,18 @@ class _ResponseMessage(_Message):
     type: Literal["message"] = "message"
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
+    phase: Literal["commentary", "final_answer"] | None = None
+
+    @model_validator(mode="after")
+    def _require_output_identity_pair(self) -> _ResponseMessage:
+        """Bind replayed output-message identity to its completion status."""
+        if (self.id is None) != (self.status is None):
+            raise ValueError("Responses output messages require both id and status")
+        if self.id is not None and self.role != "assistant":
+            raise ValueError("Responses output message identity requires role assistant")
+        if self.phase is not None and self.id is None:
+            raise ValueError("Responses output message phase requires output identity")
+        return self
 
 
 class _FunctionDefinition(_WireModel):
@@ -251,6 +266,7 @@ class _ResponseFunctionCall(_WireModel):
     """
 
     type: Literal["function_call"]
+    id: str | None = Field(default=None, min_length=1, max_length=256)
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     arguments: str = Field(max_length=4_000_000)
@@ -296,7 +312,7 @@ class _ResponseReasoningItem(_WireModel):
     """
 
     type: Literal["reasoning"]
-    id: str | None = Field(default=None, min_length=1, max_length=256)
+    id: str = Field(min_length=1, max_length=256)
     encrypted_content: str = Field(min_length=1)
     summary: tuple[_ReasoningSummaryPart, ...] = ()
     content: tuple[_ReasoningTextPart, ...] = ()
@@ -351,9 +367,11 @@ class _ResponseReasoning(_WireModel):
         return self
 
 
-_ResponsesInputItem = (
-    _ResponseMessage | _ResponseFunctionCall | _ResponseFunctionOutput | _ResponseReasoningItem
-)
+_ResponsesOutputItem = Annotated[
+    _ResponseFunctionCall | _ResponseFunctionOutput | _ResponseReasoningItem,
+    Field(discriminator="type"),
+]
+_ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem
 
 
 class _ResponsesRequest(_WireModel):
@@ -483,8 +501,8 @@ def decode_responses(
     _validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
-    _validate_official(_RESPONSES_OFFICIAL, payload, extension_fields={"top_k", "reasoning"})
     request = _validate_wire(_ResponsesRequest, payload)
+    _validate_official(_RESPONSES_OFFICIAL, payload, extension_fields={"top_k", "reasoning"})
     include_encrypted_reasoning = _include_encrypted_reasoning(request.include)
     operation = _caller_operation(idempotency_key, client_request_id)
     messages = list(_response_input_messages(request.input))
@@ -597,6 +615,7 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
 
 _LOCATION_NOISE = {"body", "non-streaming", "streaming"}
 _UNION_BRANCH_TYPES = {"str", "int", "float", "bool", "list", "tuple", "dict", "NoneType"}
+_OUTPUT_ITEM_VARIANTS = {"message", "function_call", "function_call_output", "reasoning"}
 
 
 def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
@@ -609,6 +628,8 @@ def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
         if isinstance(part, str) and (
             part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES
         ):
+            continue
+        if text in _OUTPUT_ITEM_VARIANTS and cleaned and cleaned[-1].isdigit():
             continue
         cleaned.append(text)
     return tuple(cleaned)
@@ -828,15 +849,15 @@ def _response_input_messages(
 ) -> tuple[GatewayMessage, ...]:
     """Convert Responses input items into ordered canonical history.
 
-    A replayed reasoning item precedes the assistant action it belongs to on
-    the official wire, so pending reasoning blocks attach to the next
-    assistant message or function call; trailing or orphaned reasoning stays
-    a standalone assistant turn carrying only the opaque blocks.
+    Provider output items retain their exact identities and indexes. Contiguous
+    function calls form one assistant turn so parallel calls and their leading
+    reasoning replay in the provider's original order.
     """
     if isinstance(value, str):
         return (GatewayMessage(role="user", content=value),)
     messages: list[GatewayMessage] = []
     pending_reasoning: list[EncryptedReasoningBlock] = []
+    pending_calls: list[ToolCall] = []
 
     def take_reasoning(role: str) -> tuple[EncryptedReasoningBlock, ...]:
         """Hand pending reasoning blocks to one assistant successor."""
@@ -853,19 +874,44 @@ def _response_input_messages(
                 GatewayMessage(role="assistant", provider_reasoning=take_reasoning("assistant"))
             )
 
+    def flush_calls() -> None:
+        """Group contiguous function-call items into their one assistant turn."""
+        if pending_calls:
+            messages.append(
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=tuple(pending_calls),
+                    provider_reasoning=take_reasoning("assistant"),
+                )
+            )
+            pending_calls.clear()
+
     for index, item in enumerate(value):
         if isinstance(item, _ResponseReasoningItem):
+            flush_calls()
             pending_reasoning.append(
-                EncryptedReasoningBlock(id=item.id, encrypted_content=item.encrypted_content)
+                EncryptedReasoningBlock(
+                    id=item.id,
+                    encrypted_content=item.encrypted_content,
+                    output_index=index,
+                    status=item.status,
+                )
             )
         elif isinstance(item, _ResponseMessage):
+            flush_calls()
             if item.role != "assistant":
                 flush_orphaned_reasoning()
             converted = _messages((item,), f"input.{index}")
             if converted and item.role == "assistant":
                 converted = (
                     converted[0].model_copy(
-                        update={"provider_reasoning": take_reasoning("assistant")}
+                        update={
+                            "provider_reasoning": take_reasoning("assistant"),
+                            "provider_item_id": item.id,
+                            "provider_output_index": index if item.id is not None else None,
+                            "provider_status": item.status,
+                            "provider_phase": item.phase,
+                        }
                     ),
                     *converted[1:],
                 )
@@ -875,17 +921,21 @@ def _response_input_messages(
                 id=item.call_id,
                 function=_FunctionCall(name=item.name, arguments=item.arguments),
             )
-            messages.append(
-                GatewayMessage(
-                    role="assistant",
-                    tool_calls=(_tool_call(wire_call, f"input.{index}.arguments"),),
-                    provider_reasoning=take_reasoning("assistant"),
+            pending_calls.append(
+                _tool_call(wire_call, f"input.{index}.arguments").model_copy(
+                    update={
+                        "provider_item_id": item.id,
+                        "provider_output_index": index,
+                        "provider_status": item.status,
+                    }
                 )
             )
         else:
+            flush_calls()
             flush_orphaned_reasoning()
             messages.append(
                 GatewayMessage(role="tool", content=item.output, tool_call_id=item.call_id)
             )
+    flush_calls()
     flush_orphaned_reasoning()
     return tuple(messages)
