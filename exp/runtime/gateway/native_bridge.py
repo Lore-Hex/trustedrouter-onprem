@@ -50,6 +50,7 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
+from exp.runtime.gateway.native_admission import admitted_route_requests
 from exp.runtime.gateway.native_bridge_errors import (
     escalation as _escalation,
 )
@@ -116,14 +117,8 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     normalized_provider_failure,
 )
-from exp.runtime.models.providers.generation_route_compat import (
-    compatible_generation_parameter_profile_indexes,
-)
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
-from exp.runtime.models.providers.streaming_requests import (
-    dialect_stream_payload,
-    route_generation_parameter_requests,
-)
+from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
     invalid_field,
@@ -458,52 +453,13 @@ class NativeControlPlane(NativeObservabilityMixin):
         try:
             if probe_failure is not None or route is None or resolved_wires is None:
                 raise probe_failure or GatewayRoutingError("authorized route did not resolve")
-            compatible_indexes = compatible_generation_parameter_profile_indexes(
-                tuple(profile for profile, _client in resolved_wires),
+            route, resolved_wires, public_request, provider_request = admitted_route_requests(
+                route,
+                resolved_wires,
                 request,
+                accounting=self._accounting,
+                authorization=authorization,
             )
-            route = select_route_deployments(route, compatible_indexes)
-            resolved_wires = tuple(resolved_wires[index] for index in compatible_indexes)
-            public_request, provider_request = route_generation_parameter_requests(
-                tuple(profile for profile, _client in resolved_wires),
-                request,
-            )
-            provider_request = provider_request.model_copy(
-                update={"stream": True, "include_usage": True}
-            )
-            protocol_indexes: list[int] = []
-            first_protocol_error: ProviderParameterError | ProviderCapabilityError | None = None
-            for index, (deployment, (profile, _client)) in enumerate(
-                zip(route.deployments, resolved_wires, strict=True)
-            ):
-                try:
-                    preflight_gateway_request(
-                        provider_request,
-                        deployment.gateway.capabilities,
-                        model_capabilities=deployment.capabilities,
-                        public_stream=public_request.stream,
-                    )
-                    dialect_stream_payload(profile, provider_request)
-                except (ProviderParameterError, ProviderCapabilityError) as exc:
-                    if first_protocol_error is None:
-                        first_protocol_error = exc
-                    continue
-                protocol_indexes.append(index)
-            if not protocol_indexes:
-                if first_protocol_error is None:
-                    raise GatewayRoutingError("authorized route has no compatible deployment")
-                raise first_protocol_error
-            if len(protocol_indexes) != len(route.deployments):
-                selected_indexes = tuple(protocol_indexes)
-                route = select_route_deployments(route, selected_indexes)
-                resolved_wires = tuple(resolved_wires[index] for index in selected_indexes)
-                public_request, provider_request = route_generation_parameter_requests(
-                    tuple(profile for profile, _client in resolved_wires),
-                    request,
-                )
-                provider_request = provider_request.model_copy(
-                    update={"stream": True, "include_usage": True}
-                )
             wire_route: list[JsonObject] = []
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
@@ -556,6 +512,10 @@ class NativeControlPlane(NativeObservabilityMixin):
                         strict=True,
                     )
                 )
+        except NativeBridgeError:
+            # The enriched fail-closed capability rejection above already
+            # finished the accepted request; let it cross the boundary as-is.
+            raise
         except (ProviderParameterError, ProviderCapabilityError) as exc:
             # One shared normalizer keeps both pre-dispatch rejections
             # field-specific: the parameter path names the parameter and the
