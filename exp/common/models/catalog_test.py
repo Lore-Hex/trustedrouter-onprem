@@ -583,8 +583,8 @@ def test_azure_connection_requires_endpoint_key_and_api_version() -> None:
         )
 
 
-def test_bedrock_connection_rejects_api_keys_and_includes_region_in_identity() -> None:
-    """Bedrock catalog records use the AWS chain and keep region in connection identity."""
+def test_bedrock_connection_accepts_complete_key_pair_without_hashing_secret_pointers() -> None:
+    """Bedrock accepts ambient or paired auth while identity remains endpoint-only."""
     with_region = ConnectionConfig(provider="bedrock", region="us-east-1")
     without_region = ConnectionConfig(provider="bedrock")
 
@@ -598,8 +598,52 @@ def test_bedrock_connection_rejects_api_keys_and_includes_region_in_identity() -
     )
     with pytest.raises(ValueError, match="api_key_env"):
         ConnectionConfig(provider="bedrock", api_key_env="AWS_ACCESS_KEY_ID")
+    explicit = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="BEDROCK_ACCESS_KEY_ID",
+        region="us-east-1",
+    )
+    assert explicit.identity_sha256() != with_region.identity_sha256()
+    assert (
+        explicit.identity_sha256()
+        == ConnectionConfig(
+            provider="bedrock",
+            api_key_env="OTHER_SECRET_ACCESS_KEY",
+            aws_access_key_id_env="OTHER_ACCESS_KEY_ID",
+            bedrock_auth_mode="access_key_pair",
+            region="us-east-1",
+        ).identity_sha256()
+    )
+    api_key = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="BEDROCK_API_KEY",
+        bedrock_auth_mode="api_key",
+        region="us-east-1",
+    )
+    assert api_key.identity_sha256() != explicit.identity_sha256()
+    with pytest.raises(ValueError, match="bedrock_auth_mode"):
+        ConnectionConfig(provider="openai", bedrock_auth_mode="api_key")
     with pytest.raises(ValueError, match="base_url"):
         ConnectionConfig(provider="bedrock", base_url="https://bedrock.example.test")
+
+
+def test_absent_bedrock_fields_preserve_legacy_connection_payload_shape() -> None:
+    """Optional Bedrock metadata does not rewrite unrelated canonical payloads."""
+    legacy = ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")
+    payload = legacy.model_dump(mode="json", exclude_none=False)
+
+    assert "aws_access_key_id_env" not in payload
+    assert "bedrock_auth_mode" not in payload
+
+    explicit = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="BEDROCK_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="BEDROCK_ACCESS_KEY_ID",
+        bedrock_auth_mode="access_key_pair",
+    ).model_dump(mode="json", exclude_none=False)
+    assert explicit["aws_access_key_id_env"] == "BEDROCK_ACCESS_KEY_ID"
+    assert explicit["bedrock_auth_mode"] == "access_key_pair"
 
 
 def test_azure_and_bedrock_models_require_explicit_capabilities(tmp_path: Path) -> None:
