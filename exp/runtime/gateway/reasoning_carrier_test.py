@@ -222,7 +222,72 @@ def test_carrier_rejects_tampering_retagging_and_turn_changes() -> None:
             parsed,
             authority,
             assistant_content="visible assistant text",
-            tool_calls=_tool_calls("call-one", raw_arguments='{"q":"x"}'),
+            tool_calls=_tool_calls("call-one", raw_arguments='{"q":"y"}'),
+        )
+
+
+def test_carrier_authenticates_a_client_reencoding_of_the_same_turn() -> None:
+    """A caller that reparses the streamed turn continues it without byte equality."""
+    authority = _authority()
+    carrier = seal_reasoning_content(
+        authority,
+        issuing_request_id="issuing-request",
+        issuing_route_depth=0,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="",
+        tool_calls=_tool_calls("call-one", raw_arguments='{"q": "x", "n": 1.0}'),
+        content="hidden",
+    )
+    block, _claims = unseal_reasoning_content(
+        parse_reasoning_content_carrier(carrier),
+        authority,
+        assistant_content=None,
+        tool_calls=_tool_calls("call-one", raw_arguments='{"n":1,"q":"x"}'),
+    )
+    assert block.content == "hidden"
+
+
+def test_carrier_authenticates_a_turn_whose_blank_text_the_client_dropped() -> None:
+    """Whitespace a provider pads a tool-only turn with is not visible text."""
+    authority = _authority()
+    carrier = seal_reasoning_content(
+        authority,
+        issuing_request_id="issuing-request",
+        issuing_route_depth=0,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="\n\n",
+        tool_calls=_tool_calls("call-one"),
+        content="hidden",
+    )
+    block, _claims = unseal_reasoning_content(
+        parse_reasoning_content_carrier(carrier),
+        authority,
+        assistant_content=None,
+        tool_calls=_tool_calls("call-one"),
+    )
+    assert block.content == "hidden"
+
+
+def test_carrier_rejects_a_number_no_float_names_exactly() -> None:
+    """Beyond the exact integers a float stops standing in for one integer value."""
+    authority = _authority()
+    carrier = seal_reasoning_content(
+        authority,
+        issuing_request_id="issuing-request",
+        issuing_route_depth=0,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="visible assistant text",
+        tool_calls=_tool_calls("call-one", raw_arguments='{"n": 9007199254740993.0}'),
+        content="hidden",
+    )
+    parsed = parse_reasoning_content_carrier(carrier)
+
+    with pytest.raises(ValueError):
+        unseal_reasoning_content(
+            parsed,
+            authority,
+            assistant_content="visible assistant text",
+            tool_calls=_tool_calls("call-one", raw_arguments='{"n":9007199254740992}'),
         )
 
 
@@ -267,6 +332,18 @@ def test_carrier_rejects_a_different_nonempty_conversation_prefix() -> None:
             tool_calls=_tool_calls("call-one"),
             history_prefix=(GatewayMessage(role="user", content="different prompt"),),
         )
+
+
+def test_history_digest_treats_empty_and_absent_text_as_one_conversation() -> None:
+    """A caller echoing the empty string of a tool-only turn keeps the same prefix."""
+    tool_only = GatewayMessage(
+        role="assistant",
+        content="",
+        tool_calls=_tool_calls("call-one"),
+    )
+    assert reasoning_history_sha256((tool_only,)) == reasoning_history_sha256(
+        (tool_only.model_copy(update={"content": None}),)
+    )
 
 
 def test_later_carrier_binds_earlier_authenticated_reasoning() -> None:

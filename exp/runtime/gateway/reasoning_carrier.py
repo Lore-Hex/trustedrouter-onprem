@@ -18,9 +18,9 @@ from pydantic import Field, ValidationError
 
 from exp.common.core.artifacts import (
     ContractModel,
+    JsonValue,
     Sha256,
     canonical_json_bytes,
-    sha256_bytes,
     sha256_json,
 )
 from exp.common.models import ToolCall
@@ -47,6 +47,8 @@ MAXIMUM_REASONING_CARRIER_BYTES = 4 * ((_MAXIMUM_ENVELOPE_BYTES + 2) // 3) + 512
 _NONCE_BYTES = 12
 _KEY_DERIVATION_DOMAIN = b"trustedrouter-onprem/fireworks-reasoning-carrier/aes256gcm/v2\0"
 _CREDENTIAL_IDENTITY_DOMAIN = b"trustedrouter-onprem/fireworks-reasoning-credential/v2\0"
+_EXACT_INTEGER_LIMIT = 2**53
+"""First magnitude where a JSON float stops naming exactly one integer."""
 
 
 class ReasoningCarrierClaims(ContractModel):
@@ -306,10 +308,15 @@ def reasoning_history_sha256(messages: tuple[GatewayMessage, ...]) -> Sha256:
     artifact serialization. Carrier chaining is an internal authority boundary, so it
     deliberately adds the normalized blocks back before hashing. A later carrier then
     cannot be transplanted across two visually identical turns with different hidden state.
+
+    The digest covers the conversation a caller can observe, so absent and empty text are
+    the same history: a client that echoes the empty string the gateway streamed for a
+    tool-only turn continues the same conversation as one that echoes null.
     """
     payload: list[dict[str, object]] = []
     for message in messages:
         item = message.model_dump(mode="json")
+        item["content"] = _normalized_content(message.content)
         item["provider_reasoning"] = [
             block.model_dump(mode="json") for block in message.provider_reasoning
         ]
@@ -395,20 +402,55 @@ def _issuing_turn_sha256(
     assistant_content: str | None,
     tool_calls: tuple[ToolCall, ...],
 ) -> Sha256:
-    """Bind visible assistant text and every exact tool-call field."""
+    """Bind visible assistant text and every semantic tool-call field.
+
+    The turn is identified by what the caller can observe, not by one exact byte
+    encoding of it. Assistant text is compared with absent text equal to empty text,
+    and tool arguments are compared as canonical JSON values, because an
+    OpenAI-compatible client parses the streamed arguments and re-encodes them on the
+    next turn. Argument values, names, order, and call identity all still bind.
+    """
     return sha256_json(
         {
-            "assistant_content": assistant_content,
+            "assistant_content": _normalized_content(assistant_content),
             "tool_calls": [
                 {
                     "call_id": call.call_id,
                     "name": call.name,
-                    "arguments_sha256": sha256_bytes(call.arguments_json().encode("utf-8")),
+                    "arguments_sha256": sha256_json(_normalized_arguments(call.arguments)),
                 }
                 for call in tool_calls
             ],
         }
     )
+
+
+def _normalized_content(content: str | None) -> str | None:
+    """Return absent text for the blank text a tool-only turn may carry.
+
+    A tool-only turn shows the caller no text, whether the provider streamed nothing,
+    the empty string, or padding such as a pair of newlines. Any client is free to trim
+    or drop that, so every blank form is the same visible turn.
+    """
+    return content if content and content.strip() else None
+
+
+def _normalized_arguments(value: JsonValue) -> JsonValue:
+    """Return one JSON value whose numbers survive a client parse and re-encode.
+
+    A JSON number carries no type, so a client that parses ``1.0`` and serializes the
+    same value as ``1`` sent the same arguments. An integral number therefore digests as
+    an integer, leaving strings, booleans, null, and fractional numbers untouched. Above
+    the exactly representable integers a float no longer names one integer, so those
+    values keep their own encoding and a changed magnitude still fails authentication.
+    """
+    if isinstance(value, dict):
+        return {key: _normalized_arguments(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalized_arguments(item) for item in value]
+    if isinstance(value, float) and value.is_integer() and abs(value) < _EXACT_INTEGER_LIMIT:
+        return int(value)
+    return value
 
 
 def _associated_data(deployment_text: str) -> bytes:
