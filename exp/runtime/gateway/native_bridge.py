@@ -103,7 +103,11 @@ from exp.runtime.models.providers.streaming_requests import (
     dialect_stream_payload,
     route_generation_parameter_requests,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
+from exp.runtime.openai_protocol.errors import (
+    OpenAIProtocolError,
+    public_failure_error,
+    unsupported_field,
+)
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -113,6 +117,92 @@ from exp.runtime.openai_protocol.state import (
 )
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
+_PUBLIC_REQUEST_CAPABILITY_PARAMS = {
+    GatewayApiSurface.CHAT_COMPLETIONS: {
+        "developer_messages": "messages",
+        "function_tools": "tools",
+        "parallel_tool_calls": "parallel_tool_calls",
+        "stop_sequences": "stop",
+        "streaming": "stream",
+        "streaming_tool_arguments": "stream",
+        "strict_tools": "tools",
+        "structured_output": "response_format",
+        "structured_text": "response_format",
+    },
+    GatewayApiSurface.RESPONSES: {
+        "developer_messages": "instructions",
+        "function_tools": "tools",
+        "parallel_tool_calls": "parallel_tool_calls",
+        "streaming": "stream",
+        "streaming_tool_arguments": "stream",
+        "strict_tools": "tools",
+        "structured_output": "text.format",
+        "structured_text": "text.format",
+    },
+    GatewayApiSurface.MESSAGES: {
+        "developer_messages": "system",
+        "function_tools": "tools",
+        "parallel_tool_calls": "tool_choice.disable_parallel_tool_use",
+        "stop_sequences": "stop_sequences",
+        "streaming": "stream",
+        "streaming_tool_arguments": "stream",
+        "strict_tools": "tools",
+    },
+}
+
+
+def _public_capability_param(
+    capability: str,
+    surface: GatewayApiSurface,
+    *,
+    public_stream: bool = True,
+    public_tools: bool = False,
+) -> str | None:
+    """Translate an internal capability label to the caller's request field."""
+    if capability == "streaming_tool_arguments":
+        return "tools"
+    if capability == "streaming" and not public_stream:
+        return None
+    return _PUBLIC_REQUEST_CAPABILITY_PARAMS[surface].get(capability)
+
+
+def _public_capability_error(
+    error: ProviderCapabilityError,
+    surface: GatewayApiSurface,
+    *,
+    public_stream: bool,
+    public_tools: bool,
+    developer_messages_param: str | None = None,
+) -> OpenAIProtocolError:
+    """Translate one internal admission label into a stable public 400.
+
+    Provider capability literals are useful for internal accounting but are
+    not part of the public request contract. Known request requirements name
+    the field that activated them. Internal route requirements fail against
+    ``model`` without exposing implementation details.
+    """
+    param = (
+        developer_messages_param
+        if error.capability == "developer_messages" and developer_messages_param is not None
+        else _public_capability_param(
+            error.capability,
+            surface,
+            public_stream=public_stream,
+            public_tools=public_tools,
+        )
+    )
+    if param is not None:
+        return unsupported_field(param, capability=True)
+    return OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_capability",
+        message=(
+            "The selected model route cannot serve this request. "
+            "Choose a different model alias and resend the request."
+        ),
+        param="model",
+    )
+
 
 _logger = logging.getLogger(__name__)
 
@@ -403,6 +493,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                         provider_request,
                         deployment.gateway.capabilities,
                         model_capabilities=deployment.capabilities,
+                        public_stream=public_request.stream,
                     )
                     dialect_stream_payload(profile, provider_request)
                 except (ProviderParameterError, ProviderCapabilityError) as exc:
@@ -436,6 +527,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                     provider_request,
                     deployment.gateway.capabilities,
                     model_capabilities=deployment.capabilities,
+                    public_stream=public_request.stream,
                 )
                 upstream_payload = dialect_stream_payload(profile, provider_request)
                 upstream_body, dispatch_signer = frozen_dispatch(profile, client, upstream_payload)
@@ -464,7 +556,18 @@ class NativeControlPlane(NativeObservabilityMixin):
             # request feature the route cannot preserve.
             failure = normalized_provider_failure(exc)
             self._accounting.finish_request_quietly(authorization, failure)
-            raise NativeBridgeError(public_failure_error(failure)) from exc
+            public_error = (
+                _public_capability_error(
+                    exc,
+                    provider_request.surface,
+                    public_stream=public_request.stream,
+                    public_tools=bool(public_request.tools),
+                    developer_messages_param=decoded.developer_messages_param,
+                )
+                if isinstance(exc, ProviderCapabilityError)
+                else public_failure_error(failure, param=exc.param)
+            )
+            raise NativeBridgeError(public_error) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             error = _authority_error(exc)
             failure = GatewayFailure(

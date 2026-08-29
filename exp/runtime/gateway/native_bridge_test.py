@@ -23,6 +23,7 @@ from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKi
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
+    GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -41,8 +42,11 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
+    _public_capability_error,
+    _public_capability_param,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -57,6 +61,99 @@ _PublicErrorType = Literal[
     "insufficient_quota",
     "api_error",
 ]
+
+
+@pytest.mark.parametrize(
+    ("capability", "chat_param", "responses_param", "messages_param"),
+    (
+        ("developer_messages", "messages", "instructions", "system"),
+        ("function_tools", "tools", "tools", "tools"),
+        (
+            "parallel_tool_calls",
+            "parallel_tool_calls",
+            "parallel_tool_calls",
+            "tool_choice.disable_parallel_tool_use",
+        ),
+        ("stop_sequences", "stop", None, "stop_sequences"),
+        ("streaming", "stream", "stream", "stream"),
+        ("streaming_tool_arguments", "tools", "tools", "tools"),
+        ("strict_tools", "tools", "tools", "tools"),
+        ("structured_output", "response_format", "text.format", None),
+        ("structured_text", "response_format", "text.format", None),
+    ),
+)
+def test_public_capability_params_name_real_surface_fields(
+    capability: str,
+    chat_param: str | None,
+    responses_param: str | None,
+    messages_param: str | None,
+) -> None:
+    """Internal admission labels never leak as nonexistent public fields."""
+    assert _public_capability_param(capability, GatewayApiSurface.CHAT_COMPLETIONS) == chat_param
+    assert _public_capability_param(capability, GatewayApiSurface.RESPONSES) == responses_param
+    assert _public_capability_param(capability, GatewayApiSurface.MESSAGES) == messages_param
+
+
+def test_tool_argument_streaming_failure_names_the_public_tools_field() -> None:
+    """Tool argument transport failures identify the tool request that activated them."""
+    for surface in GatewayApiSurface:
+        assert (
+            _public_capability_param(
+                "streaming_tool_arguments",
+                surface,
+                public_stream=False,
+                public_tools=True,
+            )
+            == "tools"
+        )
+
+
+def test_internal_text_streaming_failure_has_no_fake_public_field() -> None:
+    """An internal text transport deficit has no caller-removable request field."""
+    for surface in GatewayApiSurface:
+        assert (
+            _public_capability_param(
+                "streaming",
+                surface,
+                public_stream=False,
+            )
+            is None
+        )
+
+        error = _public_capability_error(
+            ProviderCapabilityError(capability="streaming"),
+            surface,
+            public_stream=False,
+            public_tools=False,
+        )
+        assert error.detail.param == "model"
+        assert "Choose a different model alias" in error.detail.message
+
+
+def test_public_capability_error_never_exposes_internal_labels() -> None:
+    """Internal route requirements fail against model without leaking their names."""
+    error = _public_capability_error(
+        ProviderCapabilityError(capability="tinker_gateway_execution"),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        public_stream=False,
+        public_tools=False,
+    )
+
+    assert error.detail.param == "model"
+    assert error.detail.code == "unsupported_capability"
+    assert "tinker_gateway_execution" not in error.detail.message
+
+
+def test_forced_streaming_tool_deficit_names_the_public_tools_field() -> None:
+    """An internally streamed tool deficit names the tool request that caused it."""
+    error = _public_capability_error(
+        ProviderCapabilityError(capability="streaming_tool_arguments"),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        public_stream=False,
+        public_tools=True,
+    )
+
+    assert error.detail.param == "tools"
 
 
 def _parity_golden(name: str) -> object:
@@ -516,6 +613,7 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
+            supports_streaming_tool_arguments=True,
             supports_stop_sequences=True,
             supports_strict_tools=True,
             supports_structured_text=True,
@@ -792,6 +890,7 @@ def _configured_pool_gateway(
     base_urls: tuple[str, str] = ("http://127.0.0.1:9/v1", "http://127.0.0.1:10/v1"),
     gateway_capabilities: tuple[GatewayDeploymentCapabilities, GatewayDeploymentCapabilities]
     | None = None,
+    model_capabilities: tuple[ModelCapabilities, ModelCapabilities] | None = None,
     api_key_envs: tuple[str, str] = ("TEST_PROVIDER_KEY", "TEST_PROVIDER_KEY"),
 ) -> tuple[GatewayManagement, str]:
     """Create one certified two-deployment pool alias, grant, and key.
@@ -801,6 +900,7 @@ def _configured_pool_gateway(
         refusal_failover: Whether the alias revision opts into refusal failover.
         base_urls: One provider endpoint per ordered deployment.
         gateway_capabilities: Optional protocol contract for each deployment.
+        model_capabilities: Optional semantic model contract for each deployment.
         api_key_envs: One credential environment-variable name per ordered
             deployment, so a test can make one rung's credential resolvable
             while another is absent.
@@ -826,8 +926,17 @@ def _configured_pool_gateway(
         GatewayDeploymentCapabilities(supports_streaming=True),
         GatewayDeploymentCapabilities(supports_streaming=True),
     )
-    for alias, base_url, gateway_capability, api_key_env in zip(
-        ("alpha", "beta"), base_urls, declared_gateway_capabilities, api_key_envs, strict=True
+    declared_model_capabilities = model_capabilities or (
+        ModelCapabilities(),
+        ModelCapabilities(),
+    )
+    for alias, base_url, gateway_capability, model_capability, api_key_env in zip(
+        ("alpha", "beta"),
+        base_urls,
+        declared_gateway_capabilities,
+        declared_model_capabilities,
+        api_key_envs,
+        strict=True,
     ):
         upsert_connection(
             root,
@@ -846,7 +955,7 @@ def _configured_pool_gateway(
             provider_model=f"{alias}-model-exact",
             exact_model_id="model-revision-exact",
             revision=None,
-            capabilities=ModelCapabilities(),
+            capabilities=model_capability,
             gateway_capabilities=gateway_capability,
             prices=GatewayTokenPrices(),
             pricing_source=None,
@@ -889,12 +998,14 @@ def _pool_control_plane(
     refusal_failover: bool = False,
     gateway_capabilities: tuple[GatewayDeploymentCapabilities, GatewayDeploymentCapabilities]
     | None = None,
+    model_capabilities: tuple[ModelCapabilities, ModelCapabilities] | None = None,
 ) -> tuple[NativeControlPlane, str]:
     """Load the native control plane over one certified two-deployment pool."""
     _manager, raw_key = _configured_pool_gateway(
         root,
         refusal_failover=refusal_failover,
         gateway_capabilities=gateway_capabilities,
+        model_capabilities=model_capabilities,
     )
     components = load_gateway_components(
         root,
@@ -967,6 +1078,265 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
     assert [item["model_id"] for item in route] == ["beta-model-exact"]
     upstream = cast("JsonObject", route[0]["upstream_payload"])
     assert upstream["stop"] == ["DONE"]
+
+
+@pytest.mark.parametrize(
+    ("body_update", "lead", "fallback", "model_capabilities"),
+    (
+        (
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                            "strict": True,
+                        },
+                    }
+                ]
+            },
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_streaming_tool_arguments=True,
+                supports_strict_tools=True,
+            ),
+            (ModelCapabilities(supports_tools=True), ModelCapabilities(supports_tools=True)),
+        ),
+        (
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {"type": "object"},
+                        "strict": True,
+                    },
+                }
+            },
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_structured_text=True,
+            ),
+            (
+                ModelCapabilities(supports_structured_output=True),
+                ModelCapabilities(supports_structured_output=True),
+            ),
+        ),
+        (
+            {"stream": True},
+            GatewayDeploymentCapabilities(),
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            (ModelCapabilities(), ModelCapabilities()),
+        ),
+        (
+            {
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_streaming_tool_arguments=True,
+            ),
+            (ModelCapabilities(supports_tools=True), ModelCapabilities(supports_tools=True)),
+        ),
+    ),
+)
+def test_admit_filters_each_protocol_capability_before_selection(
+    tmp_path: Path,
+    body_update: JsonObject,
+    lead: GatewayDeploymentCapabilities,
+    fallback: GatewayDeploymentCapabilities,
+    model_capabilities: tuple[ModelCapabilities, ModelCapabilities],
+) -> None:
+    """Tools, structured output, and streaming retain only a capable rung."""
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(lead, fallback),
+        model_capabilities=model_capabilities,
+    )
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        **body_update,
+    }
+
+    admission = _admit(control, raw_key, json.dumps(body))
+
+    route = cast("list[JsonObject]", admission["route"])
+    assert [item["model_id"] for item in route] == ["beta-model-exact"]
+
+
+def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
+    tmp_path: Path,
+) -> None:
+    """An all-incompatible tool route names strict_tools and never reports internal."""
+    unsupported = GatewayDeploymentCapabilities(supports_streaming=True)
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(unsupported, unsupported),
+        model_capabilities=(
+            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(supports_tools=True),
+        ),
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                        "strict": True,
+                    },
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body)
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_capability"
+    assert error["param"] == "tools"
+    assert "internal" not in error["code"]
+
+
+def test_non_streaming_tool_transport_failure_names_tools(tmp_path: Path) -> None:
+    """A buffered tool request identifies the feature that requires streaming."""
+    unsupported = GatewayDeploymentCapabilities(supports_strict_tools=True)
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(unsupported, unsupported),
+        model_capabilities=(
+            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(supports_tools=True),
+        ),
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body)
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["code"] == "unsupported_capability"
+    assert error["param"] == "tools"
+    assert "Remove the field" in error["message"]
+
+
+def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Path) -> None:
+    """A parameter validator reaches the public 400 with its exact field path intact."""
+    capabilities = GatewayDeploymentCapabilities(
+        supports_streaming=True,
+        supports_stop_sequences=True,
+        maximum_stop_sequences=5,
+    )
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(capabilities, capabilities),
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["a", "b", "c", "d", "e", "f"],
+        }
+    )
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body)
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "invalid_parameter"
+    assert error["param"] == "stop"
+
+
+@pytest.mark.parametrize(
+    ("body_update", "gateway_capabilities", "model_capabilities", "param"),
+    (
+        (
+            {"stop": ["DONE"]},
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            ModelCapabilities(),
+            "stop",
+        ),
+        (
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {"type": "object"},
+                        "strict": True,
+                    },
+                }
+            },
+            GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_structured_text=True,
+            ),
+            ModelCapabilities(),
+            "response_format",
+        ),
+    ),
+)
+def test_admit_scopes_each_public_capability_failure_to_its_request_field(
+    tmp_path: Path,
+    body_update: JsonObject,
+    gateway_capabilities: GatewayDeploymentCapabilities,
+    model_capabilities: ModelCapabilities,
+    param: str,
+) -> None:
+    """Public admission failures never degrade to an unscoped internal error."""
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(gateway_capabilities, gateway_capabilities),
+        model_capabilities=(model_capabilities, model_capabilities),
+    )
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        **body_update,
+    }
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, json.dumps(body))
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_capability"
+    assert error["param"] == param
 
 
 def _partial_pool_control_plane(
@@ -3258,21 +3628,20 @@ def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
     assert json.loads(repeated.value.public_error_json)["code"] != "idempotency_conflict"
 
 
-def test_capability_rejection_names_the_unsupported_capability(tmp_path: Path) -> None:
-    """A pre-dispatch capability rejection names the exact capability.
-
-    A Responses request with instructions decodes to a developer message; a
-    route that cannot preserve developer messages must say so by name, not
-    with a flattened generic sentence, so a production 400 is triageable.
-    The message carries only the stable internal capability literal, never
-    request content.
-    """
+def test_capability_rejection_names_the_public_request_field(tmp_path: Path) -> None:
+    """A pre-dispatch capability rejection names the exact public field."""
     control, raw_key = _control_plane(tmp_path)
     body = json.dumps(
         {
             "model": "coding",
-            "instructions": "Follow the sync-lane policy canary-instructions.",
-            "input": "hello canary-input",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": "Follow the sync-lane policy canary-instructions.",
+                },
+                {"type": "message", "role": "user", "content": "hello canary-input"},
+            ],
         }
     )
     with pytest.raises(NativeBridgeError) as raised:
@@ -3281,7 +3650,9 @@ def test_capability_rejection_names_the_unsupported_capability(tmp_path: Path) -
     assert payload["status_code"] == 400
     assert payload["code"] == "unsupported_capability"
     assert payload["error_type"] == "invalid_request_error"
-    assert "developer_messages" in payload["message"]
+    assert payload["param"] == "input.0.role"
+    assert "'input.0.role'" in payload["message"]
+    assert "developer_messages" not in payload["message"]
     assert "canary" not in json.dumps(payload)
 
 

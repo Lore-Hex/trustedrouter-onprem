@@ -19,6 +19,10 @@ from exp.runtime.gateway.project_activation import (
     ProjectActivationRepository,
     require_project_activation_authority,
 )
+from exp.runtime.gateway.provider_certification import (
+    ProviderCapability,
+    provider_has_certified_capability,
+)
 from exp.runtime.models import RuntimeModelCatalog
 
 
@@ -153,12 +157,25 @@ def _migrate_legacy_project_gateway_metadata(
     changed = False
     for alias in aliases:
         record = models.get(alias)
-        if record is None or record.gateway is not None:
+        if record is None:
+            continue
+        provider = catalog.connections[record.connection].provider
+        supports_streaming_tool_arguments = provider_has_certified_capability(
+            provider,
+            ProviderCapability.TOOL_ARGUMENT_STREAM,
+        )
+        if record.gateway is not None:
+            # Any gateway metadata is already an endpoint-specific declaration. The schema's
+            # conservative false default is indistinguishable from an explicit false, so a
+            # provider-family certification must never overwrite it during legacy migration.
             continue
         models[alias] = record.model_copy(
             update={
                 "gateway": GatewayDeploymentMetadata(
-                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                    capabilities=GatewayDeploymentCapabilities(
+                        supports_streaming=True,
+                        supports_streaming_tool_arguments=supports_streaming_tool_arguments,
+                    )
                 )
             }
         )

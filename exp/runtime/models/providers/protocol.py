@@ -8,7 +8,7 @@ from typing import Protocol, runtime_checkable
 
 from exp.common.models import ModelCapabilities, ModelClient, ModelRequest, ModelResponse
 from exp.common.models.catalog import GatewayDeploymentCapabilities
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.models.providers.async_transport import (
     RequestDeadline,
     run_then_close_pooled_client,
@@ -186,6 +186,7 @@ def preflight_gateway_request(
     capabilities: GatewayDeploymentCapabilities,
     *,
     model_capabilities: ModelCapabilities | None = None,
+    public_stream: bool | None = None,
 ) -> None:
     """Reject gateway semantics a deployment cannot preserve before provider dispatch.
 
@@ -195,12 +196,27 @@ def preflight_gateway_request(
         model_capabilities: Exact model-level semantic capabilities. Production
             routes supply this value; ``None`` preserves compatibility for
             standalone callers that only validate deployment protocol fields.
+        public_stream: Whether the caller requested streaming. ``None`` uses
+            ``request.stream`` for standalone callers. Hosted execution passes
+            this explicitly because its provider request is always streamed.
 
     Raises:
         ProviderCapabilityError: A present request feature is unsupported.
     """
-    requirements = (
-        (request.stream, capabilities.supports_streaming, "streaming"),
+    requirements: tuple[tuple[bool, bool, str], ...] = ()
+    if model_capabilities is not None:
+        requirements += (
+            (bool(request.tools), model_capabilities.supports_tools is not False, "function_tools"),
+            (
+                request.structured_text is not None,
+                model_capabilities.supports_structured_output,
+                "structured_output",
+            ),
+        )
+    caller_stream = request.stream if public_stream is None else public_stream
+    if caller_stream:
+        requirements += ((request.stream, capabilities.supports_streaming, "streaming"),)
+    requirements += (
         (
             any(message.role == "developer" for message in request.messages),
             capabilities.supports_developer_messages,
@@ -222,17 +238,14 @@ def preflight_gateway_request(
             capabilities.supports_structured_text,
             "structured_text",
         ),
+        (
+            request.stream and bool(request.tools),
+            capabilities.supports_streaming_tool_arguments,
+            "streaming_tool_arguments",
+        ),
     )
-    if model_capabilities is not None:
-        model_requirements = (
-            (bool(request.tools), model_capabilities.supports_tools is not False, "function_tools"),
-            (
-                request.structured_text is not None,
-                model_capabilities.supports_structured_output,
-                "structured_output",
-            ),
-        )
-        requirements += model_requirements
+    if request.stream and not caller_stream:
+        requirements += ((True, capabilities.supports_streaming, "streaming"),)
     for requested, supported, capability in requirements:
         if requested and not supported:
             raise ProviderCapabilityError(capability=capability)
@@ -243,8 +256,8 @@ def preflight_gateway_request(
                 f"This model route accepts at most {stop_limit} stop "
                 f"sequences; the request supplied {len(request.stop)}."
             ),
-            param="stop",
-            code="too_many_stop_sequences",
+            param=("stop_sequences" if request.surface == GatewayApiSurface.MESSAGES else "stop"),
+            code="invalid_parameter",
         )
 
 
