@@ -1,10 +1,11 @@
 //! Provider-rejected parameter attribution for sanitized 400s.
 //!
 //! When a provider rejects a dispatched request with a client-error status,
-//! the public failure stays sanitized: no provider prose or body content ever
-//! crosses the boundary. The ONE fact this module may relay is the parameter
-//! path the provider named, and only when it validates against the strict
-//! path grammar below — anything else keeps today's content-free message.
+//! two facts may reach the caller, and only for that class: the parameter
+//! path the provider named, validated against the strict path grammar below,
+//! and the provider's own one-sentence explanation, read from the documented
+//! message field and sanitized by [`rejected_detail`]. Nothing else from the
+//! body crosses the boundary, and no other failure class relays any of it.
 //!
 //! Extraction classification per dialect (a new [`Dialect`] variant fails to
 //! compile until it is classified here, and the exhaustiveness test pins the
@@ -17,6 +18,9 @@
 //! | `AnthropicMessages`     | leading `path: ` or `` `path` `` message token |
 //! | `GeminiGenerateContent` | `fieldViolations[].field`, else `* path: ` msg |
 //! | `BedrockConverseStream` | none — no machine-readable parameter contract  |
+//!
+//! The explanation relayed alongside it comes from `error.message` for every
+//! dialect except Bedrock, which reports a bare top-level `message`.
 
 use serde_json::Value;
 
@@ -24,6 +28,9 @@ use crate::dialects::Dialect;
 
 /// Longest parameter path relayed; anything longer is treated as prose.
 const MAXIMUM_PATH_LENGTH: usize = 128;
+
+/// Longest provider explanation relayed; longer text is a body dump.
+const MAXIMUM_DETAIL_LENGTH: usize = 240;
 
 /// Fixed OpenAI-family prefix naming one unsupported argument.
 const UNKNOWN_ARGUMENT_PREFIXES: [&str; 2] = [
@@ -58,6 +65,106 @@ pub fn rejected_parameter(dialect: Dialect, body: &str) -> Option<String> {
         Dialect::BedrockConverseStream => None,
     }?;
     valid_parameter_path(&candidate).then_some(candidate)
+}
+
+/// Extract the provider's own explanation from one client-error body.
+///
+/// A client-error body explains what the caller got wrong, and the caller is
+/// the only party who can act on it, so the sentence itself is worth more to
+/// them than the gateway's generic wording. Only the dialect's documented
+/// message field is read, and only after [`sanitized_detail`] proves it is
+/// one bounded single-line sentence that names no provider infrastructure; a
+/// body dump, a stack trace, or a sentence carrying a deployment, account,
+/// endpoint, or request handle yields `None` and the caller keeps the
+/// generic message.
+///
+/// This relays provider wording verbatim, so it is restricted at the call
+/// site to the client-error class. Provider messages for authentication,
+/// not-found, and server-side failures are operator-facing and can name
+/// deployments or accounts, so they stay content-free.
+pub fn rejected_detail(dialect: Dialect, body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let message = match dialect {
+        Dialect::OpenAiResponses
+        | Dialect::OpenAiCompatible
+        | Dialect::AnthropicMessages
+        | Dialect::GeminiGenerateContent => value.get("error")?.get("message")?.as_str()?,
+        // Bedrock reports a modeling error as a bare top-level `message`.
+        Dialect::BedrockConverseStream => value.get("message")?.as_str()?,
+    };
+    sanitized_detail(message)
+}
+
+/// One provider sentence reduced to bounded, single-line, printable text.
+///
+/// Control characters end the candidate rather than being escaped: their
+/// presence means the field carries a payload, not a sentence. Interior runs
+/// of spaces and tabs collapse so the relayed text stays one readable line,
+/// and [`carries_provider_identifier`] then rejects any sentence naming
+/// provider-side infrastructure.
+fn sanitized_detail(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAXIMUM_DETAIL_LENGTH {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .any(|c| (c.is_control() && c != '\t') || (c.is_whitespace() && c != ' ' && c != '\t'))
+    {
+        return None;
+    }
+    let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() || collapsed.split(' ').any(carries_provider_identifier) {
+        return None;
+    }
+    Some(collapsed)
+}
+
+/// Whether one word of a provider sentence names provider-side infrastructure.
+///
+/// An explanation the caller can act on is prose about their own request, so
+/// it never needs an endpoint, a mailbox, a resource name, or an opaque
+/// handle. Any unquoted word shaped like one disqualifies the whole sentence:
+/// a partially redacted explanation reads as fact while hiding what was cut,
+/// and the caller keeps the generic message instead. A quoted word is the
+/// value the caller sent back to them, so only the unambiguous network and
+/// resource shapes disqualify it.
+fn carries_provider_identifier(word: &str) -> bool {
+    let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
+    if word.contains("://") || word.contains('@') || bare.to_ascii_lowercase().starts_with("arn:") {
+        return true;
+    }
+    if bare.len() == 36 && bare.chars().filter(|c| *c == '-').count() == 4 {
+        return true;
+    }
+    let dotted: Vec<&str> = bare.split('.').collect();
+    if dotted.len() == 4
+        && dotted
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+    {
+        return true;
+    }
+    // A bare word mixing letters and digits is a label rather than English:
+    // an account, a deployment, a region, a revision, or a key. Length is not
+    // part of the test, so `prod-7` and `acct-123` are as disqualifying as a
+    // full opaque handle. Prose keeps its numbers (`8192`) and parameter
+    // names keep their shape (`top_p`, `input[1].status`), because neither
+    // mixes the two inside one unpunctuated word.
+    //
+    // Quoting is the exception. A provider quotes the value the caller sent
+    // (`Unsupported model 'gpt-4o-mini'.`) and states its own infrastructure
+    // unquoted, so a quoted label is something the caller already knows and
+    // needs to see named.
+    if word.starts_with(['\'', '"', '`']) {
+        return false;
+    }
+    let label = bare
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    label
+        && bare.chars().any(|c| c.is_ascii_digit())
+        && bare.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// The argument named after one fixed OpenAI-family unknown-argument prefix.
@@ -345,6 +452,93 @@ mod tests {
             }
             Dialect::BedrockConverseStream => "none: no machine-readable parameter contract",
         }
+    }
+
+    #[test]
+    fn provider_explanation_is_relayed_for_every_dialect_message_field() {
+        // Exact shapes captured live from each provider (2026-08-29).
+        let openai = r#"{"error": {"message": "Unknown parameter: 'top_k'.",
+            "type": "invalid_request_error"}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, openai).as_deref(),
+            Some("Unknown parameter: 'top_k'.")
+        );
+        let anthropic = r#"{"type": "error", "error": {"type": "invalid_request_error",
+            "message": "`top_p` is deprecated for this model."}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::AnthropicMessages, anthropic).as_deref(),
+            Some("`top_p` is deprecated for this model.")
+        );
+        let bedrock = r#"{"message": "The provided model does not support tool use."}"#;
+        assert_eq!(
+            rejected_detail(Dialect::BedrockConverseStream, bedrock).as_deref(),
+            Some("The provided model does not support tool use.")
+        );
+    }
+
+    #[test]
+    fn provider_explanation_is_dropped_when_it_is_not_one_bounded_sentence() {
+        let multiline = r#"{"error": {"message": "failed\n  at deployment-7\n"}}"#;
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, multiline), None);
+        let oversized = format!(
+            r#"{{"error": {{"message": "{}"}}}}"#,
+            "x".repeat(MAXIMUM_DETAIL_LENGTH + 1)
+        );
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, &oversized), None);
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "{}"), None);
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "<html>"), None);
+        let blank = r#"{"error": {"message": "   "}}"#;
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, blank), None);
+    }
+
+    #[test]
+    fn provider_explanation_is_dropped_when_it_names_provider_infrastructure() {
+        // One readable sentence each, differing only in the operator-facing
+        // value the provider chose to echo back.
+        for message in [
+            "The deployment gpt4o-prod-7f2a91be44 is not configured for this account.",
+            "Model access denied for account 5f4dcc3b5aa765d61d8327deb882cf99.",
+            "Request 3f8a1c2e-9b44-4d17-9a1e-77c0d2b8e451 failed validation.",
+            "Route your request to https://eastus2.api.internal.example.com instead.",
+            "Contact platform-oncall@example.com about this quota.",
+            "The endpoint 10.42.117.8 rejected the model.",
+            "Deployment prod-7 is retired.",
+            "Quota exhausted for acct-123.",
+            "Use region eastus2 instead.",
+            "Model arn:aws:bedrock:us-east-1:481516234299:model/private is unavailable.",
+        ] {
+            let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
+            assert_eq!(
+                rejected_detail(Dialect::OpenAiCompatible, &body),
+                None,
+                "relayed an identifier-bearing sentence: {message}"
+            );
+        }
+        // Ordinary caller-actionable prose stays relayable, including the
+        // punctuation and short numbers that appear in parameter complaints.
+        for message in [
+            "`top_p` is deprecated for this model.",
+            "Unsupported value: 'input[1].status' is not one of the allowed values.",
+            "max_tokens must be less than or equal to 8192, got 100000.",
+            "Unsupported model 'gpt-4o-mini' for the Responses API.",
+            "`v2` is not a valid value for `api_version`.",
+        ] {
+            let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
+            assert_eq!(
+                rejected_detail(Dialect::OpenAiCompatible, &body).as_deref(),
+                Some(message),
+                "dropped a caller-actionable sentence: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn relayed_explanation_collapses_interior_whitespace_runs() {
+        let padded = r#"{"error": {"message": "  Unknown   parameter:\t'top_k'.  "}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, padded).as_deref(),
+            Some("Unknown parameter: 'top_k'.")
+        );
     }
 
     #[test]
