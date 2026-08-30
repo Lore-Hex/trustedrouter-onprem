@@ -25,6 +25,7 @@ from exp.common.models import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.common.models.catalog import infer_azure_api_surface
 
 
 def _catalog() -> ModelCatalog:
@@ -479,6 +480,37 @@ def test_native_provider_rejects_a_custom_endpoint_that_could_receive_its_key(
         )
 
 
+def test_azure_surface_inference_follows_the_resource_host() -> None:
+    """Foundry hosts serve model inference, Azure OpenAI hosts serve deployments."""
+    assert infer_azure_api_surface("https://resource.openai.azure.com") == "openai_deployments"
+    assert (
+        infer_azure_api_surface("https://Resource.Services.AI.Azure.com/models")
+        == "model_inference"
+    )
+    assert infer_azure_api_surface("https://resource.inference.ai.azure.com") == "model_inference"
+    assert infer_azure_api_surface("https://gateway.example.test/tenant-a") is None
+
+
+def test_undeclared_foundry_endpoint_keeps_its_stored_identity() -> None:
+    """Inference never moves the identity digest of a connection whose surface was not declared."""
+    undeclared = ConnectionConfig(
+        provider="azure",
+        base_url="https://resource.services.ai.azure.com/models",
+        api_key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+    )
+    declared = undeclared.model_copy(update={"azure_api_surface": "model_inference"})
+
+    assert undeclared.identity_sha256() != declared.identity_sha256()
+    assert undeclared.identity_sha256() == sha256_json(
+        {
+            "provider": "azure",
+            "base_url": "https://resource.services.ai.azure.com/models",
+            "api_version": "2024-05-01-preview",
+        }
+    )
+
+
 def test_azure_connection_requires_endpoint_key_and_api_version() -> None:
     """Azure catalog records pair one resource endpoint with one key name and API version."""
     connection = ConnectionConfig(
@@ -681,3 +713,23 @@ model = "anthropic.claude-sonnet-4-5"
         load_model_catalog(azure_path)
     with pytest.raises(ModelCatalogError, match="explicit capabilities"):
         load_model_catalog(bedrock_path)
+
+
+def test_declared_foundry_endpoint_spellings_keep_their_stored_identity() -> None:
+    """Identity folds only the terminal /models segment, so no stored digest moves on upgrade."""
+    root = ConnectionConfig(
+        provider="azure",
+        base_url="https://resource.services.ai.azure.com",
+        api_key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+        azure_api_surface="model_inference",
+    )
+    with_models = root.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com/models"}
+    )
+    with_v1_root = root.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com/openai/v1"}
+    )
+
+    assert root.identity_sha256() == with_models.identity_sha256()
+    assert root.identity_sha256() != with_v1_root.identity_sha256()

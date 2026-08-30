@@ -7,6 +7,11 @@ from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 from exp.common.models import ChatMaxTokensField, ModelSnapshot
+from exp.common.models.catalog import (
+    AzureApiSurface,
+    infer_azure_api_surface,
+    strip_model_inference_root,
+)
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
@@ -17,6 +22,42 @@ AZURE_OPENAI_API_KEY_ENV = "AZURE_OPENAI_API_KEY"
 AZURE_OPENAI_ENDPOINT_ENV = "AZURE_OPENAI_ENDPOINT"
 _V1_API_VERSION = "v1"
 _V1_ROOT_SUFFIX = "/openai/v1"
+
+DEFAULT_AZURE_API_SURFACE: AzureApiSurface = "openai_deployments"
+# The Foundry model-inference surface requires a dated API version, so an endpoint left on the
+# Azure OpenAI ``v1`` spelling still resolves to a version that surface accepts.
+MODEL_INFERENCE_FALLBACK_API_VERSION = "2024-05-01-preview"
+
+
+def resolve_azure_api_surface(
+    *,
+    endpoint: str,
+    api_version: str,
+    configured_surface: AzureApiSurface | None,
+) -> tuple[AzureApiSurface, str]:
+    """Resolve the wire surface and API version one Azure connection should use.
+
+    An explicitly configured surface always wins. Otherwise the surface follows the endpoint
+    host, so a Foundry resource reaches the model-inference surface without an operator having to
+    name it. An inferred model-inference surface also upgrades the Azure OpenAI ``v1`` API
+    version, which that surface rejects.
+
+    Args:
+        endpoint: Azure resource endpoint from the connection.
+        api_version: API version configured on the connection.
+        configured_surface: Operator-declared surface, when the connection carries one.
+
+    Returns:
+        The surface to call and the API version to send with it.
+    """
+    if configured_surface is not None:
+        return configured_surface, api_version
+    inferred = infer_azure_api_surface(endpoint)
+    if inferred is None:
+        return DEFAULT_AZURE_API_SURFACE, api_version
+    if inferred == "model_inference" and api_version == _V1_API_VERSION:
+        return inferred, MODEL_INFERENCE_FALLBACK_API_VERSION
+    return inferred, api_version
 
 
 def same_azure_endpoint(
@@ -101,7 +142,10 @@ def _azure_base_url(
     """Build the Azure request root for the configured API surface.
 
     ``v1`` uses the Foundry and Azure OpenAI ``/openai/v1`` root and places the deployment in
-    the JSON body. A dated API version uses the classic deployment-in-path root.
+    the JSON body. A dated API version uses the classic deployment-in-path root. The
+    model-inference surface serves ``/models`` directly off the resource, so an endpoint spelled
+    with either the terminal ``/models`` segment or the Azure OpenAI ``/openai/v1`` root resolves
+    to that one route.
 
     Args:
         endpoint: Normalized Azure resource endpoint, with or without the ``/openai/v1`` root.
@@ -114,9 +158,7 @@ def _azure_base_url(
     root = endpoint.rstrip("/")
     if api_surface == "model_inference":
         parsed = urlsplit(endpoint)
-        path = parsed.path.rstrip("/")
-        if path.lower().endswith("/models"):
-            path = path[:-7].rstrip("/")
+        path = strip_model_inference_root(parsed.path)
         model_path = f"{path}/models" if path else "/models"
         return urlunsplit((parsed.scheme, parsed.netloc, model_path, "", ""))
     if api_version == _V1_API_VERSION:
@@ -242,7 +284,8 @@ def _canonical_azure_endpoint(
 
     Default HTTPS port 443 and HTTP port 80 are treated as omitted so catalog identity and key
     pairing stay aligned. A non-default port is part of the resource identity. Model-inference
-    resource roots and their terminal ``/models`` form share one authority.
+    resource roots, their terminal ``/models`` form, and the Azure OpenAI ``/openai/v1`` root
+    share one authority.
     """
     parsed = urlsplit(value)
     hostname = (parsed.hostname or "").lower()
@@ -254,6 +297,6 @@ def _canonical_azure_endpoint(
     default_port = 443 if scheme == "https" else 80
     comparable_port = None if port in {None, default_port} else port
     path = parsed.path.rstrip("/")
-    if api_surface == "model_inference" and path.lower().endswith("/models"):
-        path = path[:-7].rstrip("/")
+    if api_surface == "model_inference":
+        path = strip_model_inference_root(path)
     return (scheme, hostname, comparable_port, path)

@@ -46,6 +46,14 @@ _FIXED_ORIGIN_PROVIDERS = frozenset(
 )
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
+AzureApiSurface = Literal["openai_deployments", "model_inference"]
+"""Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
+
+_FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
+_AZURE_OPENAI_HOST_SUFFIX = ".openai.azure.com"
+_MODEL_INFERENCE_ROOT_SUFFIXES = ("/models", "/openai/v1")
+_MODEL_INFERENCE_IDENTITY_SUFFIX = "/models"
+
 
 def _normalize_base_url(value: str) -> str:
     """Return the stable endpoint spelling used for connection identity."""
@@ -66,17 +74,64 @@ def _normalize_base_url(value: str) -> str:
     return urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
+def infer_azure_api_surface(endpoint: str) -> AzureApiSurface | None:
+    """Infer the Azure wire surface one resource endpoint serves.
+
+    Azure AI Foundry resources (``*.services.ai.azure.com``) serve the model-inference surface,
+    which carries provider-specific sampling fields such as ``top_k``. Azure OpenAI resources
+    (``*.openai.azure.com``) serve only the deployment surface.
+
+    Args:
+        endpoint: Azure resource endpoint from a connection.
+
+    Returns:
+        The surface the host is known to serve, or ``None`` for an unrecognized host such as a
+        private endpoint or a local recording proxy.
+    """
+    host = urlsplit(endpoint).hostname
+    if host is None:
+        return None
+    host = host.lower()
+    if host.endswith(_AZURE_OPENAI_HOST_SUFFIX):
+        return "openai_deployments"
+    if any(host.endswith(suffix) for suffix in _FOUNDRY_HOST_SUFFIXES):
+        return "model_inference"
+    return None
+
+
+def strip_model_inference_root(value: str) -> str:
+    """Remove the route suffix one Azure model-inference endpoint spelling carries.
+
+    The model-inference surface serves ``/models`` directly off the resource, so the bare resource,
+    its terminal ``/models`` form, and the Azure OpenAI ``/openai/v1`` root all name one resource.
+
+    Args:
+        value: Endpoint or endpoint path, with or without a trailing slash.
+
+    Returns:
+        The value reduced to the resource itself.
+    """
+    trimmed = value.rstrip("/")
+    for suffix in _MODEL_INFERENCE_ROOT_SUFFIXES:
+        if trimmed.lower().endswith(suffix):
+            return trimmed[: -len(suffix)].rstrip("/")
+    return trimmed
+
+
 def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
     """Normalize one endpoint while preserving provider-surface equivalence."""
     if connection.base_url is None:
         return None
     normalized = _normalize_base_url(connection.base_url)
+    # Endpoint identity is deliberately narrower than request routing: it folds only the terminal
+    # ``/models`` segment, and only for a declared surface, so no stored credential digest moves
+    # for a connection the operator never edited.
     if (
         connection.provider == "azure"
         and connection.azure_api_surface == "model_inference"
-        and normalized.lower().endswith("/models")
+        and normalized.lower().endswith(_MODEL_INFERENCE_IDENTITY_SUFFIX)
     ):
-        return normalized[:-7].rstrip("/")
+        return normalized[: -len(_MODEL_INFERENCE_IDENTITY_SUFFIX)].rstrip("/")
     return normalized
 
 
