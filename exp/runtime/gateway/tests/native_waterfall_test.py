@@ -515,11 +515,19 @@ def test_streaming_request_skips_the_open_primary_circuit(
 ) -> None:
     """An open primary circuit routes a streamed request straight to depth one.
 
-    The previous scenario's two operational failures opened the primary's
-    circuit, so this streamed request dispatches once on the fallback and its
-    committed headers name the winning deployment position before the first
-    byte flows.
+    Prime the circuit in this test so xdist may schedule it independently of
+    the persistent-failure scenario. The streamed request then dispatches once
+    on the fallback and its committed headers name the winning deployment
+    position before the first byte flows.
     """
+    priming = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_chat_payload("always-500"),
+        timeout=30.0,
+    )
+    assert priming.status_code == 200
+
     collected = b""
     with httpx.stream(
         "POST",
@@ -542,10 +550,18 @@ def test_streaming_request_skips_the_open_primary_circuit(
 def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None:
     """Every accepted request settles: no open attempts, matched totals.
 
-    Runs last in the module (pytest preserves definition order), so it sees
-    the traffic of every scenario above plus its own success probe, which the
-    still-open primary circuit routes to the fallback in one dispatch.
+    Compare against a baseline so the invariant remains valid when xdist's
+    work-stealing scheduler splits this module across workers. Each worker has
+    its own module-scoped engine and therefore may see only part of the module.
     """
+    before = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
+    with sqlite3.connect(engine.database_path) as connection:
+        (attempts_before,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
+        (open_before,) = connection.execute(
+            "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
+        ).fetchone()
+    assert open_before == 0
+
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
         headers={"authorization": f"Bearer {engine.raw_key}"},
@@ -554,7 +570,7 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    assert report["totals"]["requests"] == 8
+    assert report["totals"]["requests"] == before["totals"]["requests"] + 1
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
@@ -562,4 +578,4 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
     assert open_attempts == 0
-    assert terminal_attempts == total_attempts == 12
+    assert terminal_attempts == total_attempts == attempts_before + 1

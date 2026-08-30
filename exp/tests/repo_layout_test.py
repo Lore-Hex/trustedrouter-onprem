@@ -35,6 +35,7 @@ ALLOWED_TOP_FILES = {
     "CLAUDE.md",
     "LICENSE",
     "README.md",
+    "SECURITY.md",
     "conftest.py",
     "justfile",
     "pyproject.toml",
