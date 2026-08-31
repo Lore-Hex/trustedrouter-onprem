@@ -46,6 +46,14 @@ _FIXED_ORIGIN_PROVIDERS = frozenset(
 )
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
+AzureApiSurface = Literal["openai_deployments", "model_inference"]
+"""Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
+
+_FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
+_AZURE_OPENAI_HOST_SUFFIX = ".openai.azure.com"
+_MODEL_INFERENCE_ROOT_SUFFIXES = ("/models", "/openai/v1")
+_MODEL_INFERENCE_IDENTITY_SUFFIX = "/models"
+
 
 def _normalize_base_url(value: str) -> str:
     """Return the stable endpoint spelling used for connection identity."""
@@ -66,17 +74,64 @@ def _normalize_base_url(value: str) -> str:
     return urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
+def infer_azure_api_surface(endpoint: str) -> AzureApiSurface | None:
+    """Infer the Azure wire surface one resource endpoint serves.
+
+    Azure AI Foundry resources (``*.services.ai.azure.com``) serve the model-inference surface,
+    which carries provider-specific sampling fields such as ``top_k``. Azure OpenAI resources
+    (``*.openai.azure.com``) serve only the deployment surface.
+
+    Args:
+        endpoint: Azure resource endpoint from a connection.
+
+    Returns:
+        The surface the host is known to serve, or ``None`` for an unrecognized host such as a
+        private endpoint or a local recording proxy.
+    """
+    host = urlsplit(endpoint).hostname
+    if host is None:
+        return None
+    host = host.lower()
+    if host.endswith(_AZURE_OPENAI_HOST_SUFFIX):
+        return "openai_deployments"
+    if any(host.endswith(suffix) for suffix in _FOUNDRY_HOST_SUFFIXES):
+        return "model_inference"
+    return None
+
+
+def strip_model_inference_root(value: str) -> str:
+    """Remove the route suffix one Azure model-inference endpoint spelling carries.
+
+    The model-inference surface serves ``/models`` directly off the resource, so the bare resource,
+    its terminal ``/models`` form, and the Azure OpenAI ``/openai/v1`` root all name one resource.
+
+    Args:
+        value: Endpoint or endpoint path, with or without a trailing slash.
+
+    Returns:
+        The value reduced to the resource itself.
+    """
+    trimmed = value.rstrip("/")
+    for suffix in _MODEL_INFERENCE_ROOT_SUFFIXES:
+        if trimmed.lower().endswith(suffix):
+            return trimmed[: -len(suffix)].rstrip("/")
+    return trimmed
+
+
 def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
     """Normalize one endpoint while preserving provider-surface equivalence."""
     if connection.base_url is None:
         return None
     normalized = _normalize_base_url(connection.base_url)
+    # Endpoint identity is deliberately narrower than request routing: it folds only the terminal
+    # ``/models`` segment, and only for a declared surface, so no stored credential digest moves
+    # for a connection the operator never edited.
     if (
         connection.provider == "azure"
         and connection.azure_api_surface == "model_inference"
-        and normalized.lower().endswith("/models")
+        and normalized.lower().endswith(_MODEL_INFERENCE_IDENTITY_SUFFIX)
     ):
-        return normalized[:-7].rstrip("/")
+        return normalized[: -len(_MODEL_INFERENCE_IDENTITY_SUFFIX)].rstrip("/")
     return normalized
 
 
@@ -337,6 +392,22 @@ class GatewayDeploymentCapabilities(ContractModel):
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
+    time_to_first_byte_base_seconds: float | None = Field(default=None, gt=0)
+    """Deployment override for the lane's flat time-to-first-byte allowance.
+
+    ``None`` uses the serving configuration's default. The effective bound on
+    the wait for a provider's response headers is this base plus the
+    input-scaled allowance below, so very large prompts are not misread as a
+    dead lane.
+    """
+    time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
+    """Deployment override for the input-scaled time-to-first-byte allowance.
+
+    Seconds added per million approximate input tokens (the request body's
+    bytes divided by four; an allowance heuristic, never a billing quantity).
+    ``None`` uses the serving configuration's default; ``0`` disables scaling
+    for this deployment.
+    """
 
     @property
     def declares_reasoning_contract(self) -> bool:
@@ -372,6 +443,27 @@ class GatewayDeploymentCapabilities(ContractModel):
         return self
 
 
+class GatewayLongContextTier(ContractModel):
+    """Premium rates a provider applies to whole long-context requests.
+
+    Both published tier schedules this models (Gemini's ``prompts > 200k``
+    rates and Anthropic's legacy 1M-beta premium) reprice the ENTIRE request
+    once provider-reported input tokens reach the threshold, never only the
+    tokens past it, so that is the one semantic implemented: when
+    ``usage.input_tokens >= input_threshold_tokens``, these rates replace
+    the base rates for every dimension of the request. ``None`` means the
+    tier rate is unknown exactly as on the base schedule; it never inherits
+    the base rate, so a deployment reporting a dimension without a tier
+    price stays honestly unpriced above the threshold.
+    """
+
+    input_threshold_tokens: int = Field(gt=0)
+    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+
+
 class GatewayTokenPrices(ContractModel):
     """Integer gateway attribution rates for one provider deployment.
 
@@ -383,6 +475,15 @@ class GatewayTokenPrices(ContractModel):
     cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    long_context: GatewayLongContextTier | None = None
+    """Whole-request premium schedule for long-context input, when one exists.
+
+    Verified against the providers' published schedules (2026-08-30):
+    Gemini prices ``prompts > 200k tokens`` at a higher whole-request rate
+    for input, output, and cache reads; Anthropic's Claude 4.6+ models serve
+    the full 1M window at standard pricing (no tier), so current Anthropic
+    deployments leave this ``None``.
+    """
 
 
 class GatewayDeploymentMetadata(ContractModel):

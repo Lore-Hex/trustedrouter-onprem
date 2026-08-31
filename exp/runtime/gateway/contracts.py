@@ -66,6 +66,59 @@ class GatewayToolDefinition(ContractModel):
     description: str | None = Field(default=None, max_length=65_536)
     parameters: JsonObject
     strict: bool = False
+    cache_control: JsonObject | None = Field(default=None, exclude=True)
+    """Validated caller prompt-caching hint attached to this tool definition.
+
+    Forwarded onto the native Anthropic tool block and dropped with
+    disclosure on other wires. Like ``ToolCall.cache_control``, a cache hint
+    changes cost, not semantics, so it joins neither serialization nor
+    replay identity: two requests differing only here are the same request.
+    """
+    eager_input_streaming: bool | None = Field(default=None, exclude=True)
+    """Verbatim Anthropic fine-grained tool-input streaming selector.
+
+    Accepted bare by the provider (verified live 2026-08-30; no beta
+    header). Claude Code sends it conditionally. It changes how the
+    provider frames tool-input deltas, so like the other Anthropic-native
+    carriers it is excluded from serialization (tool digests predate it)
+    and a present value joins replay identity through
+    :func:`canonical_request_sha256`.
+    """
+    defer_loading: bool | None = Field(default=None, exclude=True)
+    """Verbatim Anthropic tool-search deferred-loading selector.
+
+    Accepted bare by the provider, which owns the cross-tool validity rules
+    (verified live 2026-08-30: ``false`` is a no-op and an all-deferred
+    toolset is the provider's own 400). Excluded from serialization; a
+    present value changes what the model initially sees, so it joins replay
+    identity through :func:`canonical_request_sha256`.
+    """
+    allowed_callers: tuple[str, ...] | None = Field(default=None, exclude=True)
+    """Verbatim Anthropic programmatic-tool-calling caller allowlist.
+
+    Accepted bare by the provider even without a companion server tool
+    (verified live 2026-08-30), so the provider stays the authority on the
+    combination rules. Excluded from serialization; a present value joins
+    replay identity through :func:`canonical_request_sha256`.
+    """
+    input_examples: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
+    """Verbatim Anthropic example tool inputs.
+
+    Accepted bare by the provider (verified live 2026-08-30). Examples add
+    provider-visible prompt content, so a present value is excluded from
+    serialization and joins replay identity through
+    :func:`canonical_request_sha256`; reservation counts its bytes with the
+    rest of the replay envelope.
+    """
+
+    def has_anthropic_tool_carriers(self) -> bool:
+        """Whether any Anthropic-native tool carrier is present on this tool."""
+        return (
+            self.eager_input_streaming is not None
+            or self.defer_loading is not None
+            or self.allowed_callers is not None
+            or self.input_examples is not None
+        )
 
 
 class StructuredTextFormat(ContractModel):
@@ -336,6 +389,26 @@ class GatewayRequest(ContractModel):
     so a present value joins replay identity through
     :func:`canonical_request_sha256`.
     """
+    provider_cache_control: JsonObject | None = Field(default=None, exclude=True)
+    """Verbatim caller top-level ``cache_control`` from the Messages surface.
+
+    Anthropic's automatic prompt-caching marker for the last cacheable
+    block (accepted bare, verified live 2026-08-30). Forwarded byte-for-byte
+    on Anthropic rungs and dropped with disclosure elsewhere. Like the
+    tool-call cache hint, it changes cost, not semantics, so it deliberately
+    joins NEITHER serialization NOR replay identity: two requests differing
+    only here are the same request.
+    """
+    inference_geo: str | None = Field(default=None, max_length=64, exclude=True)
+    """Verbatim caller ``inference_geo`` selector from the Messages surface.
+
+    Anthropic's inference-region selector (accepted bare, verified live
+    2026-08-30). Bounded but deliberately not enumerated: the region set is
+    an evolving provider surface. Forwarded verbatim on Anthropic rungs and
+    dropped with disclosure elsewhere. Where inference runs is a
+    caller-visible processing commitment, so a present value joins replay
+    identity through :func:`canonical_request_sha256`.
+    """
     provider_beta_tokens: tuple[str, ...] = Field(default=(), exclude=True)
     """Allowlisted caller ``anthropic-beta`` tokens from the Messages surface.
 
@@ -490,6 +563,15 @@ class GatewayRequest(ContractModel):
             raise ValueError("diagnostics is valid only for Messages requests")
         if self.speed is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("speed is valid only for Messages requests")
+        if self.provider_cache_control is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("provider_cache_control is valid only for Messages requests")
+        if self.inference_geo is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("inference_geo is valid only for Messages requests")
+        if (
+            any(tool.has_anthropic_tool_carriers() for tool in self.tools)
+            and self.surface != GatewayApiSurface.MESSAGES
+        ):
+            raise ValueError("Anthropic tool carriers are valid only for Messages requests")
         if self.provider_beta_tokens and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_beta_tokens are valid only for Messages requests")
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
@@ -501,22 +583,23 @@ class GatewayRequest(ContractModel):
         return self
 
 
-def canonical_request_sha256(request: GatewayRequest) -> Sha256:
-    """Digest one canonical request including excluded provider replay authority.
+def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
+    """Collect the provider-significant input excluded from serialization.
 
-    The carriers are excluded from model serialization so immutable artifacts
-    and pre-existing request digests stay byte-identical, but they are
-    provider-significant input: a caller operation key reused with different
-    replayed reasoning must be a rejected conflict, never a silent replay of
-    the earlier response. A request with no carrier digests exactly as its
-    plain serialization, so every request decoded before the carriers existed
-    keeps its identity.
+    The carriers (replayed reasoning, native items, verbatim provider
+    configurations) are excluded from model serialization so immutable
+    artifacts and pre-existing request digests stay byte-identical, but the
+    provider still reads them as input. Replay identity folds this envelope
+    into :func:`canonical_request_sha256`, and reservation adds its bytes to
+    the conservative input bound so an excluded carrier can never push a
+    request across a pricing threshold unreserved.
 
     Args:
         request: Canonical gateway request as decoded from the public wire.
 
     Returns:
-        The stable canonical request digest.
+        The envelope of excluded provider input, or ``None`` when the plain
+        serialization already covers everything.
     """
     replay: list[JsonObject] = []
     for message_index, message in enumerate(request.messages):
@@ -563,19 +646,34 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
             authority["tool_is_error"] = True
         if len(authority) > 1:
             replay.append(authority)
+    retained_tools: list[JsonObject] = []
+    for tool_index, tool in enumerate(request.tools):
+        if not tool.has_anthropic_tool_carriers():
+            continue
+        retained_tool: JsonObject = {"tool_index": tool_index, "name": tool.name}
+        if tool.eager_input_streaming is not None:
+            retained_tool["eager_input_streaming"] = tool.eager_input_streaming
+        if tool.defer_loading is not None:
+            retained_tool["defer_loading"] = tool.defer_loading
+        if tool.allowed_callers is not None:
+            retained_tool["allowed_callers"] = list(tool.allowed_callers)
+        if tool.input_examples is not None:
+            retained_tool["input_examples"] = list(tool.input_examples)
+        retained_tools.append(retained_tool)
     if (
         not replay
+        and not retained_tools
         and request.provider_thinking_config is None
         and request.reasoning_context is None
         and request.context_management is None
         and request.provider_output_config is None
         and request.diagnostics is None
         and request.speed is None
+        and request.inference_geo is None
         and not request.provider_beta_tokens
     ):
-        return sha256_json(request)
+        return None
     envelope: JsonObject = {
-        "request_sha256": sha256_json(request),
         "provider_replay": replay,
         "provider_thinking_config": request.provider_thinking_config,
         "reasoning_context": request.reasoning_context,
@@ -588,9 +686,33 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
         envelope["diagnostics"] = request.diagnostics
     if request.speed is not None:
         envelope["speed"] = request.speed
+    if request.inference_geo is not None:
+        envelope["inference_geo"] = request.inference_geo
+    if retained_tools:
+        envelope["tools"] = retained_tools
     if request.provider_beta_tokens:
         envelope["provider_beta_tokens"] = list(request.provider_beta_tokens)
-    return sha256_json(envelope)
+    return envelope
+
+
+def canonical_request_sha256(request: GatewayRequest) -> Sha256:
+    """Digest one canonical request including excluded provider replay authority.
+
+    A caller operation key reused with different replayed reasoning must be
+    a rejected conflict, never a silent replay of the earlier response. A
+    request with no carrier digests exactly as its plain serialization, so
+    every request decoded before the carriers existed keeps its identity.
+
+    Args:
+        request: Canonical gateway request as decoded from the public wire.
+
+    Returns:
+        The stable canonical request digest.
+    """
+    envelope = provider_replay_authority(request)
+    if envelope is None:
+        return sha256_json(request)
+    return sha256_json({"request_sha256": sha256_json(request), **envelope})
 
 
 class GatewayUsage(ContractModel):

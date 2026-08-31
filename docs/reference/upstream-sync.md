@@ -8,7 +8,7 @@ layer.
 - Upstream repository: `https://github.com/experientiallabs/experiential`
 - Upstream branch: `main`
 - Initial reviewed commit: `c8220b0543ad6d5f426f831377f9efcd67be0aa1`
-- Last reviewed commit: `d2bdef1a45a329df161b0f0be37d284d8f7b1f57`
+- Last reviewed commit: `fdda36671cc5e26cca71a1dc39f4942ba0409259`
 - Fork repository: `https://github.com/Lore-Hex/trustedrouter-onprem`
 
 ## Invariants

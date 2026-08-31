@@ -173,6 +173,17 @@ If no route can fit the shared team, identity, or total pool allocation, the neu
 returns HTTP 429 with OpenAI `insufficient_quota` semantics before provider work. Any required
 unknown price makes that route ineligible while a hard limit applies.
 
+A deployment's price schedule may declare a long-context tier: a whole-request premium applied
+once provider-reported input tokens reach its threshold, matching both published tier schedules
+(Gemini reprices `prompts > 200k` entirely; Anthropic's Claude 4.6+ models serve the 1M window at
+standard pricing and carry no tier). Reservation prices the tier fail-safe through the canonical
+byte bound (bytes never undercount tokens), settlement selects the frozen schedule by actual
+input tokens, and a tier missing a required rate keeps threshold-crossing attempts honestly
+unpriced. The wait for each attempt's first provider byte scales with input size (a flat base
+plus seconds per million approximate input tokens, both serving defaults with per-deployment
+overrides), so a 1M-token prefill is not misread as a dead lane while small requests keep the
+fail-fast bound.
+
 Settlement replaces the reservation with observed integer micro-USD usage. A dispatched failure,
 cancellation, or crash without trustworthy usage retains its conservative reservation because it
 may be billable. Retries and fallbacks therefore consume one allocation entry per physical attempt,
@@ -217,10 +228,16 @@ adaptive default; on the adaptive-only generation, which rejects `enabled`/`disa
 configs outright, an `enabled` config translates to adaptive with the dropped
 `thinking.budget_tokens` disclosed as ignored, and `disabled` is rejected by name
 because those models cannot turn thinking off), requires
-`max_tokens`, validates `cache_control` (dropping it everywhere except on `tool_use` blocks,
-where the hint forwards natively; non-Anthropic routes disclose the omission through
-`ignored_parameters`), and rejects image and document blocks loudly because the surface is
-text-only. Thinking carriers
+`max_tokens`, validates `cache_control` (carrying it where the Anthropic wire caches natively:
+`tool_use` blocks, tool definitions, and the top-level automatic marker forward verbatim, while
+content-block hints drop; non-Anthropic routes disclose each omission through
+`ignored_parameters`), carries the provider-native tool annotations (`strict`,
+`eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
+bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with
+disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
+decision behind an SDK-surface drift gate in
+`exp/runtime/anthropic_protocol/manifest.py`, and rejects image and document blocks loudly
+because the surface is text-only. Thinking carriers
 replay only on the Anthropic wire, so route admission requires every waterfall rung to speak the
 `anthropic_messages` dialect; on the Responses surface over Anthropic routes, thinking text is
 projected onto the reasoning-summary channel (signatures deliberately dropped) so callers receive
