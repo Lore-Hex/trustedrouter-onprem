@@ -3,7 +3,10 @@
 The decoder is strict and lossless for supported content: text, ``tool_use``,
 ``tool_result``, ``thinking``, and ``redacted_thinking`` blocks translate
 faithfully (thinking history rides the opaque provider-reasoning carrier with
-byte-exact signatures); ``cache_control`` annotations are validated
+byte-exact signatures); echoed server-tool output (``server_tool_use``,
+``web_search_tool_result``, and citation-bearing ``text`` blocks) rides the
+verbatim per-block carrier so it round-trips byte-for-byte to native
+Anthropic rungs; ``cache_control`` annotations are validated
 everywhere and carried on the surfaces the Anthropic wire caches natively
 (tool_use blocks, tool definitions, and the top-level automatic marker),
 while content-block hints are dropped because they do not change model
@@ -27,9 +30,10 @@ from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
+    MESSAGES_SERVER_TOOL_TYPES_ACCEPTED,
 )
+from exp.runtime.gateway.compatibility import CompatibilityDisposition
 from exp.runtime.gateway.contracts import (
-    CompatibilityDisposition,
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
@@ -51,8 +55,6 @@ from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 _REJECTED_BLOCK_HINTS = {
     "image": "image blocks are not supported: this gateway surface is text-only",
     "document": "document blocks are not supported: this gateway surface is text-only",
-    "server_tool_use": "server tools are not supported by this gateway",
-    "web_search_tool_result": "server tools are not supported by this gateway",
 }
 
 
@@ -70,11 +72,19 @@ class _CacheControl(_WireModel):
 
 
 class _TextBlock(_WireModel):
-    """One plain text content block."""
+    """One plain text content block.
+
+    ``citations`` exists only as server-tool output echoed back in assistant
+    history (Claude Code resends the cited answer verbatim, and the SDK
+    accumulator materializes the key as null for uncited blocks); each
+    citation is an evolving provider shape with a provider-issued encrypted
+    index, so validation is deliberately shallow.
+    """
 
     type: Literal["text"]
     text: str
     cache_control: _CacheControl | None = None
+    citations: tuple[JsonObject, ...] | None = None
 
 
 class _ThinkingBlock(_WireModel):
@@ -119,8 +129,36 @@ class _ToolResultBlock(_WireModel):
     cache_control: _CacheControl | None = None
 
 
+class _ServerToolUseBlock(BaseModel):
+    """One server-tool invocation echoed in history, carried shallowly.
+
+    Server-tool block shapes are an evolving provider surface; a closed
+    model here would recreate the reject-what-real-clients-send incident
+    class, so only the discriminator is validated and the raw block forwards
+    byte-for-byte on native Anthropic rungs.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["server_tool_use"]
+
+
+class _WebSearchToolResultBlock(BaseModel):
+    """One server-tool result echoed in history, carried shallowly."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["web_search_tool_result"]
+
+
 _ContentBlock = (
-    _TextBlock | _ThinkingBlock | _RedactedThinkingBlock | _ToolUseBlock | _ToolResultBlock
+    _TextBlock
+    | _ThinkingBlock
+    | _RedactedThinkingBlock
+    | _ToolUseBlock
+    | _ToolResultBlock
+    | _ServerToolUseBlock
+    | _WebSearchToolResultBlock
 )
 
 
@@ -163,6 +201,28 @@ class _Tool(_WireModel):
     defer_loading: bool | None = None
     allowed_callers: tuple[str, ...] | None = None
     input_examples: tuple[JsonObject, ...] | None = None
+
+
+class _ServerTool(BaseModel):
+    """One Anthropic server tool, validated shallowly and carried verbatim.
+
+    Server tools (``web_search_20250305``-style) execute at the provider and
+    carry no ``input_schema``; their per-type configuration is an evolving
+    provider surface, so only the discriminator pair is validated and the
+    raw entry forwards byte-for-byte on native Anthropic rungs.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
+    name: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def _require_server_type(self) -> _ServerTool:
+        """Reject the custom discriminator: custom tools take the strict model."""
+        if self.type == "custom":
+            raise ValueError("custom tools must declare an input_schema")
+        return self
 
 
 class _ToolChoice(_WireModel):
@@ -211,7 +271,7 @@ class _MessagesRequest(_WireModel):
     top_k: int | None = Field(default=None, ge=0)
     stop_sequences: tuple[str, ...] | None = None
     stream: bool = False
-    tools: tuple[_Tool, ...] = ()
+    tools: tuple[_Tool | _ServerTool, ...] = ()
     tool_choice: _ToolChoice | None = None
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
@@ -259,11 +319,18 @@ def decode_messages(
     """
     _validate_manifest(payload)
     request = _validate_wire(payload)
+    _require_served_server_tool_types(request.tools)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
     if system_text:
-        messages.append(GatewayMessage(role="system", content=system_text))
+        messages.append(
+            GatewayMessage(
+                role="system",
+                content=system_text,
+                provider_text_blocks=_marked_text_blocks(request.system),
+            )
+        )
     for index, message in enumerate(request.messages):
         messages.extend(_gateway_messages(message, index))
     parallel_tool_calls: bool | None = None
@@ -273,7 +340,14 @@ def decode_messages(
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
             messages=tuple(messages),
-            tools=tuple(_gateway_tool(tool) for tool in request.tools),
+            tools=tuple(_gateway_tool(tool) for tool in request.tools if isinstance(tool, _Tool)),
+            # Raw payload entries, mirroring thinking: the provider receives
+            # each server tool byte-for-byte on Anthropic rungs.
+            provider_server_tools=tuple(
+                cast(JsonObject, cast(list, payload["tools"])[tool_index])
+                for tool_index, tool in enumerate(request.tools)
+                if isinstance(tool, _ServerTool)
+            ),
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,
@@ -313,6 +387,28 @@ def decode_messages(
     except ValidationError as exc:
         raise _validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
+
+
+def _require_served_server_tool_types(tools: tuple[_Tool | _ServerTool, ...]) -> None:
+    """Reject any server tool type the gateway cannot serve truthfully.
+
+    Acceptance means the data plane carries every block the tool makes the
+    provider stream (see the decision tables in ``manifest.py``); an
+    unclassified type stays rejected until the SDK drift gate forces its
+    decision, so a new provider tool never half-works silently.
+
+    Raises:
+        OpenAIProtocolError: A tool entry names an unserved server tool type.
+    """
+    for tool_index, tool in enumerate(tools):
+        if isinstance(tool, _ServerTool) and tool.type not in MESSAGES_SERVER_TOOL_TYPES_ACCEPTED:
+            supported = ", ".join(sorted(MESSAGES_SERVER_TOOL_TYPES_ACCEPTED))
+            raise invalid_field(
+                f"tools.{tool_index}.type",
+                f"the server tool type '{tool.type}' is not supported by this gateway. "
+                f"Supported server tool types: {supported}. Remove the tool or use a "
+                "supported type.",
+            )
 
 
 def _output_config_effort(config: JsonObject | None) -> ReasoningEffort | None:
@@ -487,6 +583,31 @@ def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
     return "\n\n".join(block.text for block in system)
 
 
+def _marked_text_blocks(
+    blocks: str | tuple[_TextBlock, ...] | None,
+) -> tuple[JsonObject, ...]:
+    """Rebuild a text-block run verbatim when any block carries a cache marker.
+
+    Claude Code marks system blocks and the last text block of recent user
+    turns (captured live 2026-09-01). The flattened string stays the
+    canonical content on every wire; this carrier exists so Anthropic rungs
+    re-emit the caller's exact block structure with its markers, which is
+    what makes the prompt cacheable at all. A markerless run carries
+    nothing, keeping existing payloads byte-identical.
+    """
+    if blocks is None or isinstance(blocks, str):
+        return ()
+    if all(block.cache_control is None for block in blocks):
+        return ()
+    rebuilt: list[JsonObject] = []
+    for block in blocks:
+        entry: JsonObject = {"type": "text", "text": block.text}
+        if block.cache_control is not None:
+            entry["cache_control"] = block.cache_control.model_dump(mode="json", exclude_none=True)
+        rebuilt.append(entry)
+    return tuple(rebuilt)
+
+
 def _stop_sequences(sequences: tuple[str, ...] | None) -> tuple[str, ...]:
     """Dedupe stop sequences in caller order and reject empty entries."""
     if not sequences:
@@ -566,13 +687,13 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             )
         return [GatewayMessage(role=message.role, content=message.content)]
     out: list[GatewayMessage] = []
-    text_parts: list[str] = []
+    text_parts: list[_TextBlock] = []
     tool_calls: list[ToolCall] = []
     reasoning: list[ProviderReasoningBlock] = []
 
     def flush() -> None:
         """Emit the pending text, tool calls, and reasoning as one canonical message."""
-        content = "".join(text_parts) if text_parts else None
+        content = "".join(part.text for part in text_parts) if text_parts else None
         if content is None and not tool_calls and not reasoning:
             return
         out.append(
@@ -581,6 +702,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 content=content,
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
+                provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
             )
         )
         text_parts.clear()
@@ -589,7 +711,28 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
 
     for block_index, block in enumerate(message.content):
         if isinstance(block, _TextBlock):
-            text_parts.append(block.text)
+            if block.citations:
+                if message.role != "assistant":
+                    raise invalid_field(
+                        f"{param}.content.{block_index}",
+                        "citations are only valid in assistant messages.",
+                    )
+                # A cited answer is server-tool output; the block re-emits
+                # verbatim so provider-issued encrypted indexes round-trip.
+                flush()
+                out.append(
+                    GatewayMessage(
+                        role="assistant",
+                        provider_anthropic_block=block.model_dump(
+                            mode="json", exclude_none=True, exclude={"cache_control"}
+                        ),
+                    )
+                )
+                continue
+            # An empty citations array (the SDK accumulator's uncited shape)
+            # carries no information and drops; a cache marker on the block
+            # survives through the marked-run carrier.
+            text_parts.append(block)
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
             if message.role != "assistant":
                 raise invalid_field(
@@ -622,6 +765,21 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     ),
                 )
             )
+        elif isinstance(block, (_ServerToolUseBlock, _WebSearchToolResultBlock)):
+            if message.role != "assistant":
+                raise invalid_field(
+                    f"{param}.content.{block_index}",
+                    "server tool blocks are only valid in assistant messages.",
+                )
+            # The raw echoed block (extras included) carries the whole
+            # message, mirroring provider_native_item on the Responses wire.
+            flush()
+            out.append(
+                GatewayMessage(
+                    role="assistant",
+                    provider_anthropic_block=block.model_dump(mode="json"),
+                )
+            )
         else:
             if message.role != "user":
                 raise invalid_field(
@@ -635,6 +793,14 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     content=_tool_result_text(block),
                     tool_call_id=block.tool_use_id,
                     tool_is_error=block.is_error,
+                    # The marker Claude Code puts on its conversation
+                    # breakpoints usually lands on a tool_result block; it
+                    # re-emits with the block on Anthropic rungs.
+                    cache_control=(
+                        block.cache_control.model_dump(mode="json", exclude_none=True)
+                        if block.cache_control is not None
+                        else None
+                    ),
                 )
             )
     flush()

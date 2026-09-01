@@ -65,6 +65,24 @@ _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
 _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
     {"gemini_generate_content", "bedrock_converse_stream"}
 )
+_REASONING_SUMMARY_DIALECTS = frozenset({"openai_responses", "anthropic_messages"})
+
+
+def _serves_reasoning_summary(profile: GatewayWireProfile) -> bool:
+    """Return whether one rung's reasoning reaches Responses summary parts.
+
+    Native Responses deployments carry summary parts on the wire, and
+    Anthropic thinking text is projected onto the same parts by the
+    Responses encoder. Every other dialect either has no reasoning text or
+    surfaces a reasoning item the summary channel cannot carry.
+
+    Args:
+        profile: One certified deployment wire profile from the route.
+
+    Returns:
+        Whether this deployment can serve a requested reasoning summary.
+    """
+    return profile.supports_reasoning and profile.dialect in _REASONING_SUMMARY_DIALECTS
 
 
 def _fireworks_continuation_required(profile: GatewayWireProfile, request: GatewayRequest) -> bool:
@@ -345,7 +363,7 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
     if request.reasoning_summary is not None and not all(
-        profile.dialect == "openai_responses" and profile.supports_reasoning for profile in profiles
+        _serves_reasoning_summary(profile) for profile in profiles
     ):
         path = next(
             iter(request.reasoning_summary_parameters),
@@ -422,7 +440,13 @@ def route_generation_parameter_requests(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         ignore("speed")
-    if request.provider_cache_control is not None and not all(
+    # Prompt-cache marker: honored on every Anthropic rung, so it is kept as
+    # long as ANY rung is Anthropic (only the non-Anthropic rungs silently
+    # cannot cache; a cache marker changes cost, not semantics). Dropping it the
+    # moment one fallback rung is non-Anthropic used to strip prefix caching
+    # from the winning Anthropic rung too, billing every turn's full context
+    # uncached (~10x on input for a large system prompt).
+    if request.provider_cache_control is not None and not any(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         ignore("provider_cache_control", "cache_control")
@@ -472,6 +496,19 @@ def route_generation_parameter_requests(
     ) and not all(profile.dialect == "anthropic_messages" for profile in profiles):
         if "messages.tool_calls.cache_control" not in ignored:
             ignored.append("messages.tool_calls.cache_control")
+
+    # Block-level cache markers (system and message text runs, tool-result
+    # breakpoints) follow the #699 rule: kept while ANY rung is Anthropic
+    # (the marker changes cost, not semantics, and only the non-Anthropic
+    # rungs silently cannot cache), disclosed only when no rung can honor
+    # them. Claude Code marks its system prompt and conversation
+    # breakpoints on every request.
+    if any(
+        message.provider_text_blocks or message.cache_control is not None
+        for message in request.messages
+    ) and not any(profile.dialect == "anthropic_messages" for profile in profiles):
+        if "messages.content.cache_control" not in ignored:
+            ignored.append("messages.content.cache_control")
 
     # Anthropic-native tool-definition annotations exist only on that wire;
     # every other rung drops each one with a per-field disclosure, never a
@@ -546,6 +583,25 @@ def route_generation_parameter_requests(
                 param="thinking.type",
                 code="unsupported_parameter",
             )
+    server_tools_present = bool(request.provider_server_tools) or any(
+        message.provider_anthropic_block is not None for message in request.messages
+    )
+    if server_tools_present and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        # Server tools execute at the provider; silently dropping a search
+        # capability the caller asked for would be a behavior lie, so a
+        # route that cannot serve them rejects by name instead.
+        raise ProviderParameterError(
+            message=(
+                "The request carries Anthropic server tools (web_search-style "
+                "entries or their echoed result blocks) that only a native "
+                "Anthropic route can serve. Remove the server tools or choose "
+                "a different model alias."
+            ),
+            param="tools",
+            code="unsupported_parameter",
+        )
     if any(message.provider_native_item is not None for message in request.messages) and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
@@ -608,7 +664,12 @@ def route_generation_parameter_requests(
 
     # Tool-selection controls have no semantics without tool definitions and
     # several provider APIs reject the otherwise harmless combination.
-    if not request.tools:
+    # Verbatim server tools are tool definitions too: a request carrying only
+    # web_search keeps its tool_choice on the wire.
+    server_tool_names = tuple(
+        str(entry["name"]) for entry in request.provider_server_tools if "name" in entry
+    )
+    if not request.tools and not request.provider_server_tools:
         if request.tool_choice == "required" or isinstance(
             request.tool_choice, GatewayNamedToolChoice
         ):
@@ -624,8 +685,10 @@ def route_generation_parameter_requests(
             ignore("tool_choice")
         if request.parallel_tool_calls is not None:
             ignore("parallel_tool_calls")
-    elif isinstance(request.tool_choice, GatewayNamedToolChoice) and not any(
-        tool.name == request.tool_choice.name for tool in request.tools
+    elif (
+        isinstance(request.tool_choice, GatewayNamedToolChoice)
+        and not any(tool.name == request.tool_choice.name for tool in request.tools)
+        and request.tool_choice.name not in server_tool_names
     ):
         raise ProviderParameterError(
             message=(

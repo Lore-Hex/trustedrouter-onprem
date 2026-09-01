@@ -369,6 +369,63 @@ def test_route_rejects_reasoning_summary_outside_native_responses() -> None:
     assert raised.value.param == "reasoning.generate_summary"
 
 
+def test_route_accepts_reasoning_summary_on_native_anthropic() -> None:
+    """Anthropic thinking reaches the summary channel, so the route serves the field."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="auto",
+        reasoning_summary_parameters=("reasoning.summary",),
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://anthropic.test",
+            model_id="claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert public_request.reasoning_summary == "auto"
+    assert provider_request.reasoning_summary == "auto"
+    assert "reasoning" not in anthropic_messages_stream_payload(
+        "claude-opus-5",
+        provider_request,
+        supports_reasoning=True,
+    )
+
+
+def test_reasoning_summary_narrows_a_mixed_claude_waterfall() -> None:
+    """A Claude route serves the summary on Anthropic instead of failing on its fallback."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="auto",
+        reasoning_summary_parameters=("reasoning.summary",),
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://anthropic.test",
+            model_id="claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.test",
+            model_id="anthropic/claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        ),
+    )
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (0,)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("temperature", 0.2), ("top_p", 0.8), ("top_k", 20)],
@@ -698,6 +755,30 @@ def test_route_shaping_omits_tool_controls_when_no_tools_exist() -> None:
     assert public_request.ignored_parameters == ("tool_choice", "parallel_tool_calls")
     assert provider_request.tool_choice is None
     assert provider_request.parallel_tool_calls is None
+
+
+def test_mixed_route_keeps_the_prompt_cache_marker_when_any_rung_is_anthropic() -> None:
+    """The cache marker survives a mixed waterfall so the winning Anthropic rung
+    still caches; only an all-non-Anthropic route drops it. Dropping it the
+    moment one fallback rung was non-Anthropic billed every turn's full context
+    uncached (~10x on a large system prompt)."""
+    request = _chat_request().model_copy(update={"provider_cache_control": {"type": "ephemeral"}})
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://a.test", model_id="claude-fable-5"
+    )
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://b.test")
+
+    # Mixed route with an Anthropic rung: kept, not disclosed.
+    public_request, provider_request = route_generation_parameter_requests(
+        (anthropic, fallback), request
+    )
+    assert provider_request.provider_cache_control == {"type": "ephemeral"}
+    assert "cache_control" not in public_request.ignored_parameters
+
+    # No rung can cache: dropped with disclosure.
+    public_only, provider_only = route_generation_parameter_requests((fallback,), request)
+    assert provider_only.provider_cache_control is None
+    assert "cache_control" in public_only.ignored_parameters
 
 
 def test_route_shaping_omits_parallel_control_when_tool_choice_disables_tools() -> None:
@@ -2096,10 +2177,12 @@ def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere
 
 
 def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_elsewhere() -> None:
-    """Provider-native tool annotations plus the top-level cache marker and
-    inference region reach only the Anthropic wire; any other rung drops
-    each with a per-field disclosure, never a rejection (a production
-    Claude Code session sent ``eager_input_streaming`` and was 400ed)."""
+    """Provider-native tool annotations and inference region reach only the
+    Anthropic wire; any other rung drops each with a per-field disclosure,
+    never a rejection (a production Claude Code session sent
+    ``eager_input_streaming`` and was 400ed). The top-level cache marker is the
+    exception: it is cost-only and honored on any Anthropic rung, so a mixed
+    waterfall keeps it rather than billing every turn uncached."""
     from exp.runtime.gateway.contracts import GatewayToolDefinition
 
     request = GatewayRequest(
@@ -2165,8 +2248,11 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
     mixed_public, mixed_provider = route_generation_parameter_requests(
         (anthropic, fallback), request
     )
+    # The top-level cache marker is COST-only and honored on the Anthropic rung,
+    # so a mixed waterfall keeps it (dropping it billed every turn uncached);
+    # the behavioral annotations still drop with disclosure on the non-Anthropic
+    # rungs.
     assert set(mixed_public.ignored_parameters) == {
-        "cache_control",
         "inference_geo",
         "tools.cache_control",
         "tools.eager_input_streaming",
@@ -2174,5 +2260,287 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
         "tools.allowed_callers",
         "tools.input_examples",
     }
-    assert mixed_provider.provider_cache_control is None
+    assert mixed_provider.provider_cache_control == {"type": "ephemeral"}
     assert mixed_provider.inference_geo is None
+
+
+def _web_search_messages_request(
+    *,
+    tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None,
+    echoed_block: bool = False,
+) -> GatewayRequest:
+    """Build one Messages request carrying a verbatim web_search server tool."""
+    messages: tuple[GatewayMessage, ...] = (GatewayMessage(role="user", content="search"),)
+    if echoed_block:
+        messages += (
+            GatewayMessage(
+                role="assistant",
+                provider_anthropic_block={
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {"query": "python"},
+                },
+            ),
+            GatewayMessage(role="user", content="and now?"),
+        )
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=messages,
+        provider_server_tools=(
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+        ),
+        tool_choice=tool_choice,
+        maximum_output_tokens=256,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+
+
+def _anthropic_web_search_profile(url: str = "https://anthropic.test") -> GatewayWireProfile:
+    """Return one native Anthropic Messages wire profile."""
+    return GatewayWireProfile(
+        dialect="anthropic_messages",
+        url=url,
+        model_id="claude-haiku-4-5",
+        reasoning_wire_format="anthropic_adaptive",
+    )
+
+
+def test_server_tools_reject_mixed_routes_by_name() -> None:
+    """A route with any non-Anthropic rung cannot serve server tools.
+
+    Rejection, not disclosure-drop: silently removing a search capability
+    the caller asked for would falsify every answer that needed it.
+    """
+    profiles = (
+        _anthropic_web_search_profile(),
+        GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test"),
+    )
+    for request in (
+        _web_search_messages_request(),
+        _web_search_messages_request(echoed_block=True).model_copy(
+            update={"provider_server_tools": ()}
+        ),
+    ):
+        with pytest.raises(ProviderParameterError) as raised:
+            route_generation_parameter_requests(profiles, request)
+        assert raised.value.code == "unsupported_parameter"
+        assert raised.value.param == "tools"
+        assert "Anthropic" in str(raised.value)
+
+
+def test_server_tools_keep_tool_choice_on_an_anthropic_route() -> None:
+    """Server tools count as tool definitions for the no-op selector rule."""
+    profiles = (
+        _anthropic_web_search_profile(),
+        _anthropic_web_search_profile("https://anthropic-b.test"),
+    )
+    for tool_choice in ("auto", "required", GatewayNamedToolChoice(name="web_search")):
+        request = _web_search_messages_request(tool_choice=tool_choice)
+        public_request, provider_request = route_generation_parameter_requests(profiles, request)
+        assert "tool_choice" not in public_request.ignored_parameters
+        assert provider_request.tool_choice == tool_choice
+        assert provider_request.provider_server_tools == request.provider_server_tools
+
+
+def test_anthropic_payload_appends_server_tools_verbatim_after_custom_tools() -> None:
+    """Server tool entries re-emit byte-for-byte after the converted tools."""
+    request = _web_search_messages_request(tool_choice="auto").model_copy(
+        update={
+            "tools": (GatewayToolDefinition(name="Bash", parameters={"type": "object"}),),
+        }
+    )
+    payload = anthropic_messages_stream_payload("claude-haiku-4-5", request)
+    assert payload["tools"] == [
+        {"name": "Bash", "input_schema": {"type": "object"}},
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+    ]
+    assert payload["tool_choice"] == {"type": "auto"}
+
+
+def test_anthropic_payload_serves_a_server_tool_only_toolset() -> None:
+    """A request whose only tools are server tools still sends a tools array."""
+    payload = anthropic_messages_stream_payload("claude-haiku-4-5", _web_search_messages_request())
+    assert payload["tools"] == [
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+    ]
+
+
+def test_anthropic_payload_reemits_echoed_server_blocks_in_order() -> None:
+    """Echoed server-tool blocks re-emit verbatim at their positions."""
+    cited_text: JsonObject = {
+        "citations": [{"type": "web_search_result_location", "encrypted_index": "Eo8B"}],
+        "type": "text",
+        "text": "It is 3.14.7.",
+    }
+    result_block: JsonObject = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": [{"type": "web_search_result", "encrypted_content": "Et8Q"}],
+        "caller": {"type": "direct"},
+    }
+    request = _web_search_messages_request(echoed_block=True)
+    messages = (
+        request.messages[:2]
+        + (
+            GatewayMessage(role="assistant", provider_anthropic_block=result_block),
+            GatewayMessage(role="assistant", provider_anthropic_block=cited_text),
+        )
+        + request.messages[2:]
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5", request.model_copy(update={"messages": messages})
+    )
+    wire_messages = cast(list[JsonObject], payload["messages"])
+    assert [message["role"] for message in wire_messages] == ["user", "assistant", "user"]
+    # Consecutive assistant carrier messages merge back into one turn with
+    # the exact echoed block order.
+    assert wire_messages[1]["content"] == [
+        {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "python"},
+        },
+        result_block,
+        cited_text,
+    ]
+
+
+def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes() -> None:
+    """The caller's block structure re-emits exactly where markers exist and
+    only there; markerless payloads stay byte-identical, and per the #699
+    rule a mixed waterfall keeps the markers for its Anthropic rung."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(
+                role="system",
+                content="You are Claude Code.\n\nLong env block.",
+                provider_text_blocks=(
+                    {"type": "text", "text": "You are Claude Code."},
+                    {
+                        "type": "text",
+                        "text": "Long env block.",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ),
+            ),
+            GatewayMessage(
+                role="user",
+                content="contextdo the thing",
+                provider_text_blocks=(
+                    {"type": "text", "text": "context"},
+                    {
+                        "type": "text",
+                        "text": "do the thing",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ),
+            ),
+            GatewayMessage(role="assistant", content="ran it"),
+            GatewayMessage(
+                role="tool",
+                content="ok",
+                tool_call_id="call-1",
+                cache_control={"type": "ephemeral"},
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    # The canonical blank-line separator folds into the following block
+    # (the provider rejects whitespace-only blocks), so the system TEXT
+    # equals the unmarked join with markers on their blocks.
+    assert payload["system"] == [
+        {"type": "text", "text": "You are Claude Code."},
+        {"type": "text", "text": "\n\nLong env block.", "cache_control": {"type": "ephemeral"}},
+    ]
+    messages = cast(list[JsonObject], payload["messages"])
+    user_blocks = cast(list[JsonObject], messages[0]["content"])
+    assert user_blocks == [
+        {"type": "text", "text": "context"},
+        {"type": "text", "text": "do the thing", "cache_control": {"type": "ephemeral"}},
+    ]
+    tool_blocks = cast(list[JsonObject], messages[2]["content"])
+    assert tool_blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+    # Markerless requests keep the exact pre-change wire shape.
+    plain = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="system", content="a\n\nb"),
+            GatewayMessage(role="user", content="hi"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    plain_payload = anthropic_messages_stream_payload("claude-fable-5", plain)
+    assert plain_payload["system"] == "a\n\nb"
+    plain_messages = cast(list[JsonObject], plain_payload["messages"])
+    assert plain_messages[0]["content"] == [{"type": "text", "text": "hi"}]
+
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
+    mixed_public, mixed_provider = route_generation_parameter_requests(
+        (anthropic, fallback), request
+    )
+    assert "messages.content.cache_control" not in mixed_public.ignored_parameters
+    assert mixed_provider.messages[0].provider_text_blocks
+    foreign_public, _foreign_provider = route_generation_parameter_requests((fallback,), request)
+    assert "messages.content.cache_control" in foreign_public.ignored_parameters
+
+
+def test_marked_system_prompt_keeps_the_exact_unmarked_text_bytes() -> None:
+    """Marked and unmarked payloads carry byte-identical system TEXT.
+
+    Cache markers must never change the instructions the model reads: with a
+    marked top-level system followed by a leading system-role turn, the
+    block-path text (blocks concatenated in order) equals the unmarked
+    joined string exactly, separator included, and the only difference is
+    the markers themselves.
+    """
+
+    def request(marked: bool) -> GatewayRequest:
+        blocks: tuple[JsonObject, ...] = (
+            (
+                {"type": "text", "text": "You are Claude Code."},
+                {
+                    "type": "text",
+                    "text": "Long env block.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            )
+            if marked
+            else ()
+        )
+        return GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(
+                GatewayMessage(
+                    role="system",
+                    content="You are Claude Code.\n\nLong env block.",
+                    provider_text_blocks=blocks,
+                ),
+                GatewayMessage(role="system", content="Leading turn instruction."),
+                GatewayMessage(role="user", content="hi"),
+            ),
+            stream=True,
+            include_usage=True,
+        )
+
+    unmarked_payload = anthropic_messages_stream_payload("claude-fable-5", request(False))
+    marked_payload = anthropic_messages_stream_payload("claude-fable-5", request(True))
+    unmarked_system = cast(str, unmarked_payload["system"])
+    marked_system = cast(list[JsonObject], marked_payload["system"])
+    assert "".join(str(block["text"]) for block in marked_system) == unmarked_system
+    marked_controls = [block.get("cache_control") for block in marked_system]
+    assert marked_controls.count({"type": "ephemeral"}) == 1
+    assert marked_system[1] == {
+        "type": "text",
+        "text": "\n\nLong env block.",
+        "cache_control": {"type": "ephemeral"},
+    }
