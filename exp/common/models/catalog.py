@@ -47,6 +47,20 @@ _FIXED_ORIGIN_PROVIDERS = frozenset(
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
 AzureApiSurface = Literal["openai_deployments", "model_inference"]
+
+FailoverMode = Literal["maximize_availability", "maximize_cache"]
+"""How a pool's waterfall reacts to a failed attempt.
+
+``maximize_availability`` (the default, historical behavior) fails over to the
+next rung on any failover-eligible error. ``maximize_cache`` does NOT fail over on
+a throttle (429) -- it returns the throttle so the caller retries the warm rung
+after backoff, preserving its prompt cache rather than restarting cold on another
+provider -- while STILL failing over on operational deadness
+(auth/not-found/5xx/transport) and on a stalled lane (a first-byte or
+header-phase timeout that never answered), for which there is no warm cache to
+preserve. A genuinely retryable timeout (provider 408) redials the warm rung in
+both modes. Client errors reject without failover in both modes.
+"""
 """Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
 
 _FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
@@ -525,6 +539,9 @@ class GatewayPoolRecord(ContractModel):
     exact_model_id: ArtifactId
     deployment_aliases: tuple[ArtifactId, ...] = Field(min_length=2)
     equivalence: GatewayEquivalenceCertification
+    # Per-model failover policy for this pool's waterfall. Defaults to the
+    # historical maximize_availability so an unset authored pool is unchanged.
+    failover_mode: FailoverMode = "maximize_availability"
 
     @model_validator(mode="after")
     def _require_unique_deployments(self) -> GatewayPoolRecord:

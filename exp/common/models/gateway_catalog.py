@@ -7,6 +7,7 @@ from pydantic import Field, model_validator
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_json
 from exp.common.models.catalog import (
     BillingSource,
+    FailoverMode,
     GatewayDeploymentMetadata,
     GatewayEquivalenceCertification,
     ModelCatalog,
@@ -56,6 +57,9 @@ class ExactModelPool(ContractModel):
     exact_model_id: ExactModelId
     deployment_ids: tuple[DeploymentId, ...] = Field(min_length=1)
     equivalence: GatewayEquivalenceCertification | None = None
+    # Per-model failover policy for this pool's waterfall. Defaults to the
+    # historical maximize_availability so an unset pool behaves exactly as before.
+    failover_mode: FailoverMode = "maximize_availability"
 
     @model_validator(mode="after")
     def _require_unique_deployments(self) -> ExactModelPool:
@@ -176,6 +180,7 @@ def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog
                 exact_model_id=authored.exact_model_id,
                 deployment_ids=deployment_ids,
                 equivalence=authored.equivalence,
+                failover_mode=authored.failover_mode,
             )
         )
         claimed_aliases.update(authored.deployment_aliases)

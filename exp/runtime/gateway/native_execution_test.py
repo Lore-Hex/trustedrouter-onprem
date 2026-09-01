@@ -265,6 +265,96 @@ def test_caller_invalid_request_never_advances() -> None:
     assert candidate is None
 
 
+def test_maximize_cache_returns_a_throttle_without_failing_over() -> None:
+    """maximize_cache surfaces a throttle to the caller instead of failing over cold.
+
+    A same-request redial is infeasible -- the 429 records the rung's throttle
+    window before the next candidate is chosen -- so the cache-preserving move is
+    to stop the ladder and let the caller retry the warm rung after backoff. The
+    default policy still fails over on the same throttle.
+    """
+    health = DeploymentHealthRegistry()
+    # Under maximize_cache a throttle ends the ladder (no cold failover)...
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            failover_mode="maximize_cache",
+        )
+        is None
+    )
+    # ...while the default maximize_availability policy fails over to the next rung.
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            failover_mode="maximize_availability",
+        )
+        == 1
+    )
+
+
+def test_maximize_cache_does_not_redial_a_stalled_timeout_lane() -> None:
+    """A stalled-lane timeout fails over even under maximize_cache.
+
+    The engine marks first-byte and header-phase stalls as ``TIMEOUT`` with
+    ``retryable_same_deployment=False`` precisely so a dead lane advances instead
+    of burning another fail-fast window. maximize_cache must respect that signal:
+    a lane that accepted the connection but never answered has no warm cache to
+    preserve, so it is not redialed.
+    """
+    health = DeploymentHealthRegistry()
+    stalled = GatewayFailure(
+        failure_class=GatewayFailureClass.TIMEOUT,
+        safe_message="provider did not send the first token in time",
+        retryable_same_deployment=False,
+        failover_eligible=True,
+    )
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=stalled,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode="maximize_cache",
+    )
+    assert candidate == 1
+
+
+def test_maximize_cache_still_fails_over_on_operational_deadness() -> None:
+    """A dead rung (auth failure) fails over even under maximize_cache."""
+    health = DeploymentHealthRegistry()
+    dead = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+        safe_message="provider authentication failed",
+        failover_eligible=True,
+    )
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=dead,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode="maximize_cache",
+    )
+    # No cache to preserve on a rung that cannot authenticate -> advance.
+    assert candidate == 1
+
+
 def test_native_serving_blockers_name_dialectless_providers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

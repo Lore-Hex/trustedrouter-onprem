@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayFailure,
@@ -47,6 +47,28 @@ if TYPE_CHECKING:
 # The frozen native retry policy.
 MAXIMUM_TOTAL_ATTEMPTS = 8
 MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
+
+# Under maximize_cache, a throttle (429) does NOT fail over to a cold provider:
+# the request returns the throttle and the caller retries the warm rung after the
+# provider's backoff window, keeping that rung's prompt cache. A same-request
+# redial is impossible -- the 429 sets the rung's throttle window before the next
+# candidate is chosen, so an immediate re-claim is refused -- and failing over
+# cold would abandon the cache the provider just built, so the only cache-
+# preserving move is to surface the throttle instead of advancing. The default
+# maximize_availability policy is unchanged: a throttle fails over there.
+#
+# TIMEOUT is deliberately NOT in this set. The classifier already decides, per
+# timeout, whether the same rung may be redialed: a genuine retryable timeout
+# (provider 408) carries retryable_same_deployment=True and so redials the warm
+# rung in BOTH modes via the retryable-same branch below, needing no policy
+# override. The only timeouts that reach here with retryable_same_deployment=False
+# are the first-byte and header-phase stalls (relay.first_byte_timeout_failure /
+# upstream.open_timeout_failure), which are dead-lane signals: the lane accepted
+# the connection but never answered, so it must fail over. Folding the whole
+# TIMEOUT class into this set would suppress that failover and strand a stalled
+# request on a lane that never answered -- there is no warm cache to preserve on a
+# lane that never answered.
+_CACHE_PRESERVING_NO_FAILOVER_CLASSES = frozenset({GatewayFailureClass.THROTTLED})
 
 
 class NativeDialectUnavailableError(RuntimeError):
@@ -154,6 +176,7 @@ def next_route_candidate(
     attempt_counts: list[int],
     total_attempts: int,
     refusal_failover: bool,
+    failover_mode: FailoverMode = "maximize_availability",
     maximum_total_attempts: int = MAXIMUM_TOTAL_ATTEMPTS,
     maximum_same_deployment_attempts: int = MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
 ) -> int | None:
@@ -164,6 +187,16 @@ def next_route_candidate(
     a failover-eligible failure (or an opted-in typed refusal) advances to the
     next claimable deployment.
 
+    Under ``maximize_cache`` a throttle (429) surfaces to the caller instead of
+    failing over: the warm rung's prompt cache is kept for a caller retry after
+    the provider's backoff, rather than restarting cold on another provider.
+    Timeouts are unchanged from the default: a retryable 408 still redials the
+    warm rung via its own ``retryable_same_deployment`` flag in both modes, while
+    a first-byte/header-phase stall is a dead lane the classifier marks
+    non-redialable and so still fails over. Operational deadness (auth, not-found,
+    provider 5xx, transport) and client errors are unchanged too: deadness still
+    fails over in both modes, client errors never do.
+
     Args:
         health: Revision-isolated circuit and throttle registry.
         keys: One health key per ordered route deployment.
@@ -172,6 +205,7 @@ def next_route_candidate(
         attempt_counts: Physical dispatch counts per route position.
         total_attempts: Physical dispatches so far across the whole request.
         refusal_failover: Whether a typed precommit refusal may advance.
+        failover_mode: The pool's per-model failover policy.
         maximum_total_attempts: Hard cap across retries and deployments.
         maximum_same_deployment_attempts: Initial dispatch plus safe retries
             per deployment.
@@ -187,6 +221,13 @@ def next_route_candidate(
         and health.claim(keys[current_depth])
     ):
         return current_depth
+    # maximize_cache keeps a throttled rung's cache by NOT failing over cold; the
+    # request surfaces the throttle so the caller retries after the backoff window.
+    if (
+        failover_mode == "maximize_cache"
+        and failure.failure_class in _CACHE_PRESERVING_NO_FAILOVER_CLASSES
+    ):
+        return None
     refusal_eligible = failure.failure_class == GatewayFailureClass.REFUSAL and refusal_failover
     if not failure.failover_eligible and not refusal_eligible:
         return None
