@@ -18,7 +18,12 @@ from pydantic import (
 )
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
-from exp.common.models.content import DocumentContentPart, ImageContentPart, MessageContentPart
+from exp.common.models.content import (
+    DocumentContentPart,
+    ImageContentPart,
+    MessageContentPart,
+    VideoContentPart,
+)
 from exp.common.tasks import ToolSchema
 
 ModelAlias = ArtifactId
@@ -277,10 +282,10 @@ class ModelMessage(ContractModel):
 
     Empty on every text-only message. The text parts concatenate to
     ``content``, so selectors, simulators, and persisted artifacts keep
-    seeing exactly the text they saw before images existed; provider clients
-    that can carry images read the parts and emit the caller's exact
+    seeing exactly the text they saw before media existed; provider clients
+    that can carry media read the parts and emit the caller's exact
     interleaving. Excluded from serialization so identities of text-only
-    requests are byte-identical to pre-image traffic.
+    requests are byte-identical to pre-media traffic.
     """
 
     @model_validator(mode="after")
@@ -305,6 +310,11 @@ class ModelMessage(ContractModel):
     def images(self) -> tuple[ImageContentPart, ...]:
         """Return this message's image parts in caller order."""
         return tuple(part for part in self.content_parts if part.kind == "image")
+
+    @property
+    def videos(self) -> tuple[VideoContentPart, ...]:
+        """Return this message's video parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "video")
 
     @property
     def documents(self) -> tuple[DocumentContentPart, ...]:

@@ -25,6 +25,7 @@ from exp.runtime.models.providers.images import (
     openai_chat_image_part,
     responses_image_part,
 )
+from exp.runtime.models.providers.videos import openai_chat_video_part, reject_video_part
 
 
 def responses_items(message: GatewayMessage) -> list[JsonObject]:
@@ -47,6 +48,8 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
                         if part.kind == "text"
                         else responses_image_part(part)
                         if part.kind == "image"
+                        else reject_video_part(part)
+                        if part.kind == "video"
                         else responses_document_part(part)
                         for part in message.content_parts
                     ],
@@ -152,6 +155,9 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
     for part in message.content_parts:
         if part.kind == "image":
             blocks.append(anthropic_image_block(part))
+            continue
+        if part.kind == "video":
+            blocks.append(reject_video_part(part))
             continue
         if part.kind == "document":
             blocks.append(anthropic_document_block(part))
@@ -311,6 +317,8 @@ def openai_chat_message(
                 if part.kind == "text"
                 else openai_chat_image_part(part)
                 if part.kind == "image"
+                else openai_chat_video_part(part)
+                if part.kind == "video"
                 else openai_chat_document_part(part)
                 for part in message.content_parts
             ]

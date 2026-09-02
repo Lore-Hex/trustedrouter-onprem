@@ -17,6 +17,7 @@ from exp.common.models.content import (
     MAXIMUM_DOCUMENT_BASE64_BYTES,
     MAXIMUM_DOCUMENT_NAME_CHARACTERS,
     MAXIMUM_IMAGE_BASE64_BYTES,
+    MAXIMUM_VIDEO_BASE64_BYTES,
 )
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
@@ -82,6 +83,27 @@ class _ResponsesImagePart(_WireModel):
     file_id: None = None
 
 
+_MAXIMUM_VIDEO_URL_CHARACTERS = MAXIMUM_VIDEO_BASE64_BYTES + 128
+"""Room for the largest inline video plus its ``data:`` URL preamble."""
+
+
+class _ChatVideoUrl(_WireModel):
+    """Chat Completions video reference: a remote URL or a base64 data URL."""
+
+    url: str = Field(min_length=1, max_length=_MAXIMUM_VIDEO_URL_CHARACTERS)
+
+
+class _ChatVideoPart(_WireModel):
+    """One Chat Completions ``video_url`` content part.
+
+    This is the OpenAI-compatible shape OpenRouter and Fireworks document.
+    The Responses surface defines no video part, so none is accepted there.
+    """
+
+    type: Literal["video_url"]
+    video_url: _ChatVideoUrl
+
+
 _MAXIMUM_FILE_DATA_CHARACTERS = MAXIMUM_DOCUMENT_BASE64_BYTES + 128
 """Room for the largest inline document plus its ``data:`` URL preamble."""
 
@@ -130,7 +152,12 @@ class _ResponsesFilePart(_WireModel):
 
 
 _ContentPart = Annotated[
-    _TextPart | _ChatImagePart | _ResponsesImagePart | _ChatFilePart | _ResponsesFilePart,
+    _TextPart
+    | _ChatImagePart
+    | _ResponsesImagePart
+    | _ChatVideoPart
+    | _ChatFilePart
+    | _ResponsesFilePart,
     Field(discriminator="type"),
 ]
 """One accepted content part on either OpenAI-style request surface."""
@@ -207,7 +234,7 @@ class _Message(_WireModel):
         if self.role != "user" and any(
             not isinstance(part, _TextPart) for part in self.image_capable_parts
         ):
-            raise ValueError("image parts are valid only for user messages")
+            raise ValueError("image and video parts are valid only for user messages")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")

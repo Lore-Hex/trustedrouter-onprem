@@ -84,6 +84,46 @@ def test_parity_row_reports_thinking_generations_and_declared_ladders() -> None:
     assert unknown.reasoning_efforts == ()
 
 
+def test_parity_row_projects_video_declarations_onto_the_wire() -> None:
+    """Video parity follows the declaration, and URL forwarding follows the wire."""
+    bedrock = deployment_capability_parity(
+        provider="bedrock",
+        model_id="us.amazon.nova-lite-v1:0",
+        dialect="bedrock_converse_stream",
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_video_input=True,
+            supports_video_url_input=True,
+        ),
+        reasoning_wire_format="bedrock_reasoning_config",
+    )
+    assert bedrock.supports_video_input is True
+    assert bedrock.forwards_video_urls is False
+
+    gemini = deployment_capability_parity(
+        provider="gemini",
+        model_id="gemini-2.5-flash",
+        dialect="gemini_generate_content",
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_video_input=True,
+            supports_video_url_input=True,
+        ),
+        reasoning_wire_format="gemini_thinking",
+    )
+    assert gemini.forwards_video_urls is True
+
+    undeclared = deployment_capability_parity(
+        provider="openai",
+        model_id="gpt-fixture",
+        dialect="openai_responses",
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        reasoning_wire_format="openai_responses",
+    )
+    assert undeclared.supports_video_input is False
+    assert undeclared.forwards_video_urls is False
+
+
 def test_parity_row_forwards_pdf_urls_only_on_a_fetching_dialect() -> None:
     """A PDF URL declaration counts only where the wire itself fetches the URL."""
     declared = GatewayDeploymentCapabilities(supports_pdf_input=True, supports_pdf_url_input=True)

@@ -61,11 +61,28 @@ _PDF_URL_INPUT_OPTION = typer.Option(
     "--supports-pdf-url-input/--no-supports-pdf-url-input",
 )
 
+_VIDEO_INPUT_OPTION = typer.Option(False, "--supports-video-input")
+_VIDEO_URL_INPUT_OPTION = typer.Option(
+    None,
+    "--supports-video-url-input/--no-supports-video-url-input",
+)
+
 IMAGE_URL_PROVIDERS = frozenset({"anthropic", "azure", "openai", "openrouter"})
 """Providers whose wire fetches a caller image URL on the gateway's behalf.
 
 Every other adapter, notably Gemini, Vertex, and Bedrock, accepts inline bytes
 only, so a route on one of those providers must not claim URL input."""
+
+VIDEO_PROVIDERS = frozenset({"bedrock", "gemini", "openai-compatible", "openrouter", "vertex"})
+"""Providers whose wire defines a caller video carrier.
+
+Gemini and Vertex take inline bytes or a fetched URI, Bedrock Converse takes
+inline bytes, and the OpenAI-compatible Chat wire (OpenRouter, Fireworks)
+takes a ``video_url`` part. OpenAI, Azure OpenAI, and Anthropic define no
+video input, so a route on those providers must not claim it."""
+
+VIDEO_URL_PROVIDERS = frozenset({"gemini", "openai-compatible", "openrouter", "vertex"})
+"""Video providers whose wire fetches a caller video URL on the gateway's behalf."""
 
 PDF_URL_PROVIDERS = frozenset({"anthropic", "openai"})
 """Providers whose wire fetches a caller PDF URL on the gateway's behalf.
@@ -114,6 +131,40 @@ def _declared_image_url_input(
     if provider not in IMAGE_URL_PROVIDERS:
         raise ValueError(f"provider {provider!r} accepts inline image bytes only")
     return True
+
+
+def _declared_video_input(
+    *,
+    provider: str,
+    supports_video_input: bool,
+    supports_video_url_input: bool | None,
+) -> tuple[bool, bool]:
+    """Resolve the route's video and remote video URL declarations.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        supports_video_input: Whether the operator declares video content.
+        supports_video_url_input: Explicit operator URL declaration, if any.
+
+    Returns:
+        The ``(supports_video_input, supports_video_url_input)`` pair.
+
+    Raises:
+        ValueError: Video is claimed on a provider whose wire has no video
+            carrier, URL input is claimed without video input, or on a
+            provider whose wire cannot fetch a caller URL.
+    """
+    if not supports_video_input:
+        if supports_video_url_input:
+            raise ValueError("--supports-video-url-input requires --supports-video-input")
+        return False, False
+    if provider not in VIDEO_PROVIDERS:
+        raise ValueError(f"provider {provider!r} has no video input wire")
+    if supports_video_url_input is None:
+        return True, provider in VIDEO_URL_PROVIDERS
+    if supports_video_url_input and provider not in VIDEO_URL_PROVIDERS:
+        raise ValueError(f"provider {provider!r} accepts inline video bytes only")
+    return True, supports_video_url_input
 
 
 def _declared_pdf_url_input(
@@ -174,6 +225,8 @@ def alias_create(
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
     supports_image_input: bool = _IMAGE_INPUT_OPTION,
     supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
+    supports_video_input: bool = _VIDEO_INPUT_OPTION,
+    supports_video_url_input: bool | None = _VIDEO_URL_INPUT_OPTION,
     supports_pdf_input: bool = _PDF_INPUT_OPTION,
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
@@ -207,6 +260,8 @@ def alias_create(
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
             supports_image_input=supports_image_input,
             supports_image_url_input=supports_image_url_input,
+            supports_video_input=supports_video_input,
+            supports_video_url_input=supports_video_url_input,
             supports_pdf_input=supports_pdf_input,
             supports_pdf_url_input=supports_pdf_url_input,
             maximum_output_tokens=maximum_output_tokens,
@@ -261,6 +316,8 @@ def alias_update(
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
     supports_image_input: bool = _IMAGE_INPUT_OPTION,
     supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
+    supports_video_input: bool = _VIDEO_INPUT_OPTION,
+    supports_video_url_input: bool | None = _VIDEO_URL_INPUT_OPTION,
     supports_pdf_input: bool = _PDF_INPUT_OPTION,
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
@@ -294,6 +351,8 @@ def alias_update(
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
             supports_image_input=supports_image_input,
             supports_image_url_input=supports_image_url_input,
+            supports_video_input=supports_video_input,
+            supports_video_url_input=supports_video_url_input,
             supports_pdf_input=supports_pdf_input,
             supports_pdf_url_input=supports_pdf_url_input,
             maximum_output_tokens=maximum_output_tokens,
@@ -371,6 +430,8 @@ def _activate(
     supports_streaming_tool_arguments: bool | None,
     supports_image_input: bool,
     supports_image_url_input: bool | None,
+    supports_video_input: bool,
+    supports_video_url_input: bool | None,
     supports_pdf_input: bool,
     supports_pdf_url_input: bool | None,
     maximum_output_tokens: int | None,
@@ -412,6 +473,11 @@ def _activate(
                 provider,
                 ProviderCapability.TOOL_ARGUMENT_STREAM,
             )
+        declared_video_input, declared_video_url_input = _declared_video_input(
+            provider=provider,
+            supports_video_input=supports_video_input,
+            supports_video_url_input=supports_video_url_input,
+        )
         normalized, snapshot, _catalog_changed = upsert_singleton_deployment(
             root,
             deployment_alias=alias,
@@ -437,6 +503,8 @@ def _activate(
                     supports_image_input=supports_image_input,
                     supports_image_url_input=supports_image_url_input,
                 ),
+                supports_video_input=declared_video_input,
+                supports_video_url_input=declared_video_url_input,
                 supports_pdf_input=supports_pdf_input,
                 supports_pdf_url_input=_declared_pdf_url_input(
                     provider=provider,

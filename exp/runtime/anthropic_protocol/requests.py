@@ -14,8 +14,8 @@ block because a cache hint changes cost, not semantics; ``image`` and PDF
 ``document`` blocks are retained as canonical content parts so a route that
 declares the matching input capability carries them, while a document
 inside ``tool_result`` content is rejected loudly because the serving
-surface cannot preserve it there.
-Unknown or unsupported fields are rejected with a
+surface cannot preserve it there; ``video`` blocks are rejected because the
+wire defines none. Unknown or unsupported fields are rejected with a
 field-specific error, never silently dropped. Errors raise
 :class:`OpenAIProtocolError` so the shared boundary stays single-authority;
 the HTTP layer renders them in the Anthropic envelope.
@@ -68,8 +68,14 @@ from exp.runtime.openai_protocol.errors import (
 from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
+_VIDEO_HINT = (
+    "video blocks are not supported: the Anthropic Messages wire defines no video "
+    "content, so send video on the Chat Completions surface"
+)
+_REJECTED_BLOCK_HINTS = {"video": _VIDEO_HINT}
 _REJECTED_TOOL_RESULT_BLOCK_HINTS = {
     "document": "document blocks are not supported inside tool_result content",
+    "video": _VIDEO_HINT,
 }
 
 
@@ -178,11 +184,9 @@ class _ToolUseBlock(_WireModel):
 class _ToolResultBlock(_WireModel):
     """One tool result the caller returns for a prior assistant tool call.
 
-    ``is_error`` is carried on the canonical tool message
-    (``GatewayMessage.tool_is_error``) so the Anthropic upstream dialect can
-    round-trip it losslessly; the OpenAI-family wire formats have no
-    tool-error flag, so on those routes the error state travels in the
-    result text the model reads.
+    ``is_error`` rides the canonical tool message (``GatewayMessage.tool_is_error``)
+    so Anthropic rungs round-trip it losslessly; OpenAI-family wires have no
+    tool-error flag, so there the error state travels in the result text.
     """
 
     type: Literal["tool_result"]
@@ -195,10 +199,9 @@ class _ToolResultBlock(_WireModel):
 class _ServerToolUseBlock(BaseModel):
     """One server-tool invocation echoed in history, carried shallowly.
 
-    Server-tool block shapes are an evolving provider surface; a closed
-    model here would recreate the reject-what-real-clients-send incident
-    class, so only the discriminator is validated and the raw block forwards
-    byte-for-byte on native Anthropic rungs.
+    Server-tool block shapes are an evolving provider surface; a closed model
+    here would recreate the reject-what-real-clients-send incident class, so only
+    the discriminator is validated and the raw block forwards byte-for-byte.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -243,10 +246,9 @@ class _Message(_WireModel):
 class _Tool(_WireModel):
     """One caller-defined custom tool with its JSON Schema declaration.
 
-    The description bound is generous on purpose: the provider accepts
-    40k-character descriptions live (verified 2026-08-30) and a real Claude
-    Code toolset exceeded the earlier 8k bound; the request-body size cap
-    remains the effective total limit.
+    The description bound is generous on purpose: the provider accepts 40k
+    character descriptions live (verified 2026-08-30) and a real Claude Code
+    toolset exceeded an 8k bound; the request-body cap is the effective limit.
 
     ``eager_input_streaming``, ``defer_loading``, ``allowed_callers``, and
     ``input_examples`` are provider-native tool annotations the live API
@@ -271,10 +273,10 @@ class _Tool(_WireModel):
 class _ServerTool(BaseModel):
     """One Anthropic server tool, validated shallowly and carried verbatim.
 
-    Server tools (``web_search_20250305``-style) execute at the provider and
-    carry no ``input_schema``; their per-type configuration is an evolving
-    provider surface, so only the discriminator pair is validated and the
-    raw entry forwards byte-for-byte on native Anthropic rungs.
+    Server tools (``web_search_20250305``-style) execute at the provider and carry
+    no ``input_schema``; their per-type configuration is an evolving provider
+    surface, so only the discriminator pair is validated and the raw entry
+    forwards byte-for-byte on native Anthropic rungs.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -630,6 +632,9 @@ def _rejected_block_hint(payload: JsonObject) -> str | None:
             if not isinstance(block, dict):
                 continue
             block_object = cast(JsonObject, block)
+            hint = _REJECTED_BLOCK_HINTS.get(str(block_object.get("type")))
+            if hint is not None:
+                return hint
             if block_object.get("type") == "tool_result" and isinstance(
                 block_object.get("content"), list
             ):

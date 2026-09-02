@@ -17,6 +17,7 @@ from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
 from exp.runtime.models.providers.documents import gemini_document_part
 from exp.runtime.models.providers.images import gemini_image_part
 from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
+from exp.runtime.models.providers.videos import gemini_video_part
 
 GEMINI_THOUGHT_SIGNATURE_BYPASS = "skip_thought_signature_validator"
 """Gemini's documented placeholder for a function call whose signature is gone.
@@ -171,6 +172,8 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
                     if part.kind == "text"
                     else gemini_image_part(part)
                     if part.kind == "image"
+                    else gemini_video_part(part)
+                    if part.kind == "video"
                     else gemini_document_part(part)
                     for part in message.content_parts
                 ],
