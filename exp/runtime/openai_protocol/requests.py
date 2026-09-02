@@ -18,6 +18,11 @@ from pydantic import (
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
+from exp.common.models.content import (
+    MessageContentPart,
+    TextContentPart,
+    image_part_from_url,
+)
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
@@ -59,9 +64,11 @@ from exp.runtime.openai_protocol.responses_input import (
 from exp.runtime.openai_protocol.wire_models import (
     _AdditionalToolsItem,
     _AssistantToolCall,
+    _ChatImagePart,
     _ChatRequest,
     _ChatResponseFormat,
     _ChatTool,
+    _ContentPart,
     _CustomToolCall,
     _CustomToolCallOutput,
     _FunctionCall,
@@ -224,7 +231,8 @@ def decode_responses(
         # 2026-08-29). The strict wire model owns those contracts, so the
         # official probe sees a normalized item.
         adapted: list[JsonValue] = []
-        for entry in cast("list[JsonValue]", raw):
+        for original in cast("list[JsonValue]", raw):
+            entry = _official_image_details(original) if isinstance(original, dict) else original
             if isinstance(entry, dict) and entry.get("type") == "message":
                 item = {key: value for key, value in entry.items() if key != "phase"}
                 if item.get("id") is not None and "status" not in item:
@@ -349,6 +357,27 @@ def decode_responses(
     )
 
 
+def _official_image_details(entry: JsonObject) -> JsonObject:
+    """Default the detail level of every ``input_image`` part of one item.
+
+    The Responses surface treats ``input_image.detail`` as optional and
+    resolves an omitted level to ``auto``, while the installed SDK marks the
+    field required. Only the official probe sees the resolved default: the
+    strict wire model owns the real contract and keeps an unstated level
+    unstated on the provider wire.
+    """
+    content = entry.get("content")
+    if not isinstance(content, list):
+        return entry
+    parts: list[JsonValue] = []
+    for part in cast("list[JsonValue]", content):
+        if isinstance(part, dict) and part.get("type") == "input_image" and "detail" not in part:
+            parts.append({**part, "detail": "auto"})
+        else:
+            parts.append(part)
+    return {**entry, "content": parts}
+
+
 def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:
     """Reject unsupported and unknown top-level fields before responder work."""
     decisions = disposition_map(manifest)
@@ -402,8 +431,10 @@ def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
         text = str(part)
         if text in _LOCATION_NOISE:
             continue
+        # Typed-dict union branches are labeled with their class name, which
+        # no request field ever shares: every public field is lower case.
         if isinstance(part, str) and (
-            part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES
+            part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES or text[:1].isupper()
         ):
             continue
         if text in _OUTPUT_ITEM_VARIANTS and cleaned and cleaned[-1].isdigit():
@@ -544,10 +575,14 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             except ValueError as exc:
                 param = f"{prefix}.{message_index}.reasoning_content"
                 raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
+        content, content_parts = _message_content(
+            message.content, f"{prefix}.{message_index}.content"
+        )
         converted.append(
             GatewayMessage(
                 role=message.role,
-                content=_content(message.content),
+                content=content,
+                content_parts=content_parts,
                 tool_call_id=message.tool_call_id,
                 tool_calls=calls,
                 provider_reasoning=provider_reasoning,
@@ -556,11 +591,56 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
     return tuple(converted)
 
 
-def _content(content: str | tuple[_TextPart, ...] | None) -> str | None:
-    """Join supported text parts without accepting multimodal loss."""
+def _message_content(
+    content: str | tuple[_ContentPart, ...] | None,
+    param: str,
+) -> tuple[str | None, tuple[MessageContentPart, ...]]:
+    """Flatten wire content parts, retaining images in the caller's order.
+
+    Args:
+        content: Wire content: plain text, ordered parts, or absent.
+        param: Public parameter path used to report an invalid image.
+
+    Returns:
+        The flattened text and, only for a message that carries an image,
+        the ordered canonical parts. A text-only message keeps its previous
+        representation exactly, so nothing downstream changes for it.
+
+    Raises:
+        OpenAIProtocolError: An image reference is not a supported URL or
+            base64 data URL.
+    """
     if content is None or isinstance(content, str):
-        return content
-    return "".join(part.text for part in content)
+        return content, ()
+    parts: list[MessageContentPart] = []
+    for index, part in enumerate(content):
+        if isinstance(part, _TextPart):
+            # An empty text part carries no content and contributes nothing to
+            # the flattened text, while Anthropic and Gemini reject an empty
+            # block outright. Real clients emit one beside an attachment
+            # (OpenCode 1.18.26, captured live 2026-09-02), so it is dropped
+            # here rather than failing a turn that does carry an image.
+            if part.text:
+                parts.append(TextContentPart(text=part.text))
+            continue
+        url, detail = (
+            (part.image_url.url, part.image_url.detail)
+            if isinstance(part, _ChatImagePart)
+            else (part.image_url, part.detail)
+        )
+        try:
+            parts.append(image_part_from_url(url, detail=detail))
+        except ValueError as exc:
+            location = f"{param}.{index}.image_url"
+            raise invalid_field(
+                location,
+                f"'{location}' must be an http(s) URL or a base64 data URL "
+                "of a PNG, JPEG, GIF, or WebP image.",
+            ) from exc
+    text = "".join(part.text for part in parts if part.kind == "text")
+    if not any(part.kind == "image" for part in parts):
+        return text, ()
+    return text, tuple(parts)
 
 
 def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:

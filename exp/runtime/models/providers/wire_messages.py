@@ -15,6 +15,11 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.models.providers.errors import ProviderResponseError
+from exp.runtime.models.providers.images import (
+    anthropic_image_block,
+    openai_chat_image_part,
+    responses_image_part,
+)
 
 
 def responses_items(message: GatewayMessage) -> list[JsonObject]:
@@ -28,6 +33,18 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             }
         ]
     if message.role == "user":
+        if message.content_parts:
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": part.text}
+                        if part.kind == "text"
+                        else responses_image_part(part)
+                        for part in message.content_parts
+                    ],
+                }
+            ]
         return [{"role": "user", "content": message.content or ""}]
     if message.role != "assistant":
         raise ProviderResponseError("unsupported Responses message role")
@@ -107,6 +124,35 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
     return items
 
 
+def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
+    """Emit one multimodal user turn in caller order, markers intact.
+
+    The cache-marked run holds the caller's text blocks verbatim, one per
+    retained text part and in the same order, so a marker on the last text
+    block of a turn that also carries an image still re-emits: dropping it
+    would make the whole prefix uncacheable on exactly the turns Claude Code
+    marks.
+
+    Args:
+        message: A user message carrying at least one image part.
+
+    Returns:
+        The ordered Anthropic content blocks for the turn.
+    """
+    marked = [block for block in message.provider_text_blocks if block.get("text")]
+    blocks: list[JsonObject] = []
+    text_index = 0
+    for part in message.content_parts:
+        if part.kind == "image":
+            blocks.append(anthropic_image_block(part))
+            continue
+        blocks.append(
+            marked[text_index] if text_index < len(marked) else {"type": "text", "text": part.text}
+        )
+        text_index += 1
+    return blocks
+
+
 def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
     """Translate one non-instruction gateway message to Anthropic content blocks."""
     if message.role == "tool":
@@ -125,6 +171,10 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             result["cache_control"] = message.cache_control
         return ("user", [result])
     if message.role == "user":
+        if message.content_parts:
+            # The caller's exact interleaving is preserved: an image before
+            # its question reads differently from one after it.
+            return "user", _anthropic_multimodal_blocks(message)
         if message.provider_text_blocks:
             # The cache-marked run re-emits the caller's exact blocks; the
             # flattened content stays canonical for every other wire.
@@ -153,7 +203,14 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             raise ProviderResponseError("encrypted reasoning cannot replay on the Anthropic wire")
     if message.provider_text_blocks:
         blocks.extend(message.provider_text_blocks)
-    elif message.content is not None:
+    elif message.content:
+        blocks.append({"type": "text", "text": message.content})
+    elif message.content is not None and not blocks and not message.tool_calls:
+        # An empty assistant text block is rejected by this wire, and an
+        # agent that answers with a tool call alone sends exactly that
+        # (OpenCode 1.18.26, captured live 2026-09-02). The block re-emits
+        # only when it is the entire turn, where dropping it would leave an
+        # empty content array the wire also rejects.
         blocks.append({"type": "text", "text": message.content})
     for call in message.tool_calls:
         tool_use: JsonObject = {
@@ -236,7 +293,19 @@ def openai_chat_message(
             "content": message.content or "",
             "tool_call_id": message.tool_call_id or "",
         }
-    payload: JsonObject = {"role": message.role, "content": message.content or ""}
+    payload: JsonObject = {
+        "role": message.role,
+        "content": (
+            [
+                {"type": "text", "text": part.text}
+                if part.kind == "text"
+                else openai_chat_image_part(part)
+                for part in message.content_parts
+            ]
+            if message.content_parts
+            else message.content or ""
+        ),
+    }
     if message.tool_calls:
         payload["tool_calls"] = [
             {

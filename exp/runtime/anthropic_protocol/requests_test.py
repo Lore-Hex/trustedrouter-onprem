@@ -13,7 +13,14 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.models.providers.wire_messages import anthropic_blocks
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+
+_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+    "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+"""One valid single-pixel PNG, base64 encoded."""
 
 
 def _body(**overrides: JsonValue) -> JsonObject:
@@ -259,8 +266,96 @@ def test_missing_max_tokens_is_rejected_with_its_field() -> None:
     assert excinfo.value.detail.param == "max_tokens"
 
 
-def test_image_blocks_are_rejected_with_a_targeted_hint() -> None:
-    """A known-but-unsupported block gets its own explanation."""
+def test_image_blocks_are_retained_in_caller_order() -> None:
+    """An image block rides the canonical parts beside its text."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                        },
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert message.content == "what is this"
+    assert [part.kind for part in message.content_parts] == ["text", "image"]
+    assert message.images[0].data == _PNG_BASE64
+
+
+def test_a_cache_marker_on_an_image_block_is_retained() -> None:
+    """A breakpoint the caller placed on the image reaches the wire."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    assert decoded.request.messages[-1].images[0].cache_control == {"type": "ephemeral"}
+
+
+def test_an_empty_text_block_beside_an_image_never_re_emits() -> None:
+    """An attachment's empty text block never reaches the Anthropic wire."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ""},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                        },
+                        {"type": "text", "text": "read it", "cache_control": {"type": "ephemeral"}},
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert [part.kind for part in message.content_parts] == ["image", "text"]
+    _role, blocks = anthropic_blocks(message)
+    assert blocks == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+        },
+        {"type": "text", "text": "read it", "cache_control": {"type": "ephemeral"}},
+    ]
+
+
+def test_malformed_image_source_is_rejected() -> None:
+    """An image the gateway cannot forward is rejected at its own path."""
     with pytest.raises(OpenAIProtocolError) as excinfo:
         decode_messages(
             _body(
@@ -272,7 +367,7 @@ def test_image_blocks_are_rejected_with_a_targeted_hint() -> None:
                 ]
             )
         )
-    assert "image blocks are not supported" in excinfo.value.detail.message
+    assert excinfo.value.detail.param == "messages.0.content.0.source"
 
 
 def test_document_block_inside_tool_result_is_rejected() -> None:
