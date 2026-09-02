@@ -19,6 +19,7 @@ from exp.common.models import (
     ModelCapabilities,
     ModelCatalog,
 )
+from exp.common.models.known_models import known_model_metadata
 from exp.optimize.router.activation import load_project_router
 from exp.runtime.gateway.catalog_authority import (
     authored_snapshot_path,
@@ -54,12 +55,34 @@ _IMAGE_URL_INPUT_OPTION = typer.Option(
     None,
     "--supports-image-url-input/--no-supports-image-url-input",
 )
+_PDF_INPUT_OPTION = typer.Option(False, "--supports-pdf-input")
+_PDF_URL_INPUT_OPTION = typer.Option(
+    None,
+    "--supports-pdf-url-input/--no-supports-pdf-url-input",
+)
 
 IMAGE_URL_PROVIDERS = frozenset({"anthropic", "azure", "openai", "openrouter"})
 """Providers whose wire fetches a caller image URL on the gateway's behalf.
 
 Every other adapter, notably Gemini, Vertex, and Bedrock, accepts inline bytes
 only, so a route on one of those providers must not claim URL input."""
+
+PDF_URL_PROVIDERS = frozenset({"anthropic", "openai"})
+"""Providers whose wire fetches a caller PDF URL on the gateway's behalf.
+
+Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
+document source) wires fetch a remote document. Chat Completions ``file``
+parts (Azure OpenAI deployments, OpenRouter, and every other OpenAI-compatible
+adapter), Gemini, Vertex, and Bedrock accept inline bytes only. An Azure
+connection serving a known Anthropic model is the exception: it resolves to
+the native Anthropic Messages wire, so ``_fetches_pdf_urls`` admits it."""
+
+
+def _fetches_pdf_urls(provider: str, provider_model: str) -> bool:
+    """Return whether this deployment resolves to a wire that fetches PDF URLs."""
+    if provider in PDF_URL_PROVIDERS:
+        return True
+    return provider == "azure" and known_model_metadata("anthropic", provider_model) is not None
 
 
 def _declared_image_url_input(
@@ -93,6 +116,40 @@ def _declared_image_url_input(
     return True
 
 
+def _declared_pdf_url_input(
+    *,
+    provider: str,
+    provider_model: str,
+    supports_pdf_input: bool,
+    supports_pdf_url_input: bool | None,
+) -> bool:
+    """Resolve the route's remote PDF URL declaration.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        provider_model: Provider-side model identifier of the deployment.
+        supports_pdf_input: Whether the route carries PDF documents at all.
+        supports_pdf_url_input: Explicit operator declaration, if any.
+
+    Returns:
+        Whether the route may forward a caller-supplied document URL.
+
+    Raises:
+        ValueError: URL input is claimed without PDF input, or on a provider
+            whose wire cannot fetch a caller document URL.
+    """
+    fetches_urls = _fetches_pdf_urls(provider, provider_model)
+    if supports_pdf_url_input is None:
+        return supports_pdf_input and fetches_urls
+    if not supports_pdf_url_input:
+        return False
+    if not supports_pdf_input:
+        raise ValueError("--supports-pdf-url-input requires --supports-pdf-input")
+    if not fetches_urls:
+        raise ValueError(f"provider {provider!r} accepts inline PDF bytes only")
+    return True
+
+
 @alias_app.command("list")
 def alias_list(root: Path = ROOT_OPTION, json_output: bool = _JSON_OPTION) -> None:
     """List public aliases and their active immutable revisions."""
@@ -117,6 +174,8 @@ def alias_create(
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
     supports_image_input: bool = _IMAGE_INPUT_OPTION,
     supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
+    supports_pdf_input: bool = _PDF_INPUT_OPTION,
+    supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
     input_price: int | None = typer.Option(None, "--input-price", min=0),
     cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
@@ -148,6 +207,8 @@ def alias_create(
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
             supports_image_input=supports_image_input,
             supports_image_url_input=supports_image_url_input,
+            supports_pdf_input=supports_pdf_input,
+            supports_pdf_url_input=supports_pdf_url_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
                 input_micro_usd_per_million_tokens=input_price,
@@ -200,6 +261,8 @@ def alias_update(
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
     supports_image_input: bool = _IMAGE_INPUT_OPTION,
     supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
+    supports_pdf_input: bool = _PDF_INPUT_OPTION,
+    supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
     input_price: int | None = typer.Option(None, "--input-price", min=0),
     cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
@@ -231,6 +294,8 @@ def alias_update(
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
             supports_image_input=supports_image_input,
             supports_image_url_input=supports_image_url_input,
+            supports_pdf_input=supports_pdf_input,
+            supports_pdf_url_input=supports_pdf_url_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
                 input_micro_usd_per_million_tokens=input_price,
@@ -306,6 +371,8 @@ def _activate(
     supports_streaming_tool_arguments: bool | None,
     supports_image_input: bool,
     supports_image_url_input: bool | None,
+    supports_pdf_input: bool,
+    supports_pdf_url_input: bool | None,
     maximum_output_tokens: int | None,
     prices: GatewayTokenPrices,
     pricing_source: str | None,
@@ -369,6 +436,13 @@ def _activate(
                     provider=provider,
                     supports_image_input=supports_image_input,
                     supports_image_url_input=supports_image_url_input,
+                ),
+                supports_pdf_input=supports_pdf_input,
+                supports_pdf_url_input=_declared_pdf_url_input(
+                    provider=provider,
+                    provider_model=provider_model,
+                    supports_pdf_input=supports_pdf_input,
+                    supports_pdf_url_input=supports_pdf_url_input,
                 ),
             ),
             prices=prices,
