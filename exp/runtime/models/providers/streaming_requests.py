@@ -195,6 +195,8 @@ def dialect_stream_payload(
                 else profile.supports_top_p
             ),
             supports_top_k=profile.supports_top_k,
+            supports_frequency_penalty=profile.supports_frequency_penalty,
+            supports_presence_penalty=profile.supports_presence_penalty,
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_wire_format=profile.reasoning_wire_format,
@@ -295,43 +297,98 @@ def route_generation_parameter_requests(
         """Return the caller effort or this wire's required provider default."""
         return _effective_profile_reasoning_effort(profile, request.reasoning_effort)
 
+    def sampling_declared(profile: GatewayWireProfile, *, top_p: bool = False) -> bool:
+        """Return whether one rung declares this sampling control at all."""
+        return profile.supports_top_p is True if top_p else profile.supports_temperature
+
     def sampling_supported(profile: GatewayWireProfile, *, top_p: bool = False) -> bool:
         """Return whether one rung accepts this request's sampling mode."""
-        declared = profile.supports_top_p is True if top_p else profile.supports_temperature
-        return declared and (
+        return sampling_declared(profile, top_p=top_p) and (
             not profile.sampling_requires_reasoning_none
             or profile_reasoning_effort(profile) == "none"
         )
 
+    def srn_only_block(*, top_p: bool = False) -> bool:
+        """Return whether the ONLY reason the route blocks this control is srn.
+
+        Every rung declares the control, but at least one is a reasoning route
+        that accepts sampling only at ``reasoning_effort=none`` and is not at
+        none here. Such a control is dropped-and-disclosed rather than rejected:
+        the model does accept it, just not at this effort. A rung that does not
+        declare the control at all (Anthropic constrained sampling) is a genuine
+        unsupported case and is NOT covered here, so it still hard-rejects.
+        """
+        return all(sampling_declared(profile, top_p=top_p) for profile in profiles) and not all(
+            sampling_supported(profile, top_p=top_p) for profile in profiles
+        )
+
     if request.temperature is not None:
-        _require_route_numeric_parameter(
-            profiles,
-            param="temperature",
-            value=request.temperature,
-            supported=sampling_supported,
-            minimum=lambda profile: profile.minimum_temperature,
-            maximum=lambda profile: profile.maximum_temperature,
-        )
+        if srn_only_block():
+            ignore("temperature", "temperature->dropped(set_reasoning_effort_none)")
+        else:
+            _require_route_numeric_parameter(
+                profiles,
+                param="temperature",
+                value=request.temperature,
+                supported=sampling_supported,
+                minimum=lambda profile: profile.minimum_temperature,
+                maximum=lambda profile: profile.maximum_temperature,
+            )
     if request.top_p is not None:
-        _require_route_numeric_parameter(
-            profiles,
-            param="top_p",
-            value=request.top_p,
-            supported=lambda profile: sampling_supported(profile, top_p=True),
-            minimum=lambda profile: profile.minimum_top_p,
-            maximum=lambda profile: profile.maximum_top_p,
-        )
+        if srn_only_block(top_p=True):
+            ignore("top_p", "top_p->dropped(set_reasoning_effort_none)")
+        else:
+            _require_route_numeric_parameter(
+                profiles,
+                param="top_p",
+                value=request.top_p,
+                supported=lambda profile: sampling_supported(profile, top_p=True),
+                minimum=lambda profile: profile.minimum_top_p,
+                maximum=lambda profile: profile.maximum_top_p,
+            )
     if request.top_k is not None:
-        _require_route_numeric_parameter(
-            profiles,
-            param="top_k",
-            value=request.top_k,
-            supported=lambda profile: (
-                profile.supports_top_k and profile.dialect != "openai_responses"
-            ),
-            minimum=lambda profile: profile.minimum_top_k,
-            maximum=lambda profile: profile.maximum_top_k,
+
+        def top_k_supported(profile: GatewayWireProfile) -> bool:
+            return profile.supports_top_k and profile.dialect != "openai_responses"
+
+        if not all(top_k_supported(profile) for profile in profiles):
+            # top_k is a sampling preference: a rung that does not carry it still
+            # returns a valid answer with its own default, so the committed route
+            # drops it with disclosure rather than rejecting. Selection prefers a
+            # rung that honors it (generation_route_compat), so this drop is the
+            # last resort when no rung on the route accepts the field.
+            ignore("top_k", "top_k->dropped(unsupported_by_provider)")
+        else:
+            _require_route_numeric_parameter(
+                profiles,
+                param="top_k",
+                value=request.top_k,
+                supported=top_k_supported,
+                minimum=lambda profile: profile.minimum_top_k,
+                maximum=lambda profile: profile.maximum_top_k,
+            )
+
+    # Sampling penalties are soft preferences: a rung that does not carry them
+    # still returns a valid answer, so a route with any rung that lacks support
+    # drops them with disclosure rather than rejecting. Honoring is gated on the
+    # openai_compatible dialect — the ONLY payload that emits penalties — so a
+    # capability flag stamped on a non-emitting dialect (e.g. openai_responses)
+    # can never claim "honored" and then silently omit the field. Emission stays
+    # in one place; if another dialect ever emits penalties, add it here too.
+    def penalty_honored(profile: GatewayWireProfile, *, presence: bool) -> bool:
+        supported = (
+            profile.supports_presence_penalty if presence else profile.supports_frequency_penalty
         )
+        return supported and profile.dialect == "openai_compatible"
+
+    if request.frequency_penalty is not None and not all(
+        penalty_honored(profile, presence=False) for profile in profiles
+    ):
+        ignore("frequency_penalty", "frequency_penalty->dropped(unsupported_by_provider)")
+    if request.presence_penalty is not None and not all(
+        penalty_honored(profile, presence=True) for profile in profiles
+    ):
+        ignore("presence_penalty", "presence_penalty->dropped(unsupported_by_provider)")
     if request.reasoning_effort is not None:
         portable_efforts = set(REASONING_EFFORTS)
         for profile in profiles:

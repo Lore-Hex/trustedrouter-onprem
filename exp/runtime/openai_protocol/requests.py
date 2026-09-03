@@ -36,7 +36,6 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
     SealedReasoningContentBlock,
-    StructuredTextFormat,
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.reasoning_carrier import (
@@ -62,6 +61,11 @@ from exp.runtime.openai_protocol.responses_input import (
     ReplayedReasoning,
     responses_input_messages,
 )
+from exp.runtime.openai_protocol.structured_text import (
+    JSON_OBJECT_TRANSLATION_DISCLOSURE,
+    chat_structured_text,
+    responses_structured_text,
+)
 from exp.runtime.openai_protocol.wire_models import (
     _AdditionalToolsItem,
     _AssistantToolCall,
@@ -69,7 +73,6 @@ from exp.runtime.openai_protocol.wire_models import (
     _ChatFilePart,
     _ChatImagePart,
     _ChatRequest,
-    _ChatResponseFormat,
     _ChatTool,
     _ChatVideoPart,
     _ContentPart,
@@ -84,7 +87,6 @@ from exp.runtime.openai_protocol.wire_models import (
     _ResponsesFilePart,
     _ResponsesInputItem,
     _ResponsesRequest,
-    _ResponseText,
     _ResponseTool,
     _TextPart,
 )
@@ -185,7 +187,13 @@ def decode_chat(
             tools=tuple(_chat_tool(tool) for tool in request.tools),
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
-            structured_text=_chat_structured_text(request.response_format),
+            structured_text=chat_structured_text(request.response_format),
+            ignored_parameters=(
+                (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
+                if request.response_format is not None
+                and request.response_format.type == "json_object"
+                else ()
+            ),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -198,6 +206,8 @@ def decode_chat(
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
+            frequency_penalty=request.frequency_penalty,
+            presence_penalty=request.presence_penalty,
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
             reasoning_effort=request.reasoning_effort,
@@ -343,7 +353,7 @@ def decode_responses(
             provider_native_tools=tuple(native_tools),
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
-            structured_text=_responses_structured_text(request.text),
+            structured_text=responses_structured_text(request.text),
             maximum_output_tokens=request.max_output_tokens,
             maximum_output_tokens_parameter=(
                 "max_output_tokens" if request.max_output_tokens is not None else None
@@ -857,37 +867,6 @@ def _responses_tool_choice(
         if isinstance(name, str):
             return GatewayNamedToolChoice(name=name)
     raise invalid_field("tool_choice")
-
-
-def _chat_structured_text(value: _ChatResponseFormat | None) -> StructuredTextFormat | None:
-    """Convert the Chat JSON Schema response format when requested."""
-    if value is None or value.type == "text":
-        return None
-    schema = value.json_schema
-    if schema is None:
-        raise invalid_field("response_format.json_schema")
-    return StructuredTextFormat(
-        name=schema.name,
-        description=schema.description,
-        json_schema=schema.schema_,
-        strict=schema.strict,
-    )
-
-
-def _responses_structured_text(value: _ResponseText | None) -> StructuredTextFormat | None:
-    """Convert the Responses JSON Schema text format when requested."""
-    if value is None or value.format is None or value.format.type == "text":
-        return None
-    schema = value.format.schema_
-    name = value.format.name
-    if schema is None or name is None:
-        raise invalid_field("text.format")
-    return StructuredTextFormat(
-        name=name,
-        description=value.format.description,
-        json_schema=schema,
-        strict=value.format.strict,
-    )
 
 
 def _include_encrypted_reasoning(include: tuple[str, ...] | None) -> bool:

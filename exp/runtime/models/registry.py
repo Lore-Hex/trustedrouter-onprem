@@ -311,6 +311,10 @@ class RuntimeModelCatalog:
                 supports_top_p=_supports_top_p(capabilities),
                 supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                 supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                supports_frequency_penalty=_supports_flag(
+                    capabilities, "supports_frequency_penalty"
+                ),
+                supports_presence_penalty=_supports_flag(capabilities, "supports_presence_penalty"),
                 supports_reasoning=capabilities.supports_reasoning,
                 reasoning_effort=capabilities.reasoning_effort,
             )
@@ -332,6 +336,10 @@ class RuntimeModelCatalog:
                 supports_top_p=_supports_top_p(capabilities),
                 supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                 supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                supports_frequency_penalty=_supports_flag(
+                    capabilities, "supports_frequency_penalty"
+                ),
+                supports_presence_penalty=_supports_flag(capabilities, "supports_presence_penalty"),
                 supports_reasoning=capabilities.supports_reasoning,
                 reasoning_effort=capabilities.reasoning_effort,
                 sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
@@ -379,6 +387,12 @@ class RuntimeModelCatalog:
                     supports_top_p=_supports_top_p(capabilities),
                     supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                     supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                    supports_frequency_penalty=_supports_flag(
+                        capabilities, "supports_frequency_penalty"
+                    ),
+                    supports_presence_penalty=_supports_flag(
+                        capabilities, "supports_presence_penalty"
+                    ),
                     supports_reasoning=capabilities.supports_reasoning,
                     reasoning_effort=capabilities.reasoning_effort,
                 )
@@ -401,6 +415,10 @@ class RuntimeModelCatalog:
                 supports_top_p=_supports_top_p(capabilities),
                 supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                 supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                supports_frequency_penalty=_supports_flag(
+                    capabilities, "supports_frequency_penalty"
+                ),
+                supports_presence_penalty=_supports_flag(capabilities, "supports_presence_penalty"),
                 supports_reasoning=capabilities.supports_reasoning,
                 reasoning_effort=capabilities.reasoning_effort,
                 chat_max_tokens_field=capabilities.chat_max_tokens_field,
@@ -456,6 +474,12 @@ class RuntimeModelCatalog:
                     "supports_top_p": _supports_top_p(capabilities),
                     "supports_top_k": _supports_flag(capabilities, "supports_top_k"),
                     "supports_logprobs": _supports_flag(capabilities, "supports_logprobs"),
+                    "supports_frequency_penalty": _supports_flag(
+                        capabilities, "supports_frequency_penalty"
+                    ),
+                    "supports_presence_penalty": _supports_flag(
+                        capabilities, "supports_presence_penalty"
+                    ),
                 }
             )
         if provider in {"openrouter", "trustedrouter", "openai-compatible"}:

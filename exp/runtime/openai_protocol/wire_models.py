@@ -317,9 +317,15 @@ class _StructuredSchema(_WireModel):
 
 
 class _ChatResponseFormat(_WireModel):
-    """Supported Chat text or strict structured-text format."""
+    """Supported Chat text, JSON-object, or strict structured-text format.
 
-    type: Literal["text", "json_schema"]
+    ``json_object`` is admitted so the gateway can translate it to a permissive
+    ``json_schema`` and serve the caller's "give me JSON" intent on every rung
+    (the serving lanes emit only ``json_schema``); it carries no ``json_schema``
+    details, exactly like ``text``.
+    """
+
+    type: Literal["text", "json_object", "json_schema"]
     json_schema: _StructuredSchema | None = None
 
     @model_validator(mode="after")
@@ -370,6 +376,8 @@ class _ChatRequest(_WireModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None

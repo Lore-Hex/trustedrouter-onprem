@@ -178,6 +178,25 @@ def test_openai_compatible_stream_payload_forwards_top_p_and_usage() -> None:
     assert payload["top_p"] == 1.0
 
 
+def test_openai_compatible_payload_serves_a_translated_json_object_as_open_json_schema() -> None:
+    """A translated json_object (open, non-strict schema) serves as a valid json_schema
+    on an openai_compatible rung (Azure/DeepSeek), preserving the caller's JSON intent."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        structured_text=StructuredTextFormat(
+            name="json_object", json_schema={"type": "object"}, strict=False
+        ),
+    )
+
+    payload = openai_compatible_stream_payload("exact-model", request)
+
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "json_object", "schema": {"type": "object"}, "strict": False},
+    }
+
+
 def test_openai_compatible_stream_payload_omits_absent_top_p() -> None:
     """An omitted nucleus parameter stays off the wire instead of being invented."""
     payload = openai_compatible_stream_payload("exact-model", _chat_request())
@@ -443,12 +462,17 @@ def test_reasoning_summary_narrows_a_mixed_claude_waterfall() -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("temperature", 0.2), ("top_p", 0.8), ("top_k", 20)],
+    [("temperature", 0.2), ("top_p", 0.8)],
 )
 def test_route_generation_controls_use_the_whole_waterfall_intersection(
     field: str, value: float | int
 ) -> None:
-    """One incompatible fallback rejects an explicit semantic control before dispatch."""
+    """One incompatible fallback rejects an explicit semantic control before dispatch.
+
+    temperature/top_p are genuinely unsupported on the fallback (declared False),
+    so they still hard-reject; top_k is a droppable sampling preference and is
+    covered separately.
+    """
     request = _chat_request().model_copy(update={field: value})
     profiles = (
         GatewayWireProfile(
@@ -478,6 +502,106 @@ def test_route_generation_controls_use_the_whole_waterfall_intersection(
 
     assert raised.value.code == "unsupported_parameter"
     assert raised.value.param == field
+
+
+def test_top_k_narrows_to_a_supporting_rung_then_drops_when_none_support() -> None:
+    """top_k prefers a rung that carries it, and is dropped+disclosed (not rejected)
+    only when no rung on the committed route accepts it."""
+    supporting = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://first.test",
+        model_id="provider/top-k",
+        supports_top_k=True,
+        minimum_top_k=1,
+        maximum_top_k=100,
+    )
+    unsupporting = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://azure.test",
+        model_id="provider/no-top-k",
+        supports_top_k=False,
+    )
+    request = _chat_request().model_copy(update={"top_k": 20})
+
+    # Selection prefers the rung that honors top_k.
+    assert compatible_generation_parameter_profile_indexes((supporting, unsupporting), request) == (
+        0,
+    )
+
+    # A committed route with no supporting rung serves by dropping+disclosing.
+    public_request, provider_request = route_generation_parameter_requests((unsupporting,), request)
+    assert provider_request.top_k is None
+    assert public_request.ignored_parameters == ("top_k->dropped(unsupported_by_provider)",)
+
+    # A route where every rung supports it honors the value.
+    _public, honored = route_generation_parameter_requests((supporting,), request)
+    assert honored.top_k == 20
+
+
+def test_penalties_honor_where_supported_and_drop_with_disclosure_otherwise() -> None:
+    """Sampling penalties are honored (emitted) where every rung supports them, and
+    dropped+disclosed (a soft preference) where a rung does not — never rejected."""
+    supporting = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://p.test",
+        model_id="m",
+        supports_frequency_penalty=True,
+        supports_presence_penalty=True,
+    )
+    unsupporting = GatewayWireProfile(
+        dialect="openai_compatible", url="https://q.test", model_id="m2"
+    )
+    request = _chat_request().model_copy(
+        update={"frequency_penalty": 0.5, "presence_penalty": -0.3}
+    )
+
+    # Every rung supports them → honored and emitted on the payload.
+    public_all, provider_all = route_generation_parameter_requests((supporting,), request)
+    assert public_all.ignored_parameters == ()
+    payload = openai_compatible_stream_payload(
+        "m",
+        provider_all,
+        supports_frequency_penalty=True,
+        supports_presence_penalty=True,
+    )
+    assert payload["frequency_penalty"] == 0.5
+    assert payload["presence_penalty"] == -0.3
+
+    # A rung without support → dropped + disclosed, never rejected.
+    public_drop, provider_drop = route_generation_parameter_requests(
+        (supporting, unsupporting), request
+    )
+    assert provider_drop.frequency_penalty is None
+    assert provider_drop.presence_penalty is None
+    assert public_drop.ignored_parameters == (
+        "frequency_penalty->dropped(unsupported_by_provider)",
+        "presence_penalty->dropped(unsupported_by_provider)",
+    )
+
+
+def test_penalty_flag_on_a_non_emitting_dialect_still_drops_and_discloses() -> None:
+    """A supports_*_penalty flag stamped on a dialect that cannot EMIT penalties
+    (only openai_compatible does) must NOT claim honored — it drops+discloses, never a
+    silent undisclosed omission (a catalog could mis-stamp e.g. an openai_responses rung)."""
+    responses_rung = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://r.test",
+        model_id="gpt-5",
+        supports_frequency_penalty=True,
+        supports_presence_penalty=True,
+    )
+    request = _chat_request().model_copy(
+        update={"frequency_penalty": 0.5, "presence_penalty": -0.2}
+    )
+
+    public, provider = route_generation_parameter_requests((responses_rung,), request)
+
+    assert provider.frequency_penalty is None
+    assert provider.presence_penalty is None
+    assert public.ignored_parameters == (
+        "frequency_penalty->dropped(unsupported_by_provider)",
+        "presence_penalty->dropped(unsupported_by_provider)",
+    )
 
 
 def test_route_rejects_effort_not_preserved_by_the_whole_waterfall() -> None:
@@ -739,6 +863,71 @@ def test_generation_parameter_selection_uses_each_default_for_sampling() -> None
     assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
 
 
+def test_generation_parameter_selection_serves_with_drop_when_no_rung_honors() -> None:
+    """When every rung is a reasoning route that blocks sampling at this effort, all
+    rungs stay selectable (they serve by dropping+disclosing), not rejected."""
+    profiles = tuple(
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url=f"https://reasoning{position}.test",
+            model_id=f"provider/reasoning-{position}",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            reasoning_effort="high",
+            supported_reasoning_efforts=("none", "high"),
+            reasoning_effort_required=True,
+            sampling_requires_reasoning_none=True,
+        )
+        for position in range(2)
+    )
+    request = _chat_request().model_copy(update={"temperature": 0.5})
+
+    # No rung honors temperature at effort=high, so both remain serviceable and the
+    # value is dropped+disclosed on whichever serves (rather than a hard rejection).
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (0, 1)
+
+
+def test_translated_json_object_narrows_away_from_a_schema_closing_rung() -> None:
+    """A translated json_object (open, non-strict schema) narrows to a rung that serves
+    open JSON, and rejects only when every rung is a schema-closing (Anthropic) dialect —
+    never silently closing 'any object' into 'no properties allowed'. This rides the
+    existing non-strict-schema route check (a schema-closing dialect enforces the schema),
+    which the strict=False translation now reaches."""
+    open_request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        structured_text=StructuredTextFormat(
+            name="json_object", json_schema={"type": "object"}, strict=False
+        ),
+    )
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://a.test", model_id="claude"
+    )
+    openai = GatewayWireProfile(dialect="openai_compatible", url="https://o.test", model_id="gpt")
+
+    # Narrows away from the Anthropic rung to the open-capable one.
+    assert compatible_generation_parameter_profile_indexes((anthropic, openai), open_request) == (
+        1,
+    )
+
+    # No open-capable rung → reject, not a silent inversion.
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((anthropic,), open_request)
+    assert raised.value.param == "response_format.json_schema.strict"
+    assert raised.value.code == "unsupported_parameter"
+
+    # A STRICT schema on the same Anthropic rung is NOT narrowed away (it is closed by
+    # the #733 coercion downstream instead), so it stays compatible.
+    strict_request = open_request.model_copy(
+        update={
+            "structured_text": StructuredTextFormat(
+                name="answer", json_schema={"type": "object"}, strict=True
+            )
+        }
+    )
+    assert compatible_generation_parameter_profile_indexes((anthropic,), strict_request) == (0,)
+
+
 def test_route_accepts_anthropic_max_effort_without_translation() -> None:
     """The provider's documented max level is preserved exactly."""
     request = _chat_request().model_copy(update={"reasoning_effort": "max"})
@@ -916,8 +1105,9 @@ def test_route_rejects_out_of_range_provider_controls() -> None:
     assert "between 0.0 and 1.0" in str(raised.value)
 
 
-def test_conditional_sampling_requires_explicit_none_reasoning() -> None:
-    """GPT-5.1 sampling is accepted only when the caller selects exact no-reasoning mode."""
+def test_srn_sampling_drops_and_discloses_instead_of_rejecting() -> None:
+    """On a reasoning route (srn), temperature/top_p sent with reasoning on is dropped
+    and disclosed, not rejected: the model accepts sampling, just not at this effort."""
     profile = GatewayWireProfile(
         dialect="openai_responses",
         url="https://provider.test",
@@ -925,22 +1115,94 @@ def test_conditional_sampling_requires_explicit_none_reasoning() -> None:
         supports_reasoning=True,
         reasoning_wire_format="openai_responses",
         reasoning_effort="medium",
+        supports_temperature=True,
         supports_top_p=True,
         sampling_requires_reasoning_none=True,
     )
-    with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests((profile,), _chat_request(temperature=0.2))
+    public_request, provider_request = route_generation_parameter_requests(
+        (profile,), _chat_request(temperature=0.2, top_p=0.9)
+    )
 
-    assert raised.value.code == "unsupported_parameter"
-    assert raised.value.param == "temperature"
+    # The caller value survives on the public copy for reflection, is dropped from
+    # the provider payload, and both drops are disclosed with an actionable reason.
+    assert public_request.temperature == 0.2
+    assert public_request.top_p == 0.9
+    assert provider_request.temperature is None
+    assert provider_request.top_p is None
+    assert public_request.ignored_parameters == (
+        "temperature->dropped(set_reasoning_effort_none)",
+        "top_p->dropped(set_reasoning_effort_none)",
+    )
 
+
+def test_srn_sampling_is_honored_at_explicit_none_reasoning() -> None:
+    """The sampling hatch stays open: reasoning_effort=none honors temperature/top_p."""
+    profile = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://provider.test",
+        model_id="gpt-5.1",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        reasoning_effort="medium",
+        supports_temperature=True,
+        supports_top_p=True,
+        sampling_requires_reasoning_none=True,
+    )
     request = _chat_request(temperature=0.2, top_p=0.9).model_copy(
         update={"reasoning_effort": "none"}
     )
     public_request, provider_request = route_generation_parameter_requests((profile,), request)
 
     assert public_request.temperature == 0.2
+    assert provider_request.temperature == 0.2
+    assert provider_request.top_p == 0.9
     assert provider_request.reasoning_effort == "none"
+    assert public_request.ignored_parameters == ()
+
+
+def test_temperature_narrows_to_a_honoring_rung_over_an_srn_rung() -> None:
+    """A mixed route [srn rung + a plain rung that honors sampling] narrows temperature/
+    top_p to the honoring rung rather than dropping them on the srn rung — preserving the
+    caller's value when a rung can serve it."""
+    srn_rung = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://srn.test",
+        model_id="gpt-5.1",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        reasoning_effort="medium",
+        supports_temperature=True,
+        supports_top_p=True,
+        sampling_requires_reasoning_none=True,
+    )
+    plain_rung = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://plain.test",
+        model_id="provider/plain",
+        supports_temperature=True,
+        supports_top_p=True,
+    )
+    request = _chat_request(temperature=0.5, top_p=0.9)
+
+    # The srn rung would drop sampling at effort=medium; the plain rung honors it, so
+    # selection narrows to the honoring rung.
+    assert compatible_generation_parameter_profile_indexes((srn_rung, plain_rung), request) == (1,)
+
+
+def test_genuinely_unsupported_sampling_still_hard_rejects() -> None:
+    """A route that never declares temperature (Anthropic constrained [1,1]) still
+    rejects — there is nothing to honor at any effort, so it is not srn-droppable."""
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://provider.test",
+        model_id="claude-constrained",
+        supports_temperature=False,
+    )
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((profile,), _chat_request(temperature=0.2))
+
+    assert raised.value.code == "unsupported_parameter"
+    assert raised.value.param == "temperature"
 
 
 def test_payload_builder_rejects_conditional_sampling_without_admission() -> None:
