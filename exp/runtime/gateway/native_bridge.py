@@ -51,7 +51,7 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
-from exp.runtime.gateway.native_admission import admitted_route_requests
+from exp.runtime.gateway.native_admission import admitted_route_requests, resolve_admission_route
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
 from exp.runtime.gateway.native_bridge_errors import (
     escalation as _escalation,
@@ -74,6 +74,7 @@ from exp.runtime.gateway.native_continuation import (
 )
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
 from exp.runtime.gateway.native_dispatch import dispatch_signature_headers, frozen_dispatch
+from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     MAXIMUM_TOTAL_ATTEMPTS,
@@ -131,14 +132,13 @@ from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
     ProtocolNamespace,
-    episode_namespace,
     replay_key,
 )
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
-class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
+class NativeControlPlane(NativeBatchRelayMixin, NativeEmbeddingsMixin, NativeObservabilityMixin):
     """Authority and accounting callbacks for the native data plane.
 
     Rust worker threads share the group-commit writer and the locked in-flight
@@ -765,6 +765,9 @@ class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
             authority = entry.reasoning_carrier_authorities[route_depth]
             if authority is None or authority.reasoning_route_sha256 != route_sha256:
                 raise ValueError("reasoning carrier route differs from the active attempt")
+            # Carriers exist only on message-bearing surfaces: fail loud, never duck-type.
+            if not isinstance(entry.request, GatewayRequest):
+                raise ValueError("reasoning carrier is not valid for this request surface")
             carrier = seal_reasoning_content(
                 authority,
                 issuing_request_id=request_id,
@@ -957,42 +960,7 @@ class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
         *,
         continuation: ContinuationContext | None = None,
     ) -> GatewayRoute:
-        """Resolve one direct or project route without an event loop.
-
-        Direct pools resolve entirely inside frozen in-memory catalogs.
-        Project targets run frozen learned selection synchronously on this
-        worker thread through the shared selection seam and episode identity
-        derivation, so there is exactly one policy execution path. A
-        Responses continuation carries its original turn's episode key, so a
-        continued request joins the same selection episode instead of
-        re-running request-time embedding for a fresh one. Request-time
-        embedding failure falls back to the frozen conservative baseline
-        inside the shared runtime, and neither path mutates policy or
-        evidence.
-        """
-        if isinstance(authorization.target, DirectTarget):
-            return self._components.routes.resolve_direct(authorization)
-        if continuation is not None:
-            episode = (
-                authorization.organization_id,
-                authorization.identity_id,
-                authorization.alias_revision_id,
-                continuation.episode_key,
-            )
-        else:
-            episode = episode_namespace(
-                namespace=ProtocolNamespace(
-                    organization_id=authorization.organization_id,
-                    identity_id=authorization.identity_id,
-                    alias_revision_id=authorization.alias_revision_id,
-                ),
-                # The session-scoped correlation id is the stronger affinity
-                # scope; a per-operation idempotency key only pins retries.
-                caller_episode_key=request.client_request_id or request.idempotency_key,
-                request_id=authorization.request_id,
-            )
-        return self._components.routes.resolve_project_blocking(
-            authorization=authorization,
-            request=request,
-            episode_namespace=episode,
+        """Resolve one direct or project route; see ``resolve_admission_route``."""
+        return resolve_admission_route(
+            self._components, authorization, request, continuation=continuation
         )

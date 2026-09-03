@@ -6,8 +6,8 @@ from typing import Literal
 
 from pydantic import Field, field_validator
 
-from exp.common.core.artifacts import ContractModel
-from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.common.core.artifacts import ContractModel, canonical_json_bytes
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 
 
 class EmbeddingsRequest(ContractModel):
@@ -29,6 +29,19 @@ class EmbeddingsRequest(ContractModel):
     user: str | None = Field(default=None, max_length=1024)
     """End-user attribution from the OpenAI ``user`` field: content-free and never a credential."""
 
+    @property
+    def attribution_label(self) -> str | None:
+        """The end-user attribution label, per the OpenAI spec.
+
+        The embeddings body carries only the ``user`` field (no
+        ``safety_identifier``), so the label is exactly that field; hosts read
+        it off every serving request at accept, whichever surface it came in on.
+
+        Returns:
+            The attribution label, or ``None`` when the caller sent no ``user``.
+        """
+        return self.user
+
     @field_validator("inputs")
     @classmethod
     def _require_nonempty_inputs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -46,3 +59,32 @@ class EmbeddingsRequest(ContractModel):
         if any(not text for text in value):
             raise ValueError("embedding inputs must not be empty strings")
         return value
+
+
+ServingRequest = GatewayRequest | EmbeddingsRequest
+"""One admitted serving request across every public surface.
+
+The money, auth, and accounting seams widen from ``GatewayRequest`` to this
+union so a chat-assuming reader cannot duck-type onto an embeddings request and
+touch an absent leg (messages, output tokens): ``ty`` enumerates every reader
+that must now handle the embeddings arm, and each branches exhaustively.
+"""
+
+
+def embeddings_input_ceiling_micro_usd(
+    request: EmbeddingsRequest,
+    *,
+    input_rate: int | None,
+    maximum: int,
+) -> int | None:
+    """Return the conservative input-only reservation ceiling for one embeddings call.
+
+    The canonical UTF-8 byte length upper-bounds the input tokens (there is no
+    output leg and no excluded provider carrier), so only the input rate
+    applies. A missing rate unprices the route (``None``), and a ceiling above
+    ``maximum`` is likewise unpriceable, matching the completion path.
+    """
+    if input_rate is None:
+        return None
+    ceiling = (len(canonical_json_bytes(request)) * input_rate + 999_999) // 1_000_000
+    return ceiling if ceiling <= maximum else None

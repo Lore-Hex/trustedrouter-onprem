@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import assert_never
 
 from pydantic import Field, model_validator
 
@@ -20,6 +21,11 @@ from exp.common.models.gateway_catalog import (
 )
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.embeddings_contracts import (
+    EmbeddingsRequest,
+    ServingRequest,
+    embeddings_input_ceiling_micro_usd,
+)
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
@@ -531,10 +537,32 @@ def budget_period_start(period: str) -> str:
 
 
 def maximum_attempt_cost_micro_usd(
-    request: GatewayRequest,
+    request: ServingRequest,
     deployment: ExactModelDeployment,
 ) -> int | None:
     """Return a conservative integer micro-USD ceiling for one physical call.
+
+    Chat/responses/messages price an input and an output leg; embeddings price an
+    input leg only. Both bound input by canonical byte length (never undercounts).
+    """
+    match request:
+        case EmbeddingsRequest():
+            return embeddings_input_ceiling_micro_usd(
+                request,
+                input_rate=deployment.gateway.prices.input_micro_usd_per_million_tokens,
+                maximum=MAXIMUM_MICRO_USD,
+            )
+        case GatewayRequest():
+            return _completion_attempt_cost_micro_usd(request, deployment)
+        case _:  # pragma: no cover - exhaustive over the ServingRequest union.
+            assert_never(request)
+
+
+def _completion_attempt_cost_micro_usd(
+    request: GatewayRequest,
+    deployment: ExactModelDeployment,
+) -> int | None:
+    """Return a conservative integer micro-USD ceiling for one chat/responses call.
 
     Canonical UTF-8 bytes conservatively upper-bound input tokens. The caller's output ceiling
     wins when present, then the frozen deployment limit, then a reservation-only default bounded
