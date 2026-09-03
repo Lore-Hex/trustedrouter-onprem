@@ -12,8 +12,8 @@ use super::{
 use crate::encode::compact_json;
 use crate::errors::Failure;
 use crate::events::{
-    count_if_present, count_or_zero, require_string, require_u64, Event, ToolAccumulator, Usage,
-    MAXIMUM_LEDGER_COUNT,
+    bounded_ledger_sum, count_if_present, count_or_zero, require_string, require_u64, Event,
+    ToolAccumulator, Usage,
 };
 
 impl Normalizer {
@@ -271,17 +271,11 @@ impl Normalizer {
             }
             "message_stop" => {
                 events.extend(finish_open_tools(&mut self.tools)?);
-                // Individually persistable legs whose folded total is not
-                // are a provider contract violation, exactly like the
-                // Bedrock cache-leg fold.
-                let input_tokens = self
-                    .input_tokens
-                    .checked_add(self.cache_read)
-                    .and_then(|total| total.checked_add(self.cache_write))
-                    .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
-                    .ok_or_else(|| {
-                        malformed("Anthropic input token total overflows a persistable count")
-                    })?;
+                let input_tokens = bounded_ledger_sum(
+                    &[self.input_tokens, self.cache_read, self.cache_write],
+                    "Anthropic input",
+                )
+                .map_err(|message| malformed(&message))?;
                 events.push(Event::Usage(Usage {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(self.output_tokens),
@@ -491,6 +485,9 @@ mod tests {
                 assert_eq!(usage.input_tokens, Some(12294));
                 assert_eq!(usage.output_tokens, Some(103));
                 assert_eq!(usage.cached_input_tokens, Some(4));
+                // Anthropic bills thinking inside output_tokens and publishes
+                // no separate count, so the reasoning subset stays unknown.
+                assert_eq!(usage.reasoning_tokens, None);
             }
             other => panic!("unexpected events: {other:?}"),
         }

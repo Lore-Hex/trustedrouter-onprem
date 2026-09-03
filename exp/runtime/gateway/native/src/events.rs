@@ -1,4 +1,33 @@
 //! Provider-neutral stream events, the Rust mirror of `GatewayEvent`.
+//!
+//! # Usage contract
+//!
+//! Every usage mapper in this module emits OpenAI subset semantics:
+//! `reasoning_tokens` (when known) counts a SUBSET of `output_tokens`, and
+//! `cached_input_tokens` a subset of `input_tokens`. Settlement prices the
+//! reasoning subset at the reasoning rate and the remainder of `output_tokens`
+//! at the output rate, so a wire that reports reasoning OUTSIDE its output
+//! total would bill every reasoning token at zero unless the mapper folds it
+//! back in. Per wire:
+//!
+//! - OpenAI-shaped wires (Responses via `openai_usage`, Chat Completions via
+//!   `openai_compatible_usage`): OpenAI, OpenRouter, DeepSeek, and Fireworks
+//!   report reasoning inside the output total; xAI (native and relayed by
+//!   Azure Foundry) reports it outside on both wires. The provider's own
+//!   `total_tokens` decides: `input + output` is the subset shape and is
+//!   forwarded as reported, `input + output + reasoning` is the additive shape
+//!   and folds (`fold_openai_shaped_reasoning`). Without a decisive total, a
+//!   reasoning count above the output total is impossible under subset
+//!   semantics and folds.
+//! - Gemini (`gemini_usage`): `thoughtsTokenCount` is additive by Google's
+//!   definition (`totalTokenCount` = prompt + candidates + thoughts), so it is
+//!   folded into `output_tokens` unconditionally.
+//! - Anthropic Messages and Bedrock Converse: thinking is billed inside the
+//!   provider's `output_tokens` and no separate count is published, so
+//!   `reasoning_tokens` stays `None` and the total is forwarded as reported.
+//!
+//! A fold whose total leaves the persistable ledger range is a provider
+//! contract violation and fails the stream; totals are never clamped.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -613,9 +642,53 @@ fn optional_usage_detail(
     }
 }
 
-/// Parse an OpenAI-shaped usage object from a terminal Responses payload,
-/// mirroring `streaming_usage.openai_usage`: an omitted object is unknown
-/// usage, while a malformed one fails the stream.
+/// Sum persistable legs into one ledger count. Individually persistable legs
+/// whose total is not are a provider contract violation, never a clamped or
+/// wrapped total.
+pub fn bounded_ledger_sum(legs: &[u64], label: &str) -> Result<u64, String> {
+    legs.iter()
+        .try_fold(0u64, |total, leg| total.checked_add(*leg))
+        .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
+        .ok_or_else(|| format!("{label} token total overflows a persistable count"))
+}
+
+/// Resolve the output total of an OpenAI-shaped usage object so that
+/// `reasoning_tokens` names a subset of it (see the module documentation).
+///
+/// The provider's own `total_tokens` is authoritative when it matches either
+/// accounting: `input + output` is the documented subset shape and the output
+/// total is forwarded as reported; `input + output + reasoning` is the
+/// additive shape (xAI, natively or relayed by Azure Foundry) and reasoning is
+/// folded in. Without a decisive total, a reasoning count above the output
+/// total cannot occur under subset semantics and is folded.
+fn fold_openai_shaped_reasoning(
+    input_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    label: &str,
+) -> Result<u64, String> {
+    let Some(reasoning) = reasoning_tokens.filter(|reasoning| *reasoning > 0) else {
+        return Ok(output_tokens);
+    };
+    let subset_total = input_tokens.checked_add(output_tokens);
+    let additive_total = subset_total.and_then(|total| total.checked_add(reasoning));
+    let additive = match total_tokens {
+        Some(total) if Some(total) == subset_total => false,
+        Some(total) if Some(total) == additive_total => true,
+        _ => reasoning > output_tokens,
+    };
+    if additive {
+        bounded_ledger_sum(&[output_tokens, reasoning], label)
+    } else {
+        Ok(output_tokens)
+    }
+}
+
+/// Parse an OpenAI-shaped usage object from a terminal Responses payload: an
+/// omitted object is unknown usage, while a malformed one fails the stream.
+/// `output_tokens_details.reasoning_tokens` folds into `output_tokens` when
+/// the provider's `total_tokens` shows it was reported additively.
 pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let value = match value {
         None | Some(Value::Null) => return Ok(None),
@@ -624,17 +697,25 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "OpenAI usage must be an object".to_string())?;
+    let input_tokens = count_or_zero(object, "input_tokens", "OpenAI input_tokens")?;
+    let reported_output = count_or_zero(object, "output_tokens", "OpenAI output_tokens")?;
+    let reasoning_tokens = optional_usage_detail(
+        object,
+        "output_tokens_details",
+        "reasoning_tokens",
+        "OpenAI reasoning_tokens",
+    )?;
+    let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
+    let output_tokens = fold_openai_shaped_reasoning(
+        input_tokens,
+        reported_output,
+        reasoning_tokens,
+        total_tokens,
+        "OpenAI output",
+    )?;
     Ok(Some(Usage {
-        input_tokens: Some(count_or_zero(
-            object,
-            "input_tokens",
-            "OpenAI input_tokens",
-        )?),
-        output_tokens: Some(count_or_zero(
-            object,
-            "output_tokens",
-            "OpenAI output_tokens",
-        )?),
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output_tokens),
         cached_input_tokens: optional_usage_detail(
             object,
             "input_tokens_details",
@@ -642,29 +723,37 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
             "OpenAI cached_tokens",
         )?,
         cache_creation_input_tokens: None,
-        reasoning_tokens: optional_usage_detail(
-            object,
-            "output_tokens_details",
-            "reasoning_tokens",
-            "OpenAI reasoning_tokens",
-        )?,
+        reasoning_tokens,
     }))
 }
 
-/// Parse a Chat Completions usage object, mirroring
-/// `streaming_usage.openai_compatible_usage`: a malformed object fails the
-/// stream instead of silently dropping token accounting.
+/// Parse a Chat Completions usage object: a malformed object fails the stream
+/// instead of silently dropping token accounting.
+/// `completion_tokens_details.reasoning_tokens` folds into `output_tokens`
+/// when the provider's `total_tokens` shows it was reported additively.
 pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "OpenAI-compatible usage must be an object".to_string())?;
+    let input_tokens = count_or_zero(object, "prompt_tokens", "prompt_tokens")?;
+    let completion_tokens = count_or_zero(object, "completion_tokens", "completion_tokens")?;
+    let reasoning_tokens = optional_usage_detail(
+        object,
+        "completion_tokens_details",
+        "reasoning_tokens",
+        "reasoning_tokens",
+    )?;
+    let total_tokens = count_if_present(object, "total_tokens", "OpenAI-compatible usage")?;
+    let output_tokens = fold_openai_shaped_reasoning(
+        input_tokens,
+        completion_tokens,
+        reasoning_tokens,
+        total_tokens,
+        "OpenAI-compatible output",
+    )?;
     Ok(Usage {
-        input_tokens: Some(count_or_zero(object, "prompt_tokens", "prompt_tokens")?),
-        output_tokens: Some(count_or_zero(
-            object,
-            "completion_tokens",
-            "completion_tokens",
-        )?),
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output_tokens),
         cached_input_tokens: optional_usage_detail(
             object,
             "prompt_tokens_details",
@@ -672,18 +761,19 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
             "cached_tokens",
         )?,
         cache_creation_input_tokens: None,
-        reasoning_tokens: optional_usage_detail(
-            object,
-            "completion_tokens_details",
-            "reasoning_tokens",
-            "reasoning_tokens",
-        )?,
+        reasoning_tokens,
     })
 }
 
-/// Parse Gemini `usageMetadata`, mirroring the python `_usage` normalizer:
-/// cached tokens are an input subset, absent counts are zero (`require_integer`
-/// parity), and `thoughtsTokenCount` stays unknown when omitted.
+/// Parse Gemini `usageMetadata`: cached tokens are an input subset, absent
+/// counts are zero (`require_integer` parity), and `thoughtsTokenCount` stays
+/// unknown when omitted.
+///
+/// Google defines thinking tokens as ADDITIVE to `candidatesTokenCount`
+/// (`totalTokenCount` = prompt + candidates + thoughts, and response pricing
+/// is the sum of output and thinking tokens), so a reported
+/// `thoughtsTokenCount` is folded into `output_tokens`; `reasoning_tokens`
+/// names the subset the ledger prices at the reasoning rate.
 pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
     let object = value
         .as_object()
@@ -696,17 +786,22 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
             "Gemini thoughtsTokenCount",
         )?),
     };
+    let candidates_tokens = count_or_zero(
+        object,
+        "candidatesTokenCount",
+        "Gemini candidatesTokenCount",
+    )?;
+    let output_tokens = match reasoning_tokens {
+        Some(reasoning) => bounded_ledger_sum(&[candidates_tokens, reasoning], "Gemini output")?,
+        None => candidates_tokens,
+    };
     Ok(Usage {
         input_tokens: Some(count_or_zero(
             object,
             "promptTokenCount",
             "Gemini promptTokenCount",
         )?),
-        output_tokens: Some(count_or_zero(
-            object,
-            "candidatesTokenCount",
-            "Gemini candidatesTokenCount",
-        )?),
+        output_tokens: Some(output_tokens),
         cached_input_tokens: Some(count_or_zero(
             object,
             "cachedContentTokenCount",
@@ -717,12 +812,13 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
     })
 }
 
-/// Parse Bedrock `metadata.usage`, mirroring the python `_usage` normalizer:
-/// cache read and write legs fold into total input, cached input reports the
-/// read leg, and absent counts are zero (`require_integer` parity). Legs and
-/// the folded total beyond the persistable ledger range are provider
-/// contract violations and fail the stream rather than reaching settlement
-/// as a value the ledger could never write.
+/// Parse Bedrock `metadata.usage`: cache read and write legs fold into total
+/// input, cached input reports the read leg, and absent counts are zero
+/// (`require_integer` parity). Legs and the folded total beyond the
+/// persistable ledger range are provider contract violations and fail the
+/// stream rather than reaching settlement as a value the ledger could never
+/// write. Converse bills a reasoning model's thinking inside `outputTokens`
+/// and publishes no separate count, so `reasoning_tokens` stays unknown.
 pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
     let usage = value
         .and_then(Value::as_object)
@@ -738,11 +834,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         "cacheWriteInputTokens",
         "Bedrock cacheWriteInputTokens",
     )?;
-    let input_tokens = fresh
-        .checked_add(cache_read)
-        .and_then(|total| total.checked_add(cache_write))
-        .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
-        .ok_or_else(|| "Bedrock input token total overflows a persistable count".to_string())?;
+    let input_tokens = bounded_ledger_sum(&[fresh, cache_read, cache_write], "Bedrock input")?;
     Ok(Usage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(count_or_zero(
@@ -798,155 +890,4 @@ pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Resul
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn output_tokens_lead_a_turn_but_control_frames_do_not() {
-        // Content, reasoning, and tool-call deltas are the first visible output.
-        assert!(Event::TextDelta("hi".to_string()).is_output_token());
-        assert!(Event::RefusalDelta("no".to_string()).is_output_token());
-        assert!(Event::ProviderTextDelta {
-            output_index: 0,
-            item_id: "msg_1".to_string(),
-            delta: "hi".to_string(),
-        }
-        .is_output_token());
-        assert!(Event::ThinkingDelta {
-            index: 0,
-            delta: "hmm".to_string(),
-        }
-        .is_output_token());
-        // A tool-only turn's first token is the tool call itself.
-        assert!(Event::ToolCallStarted {
-            index: 0,
-            call_id: "call_1".to_string(),
-            name: "get".to_string(),
-        }
-        .is_output_token());
-        // Usage, terminals, and opaque reasoning-carrier frames never lead.
-        assert!(!Event::Usage(Usage::default()).is_output_token());
-        assert!(!Event::Completed.is_output_token());
-        assert!(!Event::Incomplete.is_output_token());
-        assert!(!Event::ThinkingSignature {
-            index: 0,
-            signature: "sig".to_string(),
-        }
-        .is_output_token());
-        // A Responses item-start reserves a slot before the first delta; it
-        // must not stamp TTFT early -- the following delta is the real token.
-        assert!(!Event::ProviderOutputItemStarted {
-            output_index: 0,
-            item_id: Some("msg_1".to_string()),
-            kind: ProviderOutputItemKind::Message,
-            status: None,
-            phase: None,
-        }
-        .is_output_token());
-        // An empty delta (role-establishing or empty refusal frame) carries no
-        // visible token, so it must not stamp TTFT.
-        assert!(!Event::TextDelta(String::new()).is_output_token());
-        assert!(!Event::RefusalDelta(String::new()).is_output_token());
-        assert!(!Event::ProviderTextDelta {
-            output_index: 0,
-            item_id: "msg_1".to_string(),
-            delta: String::new(),
-        }
-        .is_output_token());
-    }
-
-    #[test]
-    fn openai_compatible_usage_counts_absent_fields_as_zero() {
-        let usage = openai_compatible_usage(&json!({"prompt_tokens": 7})).expect("valid usage");
-        assert_eq!(usage.input_tokens, Some(7));
-        assert_eq!(usage.output_tokens, Some(0));
-        assert_eq!(usage.cached_input_tokens, None);
-        assert_eq!(usage.reasoning_tokens, None);
-    }
-
-    #[test]
-    fn openai_compatible_usage_rejects_malformed_counts() {
-        assert!(openai_compatible_usage(&json!({"prompt_tokens": "7"})).is_err());
-        assert!(
-            openai_compatible_usage(&json!({"prompt_tokens": MAXIMUM_LEDGER_COUNT + 1})).is_err()
-        );
-        assert!(openai_compatible_usage(&json!([1])).is_err());
-        assert!(openai_compatible_usage(
-            &json!({"prompt_tokens": 1, "completion_tokens": 1, "prompt_tokens_details": 3})
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn parsed_counts_are_bounded_to_the_persistable_ledger_range() {
-        let at_bound = json!({"count": MAXIMUM_LEDGER_COUNT});
-        let over_bound = json!({"count": MAXIMUM_LEDGER_COUNT + 1});
-        let at_object = at_bound.as_object().expect("object");
-        let over_object = over_bound.as_object().expect("object");
-        // Exactly i64::MAX is persistable and accepted; one past it is a
-        // provider contract violation everywhere counts are parsed.
-        assert_eq!(
-            count_or_zero(at_object, "count", "count"),
-            Ok(MAXIMUM_LEDGER_COUNT)
-        );
-        assert!(count_or_zero(over_object, "count", "count").is_err());
-        assert_eq!(
-            require_u64(at_object, "count", "count"),
-            Ok(MAXIMUM_LEDGER_COUNT)
-        );
-        assert!(require_u64(over_object, "count", "count").is_err());
-        assert!(openai_usage(Some(&json!({
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "output_tokens_details": {"reasoning_tokens": MAXIMUM_LEDGER_COUNT + 1},
-        })))
-        .is_err());
-    }
-
-    #[test]
-    fn bedrock_usage_folds_cache_legs_and_rejects_unrepresentable_totals() {
-        let usage = bedrock_usage(Some(&json!({
-            "inputTokens": 9,
-            "outputTokens": 4,
-            "cacheReadInputTokens": 2,
-            "cacheWriteInputTokens": 1,
-        })))
-        .expect("valid usage");
-        assert_eq!(usage.input_tokens, Some(12));
-        assert_eq!(usage.cached_input_tokens, Some(2));
-        // A leg beyond the persistable ledger range fails at the parser.
-        assert!(bedrock_usage(Some(&json!({
-            "inputTokens": MAXIMUM_LEDGER_COUNT + 1,
-            "outputTokens": 1,
-        })))
-        .is_err());
-        // Individually persistable legs whose folded total is not are a
-        // provider contract violation, never a clamped or wrapped total.
-        assert!(bedrock_usage(Some(&json!({
-            "inputTokens": MAXIMUM_LEDGER_COUNT,
-            "outputTokens": 1,
-            "cacheReadInputTokens": 1,
-        })))
-        .is_err());
-        assert!(bedrock_usage(Some(&json!(null))).is_err());
-        assert!(bedrock_usage(None).is_err());
-    }
-
-    #[test]
-    fn openai_usage_treats_absent_and_null_objects_as_unknown() {
-        assert!(openai_usage(None).expect("absent is unknown").is_none());
-        assert!(openai_usage(Some(&serde_json::Value::Null))
-            .expect("null is unknown")
-            .is_none());
-        let usage = openai_usage(Some(&json!({
-            "input_tokens": 2,
-            "output_tokens": 3,
-            "output_tokens_details": {"reasoning_tokens": 1},
-        })))
-        .expect("valid usage")
-        .expect("usage present");
-        assert_eq!(usage.reasoning_tokens, Some(1));
-        assert_eq!(usage.cached_input_tokens, None);
-    }
-}
+mod tests;

@@ -210,6 +210,21 @@ while keyed replay creates no new reservation. A period is the immutable UTC buc
 month. Management and remaining-allocation reports are CLI surfaces only. There is no budgets
 dashboard.
 
+Normalized usage follows OpenAI subset semantics on every wire: `reasoning_tokens` counts a subset
+of `output_tokens` and `cached_input_tokens` a subset of `input_tokens`, and settlement prices the
+subset at its own rate and the remainder at the base rate. Wires that report reasoning outside
+their output total are folded by the native usage mappers before the counts leave the data plane:
+Gemini `thoughtsTokenCount` is additive by Google's definition and always folds into
+`output_tokens`; on the OpenAI-shaped wires (Chat Completions and Responses) the provider's own
+`total_tokens` decides: `input + output` is the subset shape (OpenAI, OpenRouter, Fireworks,
+DeepSeek) and passes through untouched, `input + output + reasoning` is the additive shape (xAI,
+natively or relayed by Azure Foundry) and folds; without a decisive total, a reasoning count above
+the output total folds. Anthropic and Bedrock bill thinking inside their output total and publish
+no separate count, so their reasoning subset stays unknown. The customer-visible `completion_tokens`
+and `total_tokens` therefore match what is billed. Note that an additive provider's `max_tokens`
+bounds only its visible answer, so a folded output total can exceed the caller's cap that the
+reservation ceiling was computed from; settlement charges the exact folded total.
+
 Each physical attempt records its own provider, model, usage, latency, terminal state, estimated
 cost attribution, and frozen credential-ownership billing source. Later catalog activation and
 process restart never rewrite that source. Schema-v1/v2 attempt rows migrate explicitly as
