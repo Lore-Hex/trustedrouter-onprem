@@ -14,6 +14,7 @@ from pydantic.types import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
+    MAXIMUM_AUDIO_BASE64_BYTES,
     MAXIMUM_DOCUMENT_BASE64_BYTES,
     MAXIMUM_DOCUMENT_NAME_CHARACTERS,
     MAXIMUM_IMAGE_BASE64_BYTES,
@@ -104,6 +105,29 @@ class _ChatVideoPart(_WireModel):
     video_url: _ChatVideoUrl
 
 
+class _ChatInputAudio(_WireModel):
+    """Chat Completions ``input_audio`` payload: base64 bytes plus a format name.
+
+    The format is validated as free text here so the decoder can name the
+    exact field when a value outside ``wav``/``mp3`` is refused.
+    """
+
+    data: str = Field(min_length=1, max_length=MAXIMUM_AUDIO_BASE64_BYTES)
+    format: str = Field(min_length=1, max_length=16)
+
+
+class _ChatAudioPart(_WireModel):
+    """One Chat Completions ``input_audio`` content part.
+
+    The Responses surface's official request schema defines no audio part on
+    an input message and the live Responses API refuses audio input, so the
+    part is decoded on the Chat surface only.
+    """
+
+    type: Literal["input_audio"]
+    input_audio: _ChatInputAudio
+
+
 _MAXIMUM_FILE_DATA_CHARACTERS = MAXIMUM_DOCUMENT_BASE64_BYTES + 128
 """Room for the largest inline document plus its ``data:`` URL preamble."""
 
@@ -156,6 +180,7 @@ _ContentPart = Annotated[
     | _ChatImagePart
     | _ResponsesImagePart
     | _ChatVideoPart
+    | _ChatAudioPart
     | _ChatFilePart
     | _ResponsesFilePart,
     Field(discriminator="type"),
@@ -234,7 +259,7 @@ class _Message(_WireModel):
         if self.role != "user" and any(
             not isinstance(part, _TextPart) for part in self.image_capable_parts
         ):
-            raise ValueError("image and video parts are valid only for user messages")
+            raise ValueError("image, video, and audio parts are valid only for user messages")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")
@@ -292,9 +317,15 @@ class _StructuredSchema(_WireModel):
 
 
 class _ChatResponseFormat(_WireModel):
-    """Supported Chat text or strict structured-text format."""
+    """Supported Chat text, JSON-object, or strict structured-text format.
 
-    type: Literal["text", "json_schema"]
+    ``json_object`` is admitted so the gateway can translate it to a permissive
+    ``json_schema`` and serve the caller's "give me JSON" intent on every rung
+    (the serving lanes emit only ``json_schema``); it carries no ``json_schema``
+    details, exactly like ``text``.
+    """
+
+    type: Literal["text", "json_object", "json_schema"]
     json_schema: _StructuredSchema | None = None
 
     @model_validator(mode="after")
@@ -322,9 +353,31 @@ class _ChatRequest(_WireModel):
     max_tokens: int | None = Field(default=None, gt=0)
     max_completion_tokens: int | None = Field(default=None, gt=0)
     stop: str | tuple[str, ...] | None = None
+    n: int | None = None
+    """Completion-count selector, accepted only at its no-op default of 1.
+
+    VS Code Copilot's custom-endpoint provider hardcodes ``n: 1`` on every
+    Chat request (wire-captured 2026-09-02); this gateway serves exactly one
+    completion per request, so 1 is accepted as already satisfied and any
+    other value stays a named rejection.
+    """
+
+    @field_validator("n")
+    @classmethod
+    def _require_single_completion(cls, value: int | None) -> int | None:
+        """Accept the completion count only as already satisfied."""
+        if value is not None and value != 1:
+            raise ValueError(
+                "supported only at its default of 1: this gateway serves "
+                "exactly one completion per request"
+            )
+        return value
+
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
@@ -336,6 +389,8 @@ class _ChatRequest(_WireModel):
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
+    """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""
 
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:
@@ -375,6 +430,35 @@ class _EmbeddingsRequest(_WireModel):
         if any(not text for text in value):
             raise ValueError("input array must not contain empty strings")
         return value
+
+
+class _ImagesRequest(_WireModel):
+    """Closed gateway image-generation request profile (OpenAI Images API)."""
+
+    model: str = Field(min_length=1, max_length=256)
+    prompt: str = Field(min_length=1, max_length=32_000)
+    n: int | None = Field(default=None, ge=1, le=10)
+    size: (
+        Literal[
+            "auto",
+            "256x256",
+            "512x512",
+            "1024x1024",
+            "1536x1024",
+            "1024x1536",
+            "1792x1024",
+            "1024x1792",
+        ]
+        | None
+    ) = None
+    quality: Literal["standard", "hd", "low", "medium", "high", "auto"] | None = None
+    background: Literal["transparent", "opaque", "auto"] | None = None
+    output_format: Literal["png", "jpeg", "webp"] | None = None
+    output_compression: int | None = Field(default=None, ge=0, le=100)
+    moderation: Literal["low", "auto"] | None = None
+    response_format: Literal["url", "b64_json"] | None = None
+    style: Literal["vivid", "natural"] | None = None
+    user: str | None = Field(default=None, max_length=1024)
 
 
 class _ResponseTool(_WireModel):
@@ -574,6 +658,20 @@ _ResponsesOutputItem = Annotated[
 _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem
 
 
+class _PromptCacheOptions(_WireModel):
+    """Responses prompt-cache selector, accepted only in its implicit mode.
+
+    VS Code Copilot's custom-endpoint provider hardcodes
+    ``{"mode": "implicit"}`` on every Responses request (wire-captured
+    2026-09-02). Implicit prefix caching is exactly what served routes
+    already do, so the value is accepted as already satisfied; any other
+    mode names behavior this gateway does not provide and stays a closed
+    rejection.
+    """
+
+    mode: Literal["implicit"]
+
+
 class _ResponsesRequest(_WireModel):
     """Closed gateway Responses request profile."""
 
@@ -593,6 +691,25 @@ class _ResponsesRequest(_WireModel):
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning: _ResponseReasoning | None = None
     text: _ResponseText | None = None
+    truncation: str | None = Field(default=None, max_length=64)
+    """Context-truncation selector, accepted only at its no-op default.
+
+    VS Code Copilot's custom-endpoint provider hardcodes
+    ``truncation: "disabled"`` on every Responses request (wire-captured
+    2026-09-02). This gateway never truncates context, so "disabled" is
+    accepted as already satisfied; "auto" asks for dropping context the
+    gateway does not implement and stays a closed rejection.
+    """
+
+    @field_validator("truncation")
+    @classmethod
+    def _require_no_truncation(cls, value: str | None) -> str | None:
+        """Accept the truncation selector only as already satisfied."""
+        if value is not None and value != "disabled":
+            raise ValueError("supported only as 'disabled': this gateway never truncates context")
+        return value
+
+    prompt_cache_options: _PromptCacheOptions | None = None
     stream: bool = False
     client_metadata: JsonObject | None = None
     metadata: JsonObject = Field(default_factory=dict)
@@ -600,3 +717,5 @@ class _ResponsesRequest(_WireModel):
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
+    """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""

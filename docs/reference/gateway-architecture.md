@@ -18,6 +18,16 @@ It serves:
   upgrade answers 426, the status the Codex client maps to its HTTP fallback)
 - `POST /v1/messages` (the Anthropic Messages API; `POST /v1/messages/count_tokens` answers an
   explicit Anthropic-shaped refusal because the gateway has no tokenizer authority)
+- `POST /v1/embeddings` (the OpenAI Embeddings API: message-less and never streamed; served
+  only by aliases whose catalog capabilities declare `supports_embeddings` on an OpenAI-wire
+  connection, billed on the provider's reported `prompt_tokens` with no output leg, and
+  returned with the provider's exact vectors in `float` or `base64` form; an inbound
+  `Idempotency-Key` is ignored because the surface has no replay protocol)
+- `POST /v1/images/generations` (the OpenAI Images API, generations only: prompt in, images
+  out, never streamed; served only by aliases whose catalog capabilities declare
+  `supports_image_generation` on an OpenAI-wire connection, billed on the provider's reported
+  prompt and image tokens, so a model that answers without token usage is refused as
+  unbillable rather than served for free)
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
@@ -200,6 +210,21 @@ while keyed replay creates no new reservation. A period is the immutable UTC buc
 month. Management and remaining-allocation reports are CLI surfaces only. There is no budgets
 dashboard.
 
+Normalized usage follows OpenAI subset semantics on every wire: `reasoning_tokens` counts a subset
+of `output_tokens` and `cached_input_tokens` a subset of `input_tokens`, and settlement prices the
+subset at its own rate and the remainder at the base rate. Wires that report reasoning outside
+their output total are folded by the native usage mappers before the counts leave the data plane:
+Gemini `thoughtsTokenCount` is additive by Google's definition and always folds into
+`output_tokens`; on the OpenAI-shaped wires (Chat Completions and Responses) the provider's own
+`total_tokens` decides: `input + output` is the subset shape (OpenAI, OpenRouter, Fireworks,
+DeepSeek) and passes through untouched, `input + output + reasoning` is the additive shape (xAI,
+natively or relayed by Azure Foundry) and folds; without a decisive total, a reasoning count above
+the output total folds. Anthropic and Bedrock bill thinking inside their output total and publish
+no separate count, so their reasoning subset stays unknown. The customer-visible `completion_tokens`
+and `total_tokens` therefore match what is billed. Note that an additive provider's `max_tokens`
+bounds only its visible answer, so a folded output total can exceed the caller's cap that the
+reservation ceiling was computed from; settlement charges the exact folded total.
+
 Each physical attempt records its own provider, model, usage, latency, terminal state, estimated
 cost attribution, and frozen credential-ownership billing source. Later catalog activation and
 process restart never rewrite that source. Schema-v1/v2 attempt rows migrate explicitly as
@@ -280,8 +305,9 @@ idempotency header, so this surface never joins the keyed replay stores.
 Route admission preserves caller capabilities in three verbatim-preference layers before any
 coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`), generation
 controls narrow the waterfall to the rungs that preserve every exact value
-(`compatible_generation_parameter_profile_indexes`), and each remaining deployment passes the
-capability preflight plus payload build. Only when zero rungs survive does the
+(`compatible_generation_parameter_profile_indexes`), falling back to the rungs that can serve the
+request only through a disclosed drop when no rung preserves it, and each remaining deployment
+passes the capability preflight plus payload build. Only when zero rungs survive does the
 capability-preservation policy (`exp/runtime/models/providers/capability_policy.py`) attempt one
 minimal COERCE-WITH-DISCLOSURE: a reasoning effort snaps to the nearest level any rung supports
 on the canonical ladder (ties prefer the lower level), ANY effort on a route with no reasoning
@@ -289,13 +315,42 @@ support at all drops (first-party clients pin effort globally, so a named reject
 sessions unusable against non-reasoning models the provider itself serves fine without the
 parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
 dropped value reaches the provider through no channel), and `strict: true` tools degrade to
-best-effort schemas. On `maximize_cache` pools, a cache-marked request dispatches
+best-effort schemas. On a reasoning route that accepts sampling only at `reasoning_effort=none`
+(`sampling_requires_reasoning_none`, e.g. gpt-5.6-sol/luna), a `temperature`/`top_p` sent with
+reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_effort_none)` rather
+than rejected. The model accepts sampling, just not at that effort, so the request serves and the
+caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
+control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
+nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
+rung that carries it, and a committed route with no supporting rung (an Azure `openai_deployments`
+DeepSeek rung rejects it upstream) drops it with `top_k->dropped(unsupported_by_provider)` rather
+than rejecting, since a rung's default sampling still returns a valid answer. `frequency_penalty`
+and `presence_penalty` are admitted at the ingress and adapted the same way: honored (emitted) where
+every rung supports them (the per-rung `supports_frequency_penalty`/`supports_presence_penalty`
+capability truth), dropped as `frequency_penalty->dropped(unsupported_by_provider)` where a rung does
+not. It is a soft preference whose absence still returns a valid answer. `top_logprobs` stays rejected
+(not admitted): the gateway response contract does not project logprob arrays yet, so it cannot be
+honored on any rung and silently dropping a probability request is never acceptable. The reject is
+the honest terminal until output normalization emits logprobs. A caller
+`response_format: {type: "json_object"}` is TRANSLATED, not dropped: it is admitted at the Chat
+ingress and rewritten to a permissive non-strict `json_schema` (`{"type":"object"}`, "any JSON
+object"). The serving lanes emit only `json_schema`, so this preserves the caller's JSON intent on
+every rung (dropping it would hand prose to a caller who asked for JSON), and disclosed as
+`response_format->translated(json_object)`; a non-strict schema is left open (never force-closed to
+`additionalProperties:false`), so its "any object" meaning is not inverted on a schema-closing
+(Anthropic) rung. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
+only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
+directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
+bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own
+`service_tier` stays a recorded Messages-surface rejection. On `maximize_cache` pools, a cache-marked request dispatches
 marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
 group, so a shim rung can no longer silently bill every turn's full context uncached while the
 native rung stands ready; routes narrowing to only marker-dropping wires keep disclosing the
 dropped markers. Every coercion is disclosed in `path->effective` form
 through `ignored_parameters`, logged, and counted in the `admission_parameter_coercions`
-metric; nothing coercible keeps the first rung's own field-scoped rejection.
+metric; every serving surface carries that list to the caller as a body-level
+`x-trustedrouter-onprem-ignored-parameters` key (Chat chunk and completion, Responses envelope, and the
+Anthropic message on both `message_start` and the aggregated body), so a drop is never silent; nothing coercible keeps the first rung's own field-scoped rejection.
 The per-deployment `capability_parity` export joins catalog declarations with the engine's
 provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
 caller hits that 400.

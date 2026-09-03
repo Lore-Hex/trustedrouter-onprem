@@ -9,13 +9,12 @@ from pydantic import Field, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.content import (
-    MAXIMUM_DOCUMENTS_PER_REQUEST,
-    MAXIMUM_IMAGES_PER_REQUEST,
-    MAXIMUM_VIDEOS_PER_REQUEST,
+    AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
     MessageContentPart,
     VideoContentPart,
+    require_attachment_ceilings,
 )
 from exp.common.models.gateway_catalog import (
     DeploymentId,
@@ -62,6 +61,7 @@ class GatewayApiSurface(StrEnum):
     RESPONSES = "responses"
     MESSAGES = "messages"
     EMBEDDINGS = "embeddings"
+    IMAGES = "images"
 
 
 class GatewayToolDefinition(ContractModel):
@@ -78,39 +78,25 @@ class GatewayToolDefinition(ContractModel):
     parameters: JsonObject
     strict: bool = False
     cache_control: JsonObject | None = Field(default=None, exclude=True)
-    """Validated caller prompt-caching hint attached to this tool definition.
-
-    Forwarded onto the native Anthropic tool block and dropped with
+    """Validated caller prompt-caching hint attached to this tool definition,
+    forwarded onto the native Anthropic tool block and dropped with
     disclosure on other wires. Like ``ToolCall.cache_control``, a cache hint
-    changes cost, not semantics, so it joins neither serialization nor
-    replay identity: two requests differing only here are the same request.
-    """
+    changes cost, not semantics: it joins neither serialization nor replay
+    identity."""
     eager_input_streaming: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic fine-grained tool-input streaming selector.
-
-    Accepted bare by the provider (verified live 2026-08-30; no beta header).
-    Claude Code sends it conditionally. It changes how the provider frames
-    tool-input deltas, so like the other Anthropic-native carriers it is excluded
-    from serialization (tool digests predate it) and a present value joins
-    replay identity through :func:`canonical_request_sha256`.
-    """
+    """Verbatim Anthropic fine-grained tool-input streaming selector, sent
+    conditionally by Claude Code and accepted bare by the provider (verified
+    live 2026-08-30, no beta header). Excluded from serialization (tool
+    digests predate it); a present value joins replay identity through
+    :func:`canonical_request_sha256`, like every carrier below."""
     defer_loading: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic tool-search deferred-loading selector.
-
-    Accepted bare by the provider, which owns the cross-tool validity rules
-    (verified live 2026-08-30: ``false`` is a no-op and an all-deferred toolset
-    is the provider's own 400). Excluded from serialization; a present value
-    changes what the model initially sees, so it joins replay identity through
-    :func:`canonical_request_sha256`.
-    """
+    """Verbatim Anthropic tool-search deferred-loading selector; the provider
+    owns the cross-tool validity rules (verified live 2026-08-30: ``false``
+    is a no-op and an all-deferred toolset is the provider's own 400)."""
     allowed_callers: tuple[str, ...] | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic programmatic-tool-calling caller allowlist.
-
-    Accepted bare by the provider even without a companion server tool
-    (verified live 2026-08-30), so the provider stays the authority on the
-    combination rules. Excluded from serialization; a present value joins
-    replay identity through :func:`canonical_request_sha256`.
-    """
+    """Verbatim Anthropic programmatic-tool-calling caller allowlist,
+    accepted bare by the provider even without a companion server tool
+    (verified live 2026-08-30), which stays the combination authority."""
     input_examples: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
     """Verbatim Anthropic example tool inputs.
 
@@ -320,10 +306,10 @@ class GatewayMessage(ContractModel):
 
     Empty on every text-only message, so a text-only request serializes and
     digests exactly as before attachments existed. When present, the text parts
-    concatenate to ``content`` byte-for-byte and at least one image, video, or
-    document part is included, so a route that cannot carry it is rejected at
-    admission instead of silently serving the text alone. Attachments change
-    what the model sees, so this field is serialized and joins request identity.
+    concatenate to ``content`` byte-for-byte and at least one attachment (image,
+    video, audio, or document) is included, so a route that cannot carry it is
+    rejected at admission instead of silently serving the text alone. Attachments
+    change what the model sees, so the field is serialized and joins request identity.
     """
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Validated caller prompt-caching marker on this tool-result message.
@@ -454,6 +440,8 @@ class GatewayRequest(ContractModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
@@ -614,6 +602,13 @@ class GatewayRequest(ContractModel):
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    service_tier: str | None = Field(default=None, max_length=64, exclude=True)
+    """Caller provider processing tier, forwarded only on BYOK OpenAI-family
+    rungs (routing and billing rules live at streaming_requests and
+    capability_policy). Excluded from serialization so tier-free digests are
+    unperturbed; a present value joins replay identity through
+    :func:`canonical_request_sha256`: the same body at a different tier is a
+    different provider price and schedule."""
     ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
     """Disclosed compatibility decisions applied to this request.
 
@@ -649,6 +644,12 @@ class GatewayRequest(ContractModel):
     def videos(self) -> tuple[VideoContentPart, ...]:
         """Return every video this request carries, in message and part order."""
         return tuple(video for message in self.messages for video in message.videos)
+
+    @property
+    def audios(self) -> tuple[AudioContentPart, ...]:
+        """Return every audio clip this request carries, in message and part order."""
+        parts = (part for message in self.messages for part in message.content_parts)
+        return tuple(part for part in parts if part.kind == "audio")
 
     @property
     def documents(self) -> tuple[DocumentContentPart, ...]:
@@ -699,21 +700,13 @@ class GatewayRequest(ContractModel):
             and self.tool_choice.name not in server_names
         ):
             raise ValueError("named gateway tool choice must name a request tool")
-        if (
-            self.tool_choice == "required"
-            and not self.tools
-            and not self.provider_server_tools
-            and not self.provider_native_tools
-        ):
+        has_tools = bool(self.tools or self.provider_server_tools or self.provider_native_tools)
+        if self.tool_choice == "required" and not has_tools:
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
-        if len(self.images) > MAXIMUM_IMAGES_PER_REQUEST:
-            raise ValueError(f"a request carries at most {MAXIMUM_IMAGES_PER_REQUEST} images")
-        if len(self.videos) > MAXIMUM_VIDEOS_PER_REQUEST:
-            raise ValueError(f"a request carries at most {MAXIMUM_VIDEOS_PER_REQUEST} videos")
-        if len(self.documents) > MAXIMUM_DOCUMENTS_PER_REQUEST:
-            raise ValueError(f"a request carries at most {MAXIMUM_DOCUMENTS_PER_REQUEST} documents")
+        parts = (part for message in self.messages for part in message.content_parts)
+        require_attachment_ceilings(parts)
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_summary is valid only for Responses requests")
         if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:
@@ -747,6 +740,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("Anthropic tool carriers are valid only for Messages requests")
         if self.provider_beta_tokens and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_beta_tokens are valid only for Messages requests")
+        if self.service_tier is not None and self.surface == GatewayApiSurface.MESSAGES:
+            raise ValueError("service_tier is not valid for Messages requests")
         if self.provider_server_tools and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_server_tools are valid only for Messages requests")
         if self.provider_native_tools and self.surface != GatewayApiSurface.RESPONSES:
@@ -924,6 +919,10 @@ class GatewayFailureClass(StrEnum):
     TIMEOUT = "timeout"
     PROVIDER_AUTHENTICATION = "provider_authentication"
     PROVIDER_NOT_FOUND = "provider_not_found"
+    # The provider ACCOUNT cannot pay for the request (trial quota exhausted,
+    # billing not enabled): operator-actionable deadness that fails over in
+    # every mode. Distinct from QUOTA_EXCEEDED, the CALLER's gateway credit.
+    PROVIDER_QUOTA = "provider_quota"
     REFUSAL = "refusal"
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_INTERNAL = "provider_internal"

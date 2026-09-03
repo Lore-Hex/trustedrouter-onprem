@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -13,6 +14,7 @@ from unittest import mock
 
 import pytest
 
+import exp.runtime.gateway.native_bridge as native_bridge_module
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     GatewayDeploymentCapabilities,
@@ -160,6 +162,26 @@ def test_pdf_capability_errors_explain_the_document_refusal(
     assert "cannot accept PDF document input" in inline.detail.message
     assert "inline PDF data only" in remote.detail.message
     assert "pdf_input" not in inline.detail.message
+
+
+@pytest.mark.parametrize(
+    ("surface", "param"),
+    [(GatewayApiSurface.CHAT_COMPLETIONS, "messages"), (GatewayApiSurface.RESPONSES, "input")],
+)
+def test_audio_capability_error_explains_the_refusal(
+    surface: GatewayApiSurface, param: str
+) -> None:
+    """A refused clip names the conversation field and says why, on every surface."""
+    error = _public_capability_error(
+        ProviderCapabilityError(capability="audio_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    assert error.detail.param == param
+    assert error.detail.code == "unsupported_capability"
+    assert "cannot accept audio input" in error.detail.message
+    assert "audio_input" not in error.detail.message
 
 
 def test_public_capability_error_never_exposes_internal_labels() -> None:
@@ -3056,6 +3078,39 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
     assert crossed.value.detail.code == "previous_response_not_found"
 
 
+def test_fallback_served_alias_continuation_degrades_to_resend_not_503(tmp_path: Path) -> None:
+    """A continuation on an alias served via its last-good fallback still fails
+    with the 400 'resend the full conversation' error when it cannot resolve,
+    never a 503. The fallback re-key is upstream of continuation binding, so it
+    adds no 5xx path; a fresh request on the same alias serves via the fallback.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    # Dead-pin the active revision so the alias is served on its last-good prior.
+    manager = GatewayManagement(tmp_path)
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-dead",
+        pool_id="coding",
+        snapshot_ref="catalog-snapshots/missing.json",
+        catalog_sha256="a" * 64,
+    )
+
+    # A fresh (non-continuation) Responses request still serves via the fallback.
+    served = _admit_responses(control, raw_key, _responses_body())
+    assert served["request_id"]
+
+    # A continuation whose previous_response_id cannot resolve returns the shared
+    # 400 resend error, not a 503. This confirms the re-key never turns an
+    # unresolvable continuation into a server error.
+    with pytest.raises(NativeBridgeError) as rejected:
+        _admit_responses(control, raw_key, _responses_body(previous_response_id="resp_missing"))
+    payload = json.loads(rejected.value.public_error_json)
+    assert payload["status_code"] == 400
+    assert payload["code"] == "previous_response_not_found"
+    assert payload["param"] == "previous_response_id"
+
+
 def test_responses_tool_call_retention_survives_continuation(tmp_path: Path) -> None:
     """Completed tool calls are retained and replayed into continued history."""
     control, raw_key = _control_plane(tmp_path)
@@ -4444,6 +4499,133 @@ def test_effort_carrying_marked_request_serves_native_with_caching_intact(
     assert system[-1]["cache_control"] == {"type": "ephemeral"}
 
 
+def test_adaptive_thinking_drops_with_the_effort_on_a_reasoning_less_route(
+    tmp_path: Path,
+) -> None:
+    """Claude Code pins thinking adaptive with effortLevel; both drop, disclosed.
+
+    The effort alone dropping left the adaptive object on the wire, and a
+    non-reasoning Anthropic rung answers that with a post-dispatch 400 the
+    caller cannot act on. A budgeted thinking config carries its own
+    semantics and still travels verbatim.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(root, provider="anthropic")
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=120.0)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body, surface="messages"))
+    assert admission["ignored_parameters"] == ["reasoning_effort", "thinking"]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "thinking" not in upstream
+    assert "output_config" not in upstream
+
+    budgeted = json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "output_config": {"effort": "high"},
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, budgeted, surface="messages"))
+    assert admission["ignored_parameters"] == ["reasoning_effort"]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert upstream["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+
+
+def test_open_response_format_schema_closes_on_an_anthropic_rung(tmp_path: Path) -> None:
+    """A Chat response_format schema without additionalProperties false serves.
+
+    The Anthropic validator rejects open objects that OpenAI accepts, so the
+    gateway closes every object on the wire and discloses the tightening
+    instead of relaying a post-dispatch 400.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    manager, raw_key = _configured_gateway(root, provider="anthropic")
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        root,
+        deployment_alias="structured",
+        connection_name="provider-main",
+        provider_model="provider-model-structured",
+        exact_model_id="structured-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(supports_structured_output=True),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_structured_text=True,
+        ),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="structured",
+        alias_name="structured",
+        revision_id="revision-structured",
+        pool_id="structured",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="structured")
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=120.0)
+    body = json.dumps(
+        {
+            "model": "structured",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "geo": {
+                                "type": "object",
+                                "properties": {"lat": {"type": "number"}},
+                            },
+                        },
+                        "required": ["city", "geo"],
+                    },
+                },
+            },
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body))
+    assert admission["ignored_parameters"] == ["json_schema.additionalProperties->false"]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    output_config = cast("JsonObject", upstream["output_config"])
+    schema_format = cast("JsonObject", output_config["format"])
+    schema = cast("JsonObject", schema_format["schema"])
+    assert schema["additionalProperties"] is False
+    properties = cast("JsonObject", schema["properties"])
+    geo = cast("JsonObject", properties["geo"])
+    assert geo["additionalProperties"] is False
+    assert schema["required"] == ["city", "geo"]
+
+
 def _web_search_fixture_json() -> str:
     """One WebSearch event stream in the fixture-event vocabulary."""
     result_block = (
@@ -4523,3 +4705,49 @@ def test_rust_messages_paused_turn_keeps_its_stop_reason() -> None:
     assert '"stop_reason":"pause_turn"' in frames
     body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
     assert body["stop_reason"] == "pause_turn"
+
+
+def test_internal_admission_failures_log_the_real_exception(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sanitized 500 hides the cause everywhere else, so the bridge logs it once.
+
+    A granted alias whose admission blew up with an unexpected exception used
+    to fail 500 with the traceback recorded nowhere (public error, ledger row,
+    and worker log all carry only the sanitized text). The record names the
+    request and alias and carries the exception on ``exc_info``.
+    """
+    control, raw_key = _pool_control_plane(tmp_path)
+
+    def explode(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        message = "hydrated snapshot names a deployment this worker never registered"
+        raise KeyError(message)
+
+    monkeypatch.setattr(native_bridge_module, "resolve_admission_route", explode)
+    body = json.dumps({"model": "coding", "messages": [{"role": "user", "content": "hi"}]})
+
+    with (
+        caplog.at_level(logging.ERROR, logger="exp.runtime.gateway.native_bridge"),
+        pytest.raises(NativeBridgeError) as raised,
+    ):
+        _admit(control, raw_key, body)
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 500
+    assert error["code"] == "internal_error"
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "gateway admission failed before provider dispatch"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.exc_info is not None
+    assert record.exc_info[0] is KeyError
+    # ``extra`` fields land on the record's namespace, not on the typed class.
+    fields = record.__dict__
+    assert fields["alias"] == "coding"
+    assert str(fields["request_id"]).startswith("request-")
+    assert fields["exception_type"] == "KeyError"
+    assert fields["operation"] == "native_admit"

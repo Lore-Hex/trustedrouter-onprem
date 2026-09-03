@@ -107,6 +107,15 @@ class GatewayWireProfile:
     supports_temperature: bool = True
     """Whether the exact model accepts explicit sampling temperature."""
 
+    billing_customer_managed: bool = False
+    """Whether this rung dispatches on tenant-owned (BYOK) credentials.
+
+    Tier selectors (``service_tier``) forward only where the caller pays the
+    provider directly: on host-funded rungs a tier changes what the provider
+    charges while the gateway bills catalog rates, so the field never
+    reaches the provider there.
+    """
+
     minimum_temperature: float = 0.0
     """Smallest temperature value accepted by this provider wire."""
 
@@ -135,6 +144,19 @@ class GatewayWireProfile:
     """Provider metadata for logprob support.
 
     Dispatch stays disabled until normalized output projection exists.
+    """
+
+    supports_frequency_penalty: bool = False
+    """Whether this exact route accepts the ``frequency_penalty`` sampling control.
+
+    Defaults false so the control is dropped-with-disclosure until the catalog
+    stamps the rungs that honor it (per-rung capability truth, catalog side).
+    """
+
+    supports_presence_penalty: bool = False
+    """Whether this exact route accepts the ``presence_penalty`` sampling control.
+
+    Defaults false; see ``supports_frequency_penalty``.
     """
 
     supports_reasoning: bool = False
@@ -169,6 +191,15 @@ class GatewayWireProfile:
     serialized body bytes (SigV4). When true the admission response carries a
     pre-serialized body the data plane must send verbatim, and the resolved
     client exposes ``sign_gateway_dispatch``."""
+
+    embeddings_url: str | None = None
+    """Full OpenAI-wire ``/embeddings`` endpoint for this connection, sharing
+    ``headers``; ``None`` when the connection speaks no embeddings wire, so the
+    embeddings surface excludes the rung instead of dispatching a chat URL."""
+
+    images_url: str | None = None
+    """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
+    sharing ``headers``; ``None`` when the connection speaks no images wire."""
 
     def __post_init__(self) -> None:
         """Reject malformed operator wire contracts before admission."""

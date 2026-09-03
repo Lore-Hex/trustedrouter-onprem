@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from typing import assert_never
+
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_json
 from exp.runtime.gateway.contracts import EncryptedReasoningBlock, GatewayRequest
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
+from exp.runtime.gateway.images_contracts import ImagesRequest
 
 
 def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
@@ -95,6 +99,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and request.diagnostics is None
         and request.speed is None
         and request.inference_geo is None
+        and request.service_tier is None
         and not request.provider_beta_tokens
         and not request.provider_server_tools
         and not request.provider_native_tools
@@ -115,6 +120,9 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         envelope["speed"] = request.speed
     if request.inference_geo is not None:
         envelope["inference_geo"] = request.inference_geo
+    if request.service_tier is not None:
+        # A provider tier changes pricing and scheduling for the same body.
+        envelope["service_tier"] = request.service_tier
     if retained_tools:
         envelope["tools"] = retained_tools
     if request.provider_beta_tokens:
@@ -128,7 +136,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     return envelope
 
 
-def canonical_request_sha256(request: GatewayRequest) -> Sha256:
+def canonical_request_sha256(request: ServingRequest) -> Sha256:
     """Digest one canonical request including excluded provider replay authority.
 
     A caller operation key reused with different replayed reasoning must be
@@ -136,13 +144,22 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
     request with no carrier digests exactly as its plain serialization, so
     every request decoded before the carriers existed keeps its identity.
 
+    The embeddings and images surfaces have no messages, tools, or provider
+    carriers, so they digest exactly as their plain serialization.
+
     Args:
-        request: Canonical gateway request as decoded from the public wire.
+        request: Canonical serving request as decoded from the public wire.
 
     Returns:
         The stable canonical request digest.
     """
-    envelope = provider_replay_authority(request)
-    if envelope is None:
-        return sha256_json(request)
-    return sha256_json({"request_sha256": sha256_json(request), **envelope})
+    match request:
+        case EmbeddingsRequest() | ImagesRequest():
+            return sha256_json(request)
+        case GatewayRequest():
+            envelope = provider_replay_authority(request)
+            if envelope is None:
+                return sha256_json(request)
+            return sha256_json({"request_sha256": sha256_json(request), **envelope})
+        case _:  # pragma: no cover - exhaustive over the ServingRequest union.
+            assert_never(request)

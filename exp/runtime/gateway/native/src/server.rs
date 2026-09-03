@@ -30,6 +30,8 @@ use crate::route_batches::{
     files_content, files_create, files_retrieve,
 };
 use crate::route_chat::chat;
+use crate::route_embeddings::embeddings;
+use crate::route_images::images;
 use crate::route_messages::{messages, messages_count_tokens};
 use crate::route_responses::responses;
 use crate::route_responses_ws::responses_ws;
@@ -156,6 +158,8 @@ pub async fn run(
         .route("/v1/models", get(models))
         .route("/v1/models/{model_id}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/v1/images/generations", post(images))
         .route("/v1/responses", post(responses).get(responses_ws))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))

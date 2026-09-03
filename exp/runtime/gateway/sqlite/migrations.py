@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 
 
 class GatewaySchemaError(RuntimeError):
@@ -620,6 +620,45 @@ _MIGRATION_13 = (
     "ALTER TABLE gateway_attempts ADD COLUMN long_context_reasoning_rate INTEGER",
 )
 
+# The v14 gateway_requests definition: the v10 table with the api_surface
+# CHECK widened once more to admit the embeddings surface. Migrations 11-13
+# touched other tables, so this is otherwise the live definition verbatim.
+_GATEWAY_REQUESTS_V14_SQL = _GATEWAY_REQUESTS_V10_SQL.replace(
+    "api_surface IN ('chat_completions', 'responses', 'messages')",
+    "api_surface IN ('chat_completions', 'responses', 'messages', 'embeddings')",
+)
+
+_MIGRATION_14 = (
+    # Same CHECK-only in-place rewrite as migration 10 (see its comment).
+    "PRAGMA writable_schema = ON",
+    (
+        "UPDATE sqlite_master SET sql = '"
+        + _GATEWAY_REQUESTS_V14_SQL.replace("'", "''")
+        + "' WHERE type = 'table' AND name = 'gateway_requests'"
+    ),
+    "PRAGMA writable_schema = RESET",
+    "CREATE TABLE gateway_schema_refresh_v14 (noop INTEGER) STRICT",
+    "DROP TABLE gateway_schema_refresh_v14",
+)
+
+# v15: the api_surface CHECK admits the images surface (same in-place rewrite).
+_GATEWAY_REQUESTS_V15_SQL = _GATEWAY_REQUESTS_V14_SQL.replace(
+    "api_surface IN ('chat_completions', 'responses', 'messages', 'embeddings')",
+    "api_surface IN ('chat_completions', 'responses', 'messages', 'embeddings', 'images')",
+)
+
+_MIGRATION_15 = (
+    "PRAGMA writable_schema = ON",
+    (
+        "UPDATE sqlite_master SET sql = '"
+        + _GATEWAY_REQUESTS_V15_SQL.replace("'", "''")
+        + "' WHERE type = 'table' AND name = 'gateway_requests'"
+    ),
+    "PRAGMA writable_schema = RESET",
+    "CREATE TABLE gateway_schema_refresh_v15 (noop INTEGER) STRICT",
+    "DROP TABLE gateway_schema_refresh_v15",
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -634,6 +673,8 @@ _MIGRATIONS = {
     11: _MIGRATION_11,
     12: _MIGRATION_12,
     13: _MIGRATION_13,
+    14: _MIGRATION_14,
+    15: _MIGRATION_15,
 }
 
 

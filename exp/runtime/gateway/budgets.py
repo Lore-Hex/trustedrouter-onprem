@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import assert_never
 
 from pydantic import Field, model_validator
 
@@ -20,6 +21,12 @@ from exp.common.models.gateway_catalog import (
 )
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.embeddings_contracts import (
+    EmbeddingsRequest,
+    ServingRequest,
+    embeddings_input_ceiling_micro_usd,
+)
+from exp.runtime.gateway.images_contracts import ImagesRequest, images_ceiling_micro_usd
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
@@ -531,21 +538,40 @@ def budget_period_start(period: str) -> str:
 
 
 def maximum_attempt_cost_micro_usd(
+    request: ServingRequest,
+    deployment: ExactModelDeployment,
+) -> int | None:
+    """Return a conservative micro-USD ceiling for one physical call (per surface)."""
+    match request:
+        case EmbeddingsRequest():
+            return embeddings_input_ceiling_micro_usd(
+                request,
+                input_rate=deployment.gateway.prices.input_micro_usd_per_million_tokens,
+                maximum=MAXIMUM_MICRO_USD,
+            )
+        case ImagesRequest():
+            return images_ceiling_micro_usd(
+                request,
+                input_rate=deployment.gateway.prices.input_micro_usd_per_million_tokens,
+                output_rate=deployment.gateway.prices.output_micro_usd_per_million_tokens,
+                maximum=MAXIMUM_MICRO_USD,
+            )
+        case GatewayRequest():
+            return _completion_attempt_cost_micro_usd(request, deployment)
+        case _:  # pragma: no cover - exhaustive over the ServingRequest union.
+            assert_never(request)
+
+
+def _completion_attempt_cost_micro_usd(
     request: GatewayRequest,
     deployment: ExactModelDeployment,
 ) -> int | None:
-    """Return a conservative integer micro-USD ceiling for one physical call.
+    """Return a conservative micro-USD ceiling for one chat/responses call.
 
-    Canonical UTF-8 bytes conservatively upper-bound input tokens. The caller's output ceiling
-    wins when present, then the frozen deployment limit, then a reservation-only default bounded
-    by the model's context window, so a missing output ceiling never makes a priced route
-    unpriceable. Cached-input and
-    reasoning counts are subsets of the total input and output counts, so the worst case uses
-    the highest applicable rate in each direction rather than adding subset rates to the same
-    token ceiling. A long-context tier joins the worst case exactly when the byte bound reaches
-    its threshold (bytes never undercount tokens, so a smaller request cannot be repriced), and
-    a reachable tier missing a required rate unprices the route. Unknown required prices still
-    produce ``None`` so an applicable hard limit fails closed.
+    Canonical UTF-8 bytes upper-bound input tokens; the output ceiling is the
+    caller's, else the frozen deployment limit, else a reservation-only default
+    bounded by the context window. Cached and reasoning tokens are subsets of the
+    totals, so the worst case charges the higher rate for the whole leg.
     """
     input_tokens = len(canonical_json_bytes(request))
     # Excluded provider carriers (replayed reasoning, native items, verbatim
@@ -830,19 +856,15 @@ def _unknown_token_volume(
 ) -> tuple[int, int]:
     """Sum observed token volume across one limit's unresolved unknown-cost attempts.
 
-    Input volume includes cached input tokens and output volume includes reasoning
-    tokens, so operators can gauge the real traffic behind attempts whose price is
-    still unknown.
+    Cached-input and reasoning counts are subsets of the input and output totals
+    (``GatewayUsage``), so the totals alone gauge the real traffic behind attempts
+    whose price is still unknown.
     """
     row = connection.execute(
         """
         SELECT
-            COALESCE(SUM(
-                COALESCE(a.input_tokens, 0) + COALESCE(a.cached_input_tokens, 0)
-            ), 0) AS input_volume,
-            COALESCE(SUM(
-                COALESCE(a.output_tokens, 0) + COALESCE(a.reasoning_tokens, 0)
-            ), 0) AS output_volume
+            COALESCE(SUM(COALESCE(a.input_tokens, 0)), 0) AS input_volume,
+            COALESCE(SUM(COALESCE(a.output_tokens, 0)), 0) AS output_volume
         FROM gateway_attempt_budget_charges AS c
         JOIN gateway_attempts AS a ON a.attempt_id = c.attempt_id
         WHERE c.budget_id = ?

@@ -36,14 +36,24 @@ from exp.runtime.gateway.catalog_authority import (
     upsert_connection,
     upsert_singleton_deployment,
 )
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    DirectTarget,
+    ExecutionSnapshot,
+    GatewayApiSurface,
+)
 from exp.runtime.gateway.lifecycle import (
     GatewayLifecycleError,
     LocalGatewayComponents,
+    _AliasAuthorityState,
     _ReadyControlStore,
+    _serve_or_fallback,
+    _served_triple,
+    _ServedFallback,
     gateway_instance_lock,
     load_gateway_components,
 )
-from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
 from exp.runtime.gateway.project_activation import ProjectActivation, ProjectActivationError
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models import RuntimeModelCatalog
@@ -316,6 +326,137 @@ def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) 
         _authorize(components, raw_key, "broken")
 
 
+def test_a_natively_unservable_alias_is_excluded_and_the_rest_serve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A half-activated alias whose only rung has no native dialect is excluded.
+
+    This is the incident's muse-glimmer shape: a never-activated model whose lone
+    rung was flipped active resolves to a provider with no native wire dialect. It
+    must not abort the whole worker at the startup gate (which took the fleet down);
+    the build marks it UNAVAILABLE and serves every other alias, and calling it
+    directly is a per-request failure, not a crash.
+    """
+    from exp.runtime.models.providers.errors import ProviderCapabilityError
+    from exp.runtime.models.providers.gemini import GeminiClient
+
+    def _no_native_dialect(self: GeminiClient) -> object:
+        del self
+        raise ProviderCapabilityError(capability="native_data_plane")
+
+    monkeypatch.setattr(GeminiClient, "gateway_wire_profile", _no_native_dialect)
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="muse-glimmer",
+        connection_name="gemini-main",
+        provider_model="muse-glimmer-exact",
+        exact_model_id="muse-glimmer-revision",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="muse-glimmer",
+        alias_name="muse-glimmer",
+        revision_id="revision-muse",
+        pool_id="muse-glimmer",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="muse-glimmer")
+
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "available", "TEST_GEMINI_KEY": "gemini-key"},
+    )
+
+    # The worker binds and serves the good alias; only the bad one is UNAVAILABLE.
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    ((alias_name, reason),) = components.unavailable_aliases
+    assert alias_name == "muse-glimmer"
+    assert "cannot be served natively" in reason
+    assert "native dialect" in reason
+    with pytest.raises(GatewayRoutingError):
+        _authorize(components, raw_key, "muse-glimmer")
+
+
+def test_an_unexpected_error_building_one_alias_excludes_only_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unanticipated exception building one alias excludes just that alias.
+
+    No single malformed catalog row may abort the whole build (the startup-time
+    all-or-nothing build was the fleet-wide catalog outage's root cause), so even
+    an exception type the specific handlers do not anticipate is caught by the
+    per-alias backstop and marked UNAVAILABLE while the rest serve.
+    """
+    import exp.runtime.gateway.lifecycle as lifecycle_module
+
+    original_load_snapshot = lifecycle_module._load_snapshot
+
+    def _boom(manager: GatewayManagement, alias: GatewayAliasView) -> object:
+        if alias.alias_name == "broken":
+            raise RuntimeError("unexpected catalog build failure")
+        return original_load_snapshot(manager, alias)
+
+    monkeypatch.setattr(lifecycle_module, "_load_snapshot", _boom)
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="broken",
+        connection_name="gemini-main",
+        provider_model="broken-exact",
+        exact_model_id="broken-revision",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="broken",
+        alias_name="broken",
+        revision_id="revision-broken",
+        pool_id="broken",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="broken")
+
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "available", "TEST_GEMINI_KEY": "gemini-key"},
+    )
+
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    ((alias_name, reason),) = components.unavailable_aliases
+    assert alias_name == "broken"
+    assert "unexpected catalog build failure" in reason
+    with pytest.raises(GatewayRoutingError):
+        _authorize(components, raw_key, "broken")
+
+
 def test_partial_startup_exposes_each_unavailable_alias_with_its_reason(tmp_path: Path) -> None:
     """A partially ready gateway names every failed alias and its exact load reason."""
     manager, _raw_key = _configured_gateway(tmp_path)
@@ -466,9 +607,13 @@ def test_unrelated_invalid_snapshot_does_not_block_a_valid_alias_reload(tmp_path
         catalog_sha256=normalized.identity_sha256(),
     )
 
-    assert _granted_authorities(components, raw_key) == {"coding": "revision-two"}
-    with pytest.raises(GatewayRoutingError):
-        _authorize(components, raw_key, "sibling")
+    # The broken sibling revision never blocks coding's reload, and the sibling
+    # itself degrades to its last-good prior revision instead of going dark.
+    assert _granted_authorities(components, raw_key) == {
+        "coding": "revision-two",
+        "sibling": "revision-sibling",
+    }
+    assert _authorize(components, raw_key, "sibling") == "revision-sibling"
 
 
 class _FailingProjectRepository:
@@ -522,8 +667,11 @@ def test_broken_project_sibling_does_not_block_a_valid_alias_reload(tmp_path: Pa
         _authorize(components, raw_key, "router")
 
 
-def test_invalid_new_revision_fails_closed_and_recovers_after_fix(tmp_path: Path) -> None:
-    """An unloadable new revision keeps fail-closed behavior and recovers in place."""
+def test_invalid_new_revision_serves_last_good_and_recovers_after_fix(tmp_path: Path) -> None:
+    """An unloadable new revision serves the last-good prior revision, not a 503,
+    and adopts a repaired revision in place. This is the persistent-hydration
+    fix: a live alias whose active revision pins a dead snapshot degrades to its
+    most recent good revision instead of going dark."""
     manager, raw_key = _configured_gateway(tmp_path)
     components = load_gateway_components(
         tmp_path,
@@ -540,9 +688,10 @@ def test_invalid_new_revision_fails_closed_and_recovers_after_fix(tmp_path: Path
         catalog_sha256="a" * 64,
     )
 
-    assert _granted_authorities(components, raw_key) == {}
-    with pytest.raises(GatewayRoutingError):
-        _authorize(components, raw_key, "coding")
+    # The active (broken) revision is unservable, so the alias is served and
+    # listed on its last-good prior revision, attributed to what was served.
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    assert _authorize(components, raw_key, "coding") == "revision-one"
 
     manager.activate_direct_alias(
         alias_id="coding",
@@ -555,6 +704,116 @@ def test_invalid_new_revision_fails_closed_and_recovers_after_fix(tmp_path: Path
 
     assert _granted_authorities(components, raw_key) == {"coding": "revision-repaired"}
     assert _authorize(components, raw_key, "coding") == "revision-repaired"
+
+
+def _fallback_auth(alias: str, revision: str, digest: str) -> AuthorizationSnapshot:
+    """One minimal authorization snapshot for the fallback-scoping unit test."""
+    return AuthorizationSnapshot(
+        request_id="req",
+        organization_id="org",
+        identity_id="id",
+        virtual_key_id="key",
+        alias=alias,
+        alias_revision_id=revision,
+        target=DirectTarget(pool_id="pool"),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256=digest,
+        canonical_request_sha256="c" * 64,
+        refusal_failover=False,
+        deadline_monotonic=1.0,
+    )
+
+
+def test_fallback_lookup_is_alias_scoped_not_revision_id_only() -> None:
+    """A fallback recorded for one alias is never returned for a different alias
+    that happens to share the active revision id. The fallback map is keyed by
+    (alias, revision), so it cannot cross an alias authorization boundary."""
+    shared_revision = "revision-shared"
+    fallback = _ServedFallback(
+        alias_revision_id="revision-a-prior",
+        catalog_sha256="d" * 64,
+        target=DirectTarget(pool_id="pool-a-prior"),
+    )
+    proof = ExecutionSnapshot(
+        authorization=_fallback_auth("alias-a", "revision-a-prior", "d" * 64),
+        exact_model_id="exact-a",
+        pool_id="pool-a-prior",
+        deployment_ids=("deployment-a",),
+    )
+    state = _AliasAuthorityState(
+        authorities=frozenset(),
+        normalized_catalogs={},
+        runtime_catalogs={},
+        activations={},
+        exact_models={},
+        listing_pools={},
+        proof=proof,
+        fallback_revisions={("alias-a", shared_revision): fallback},
+    )
+
+    # alias-a with the shared revision id resolves to its own fallback...
+    served_a = _serve_or_fallback(state, _fallback_auth("alias-a", shared_revision, "e" * 64))
+    assert served_a is not None
+    assert served_a.alias_revision_id == "revision-a-prior"
+    assert _served_triple(state, ("alias-a", shared_revision, "e" * 64)) == (
+        "alias-a",
+        "revision-a-prior",
+        "d" * 64,
+    )
+    # ...but alias-b with the SAME revision id gets nothing (no cross-alias leak).
+    assert _serve_or_fallback(state, _fallback_auth("alias-b", shared_revision, "e" * 64)) is None
+    assert _served_triple(state, ("alias-b", shared_revision, "e" * 64)) is None
+
+
+def test_cold_start_clears_a_dead_active_pin_via_last_good(tmp_path: Path) -> None:
+    """A FRESH pod whose alias active revision pins an unservable snapshot serves
+    and lists it on the last-good prior revision at startup. The persistent
+    dead-pin case cleared automatically on a fresh-image deploy (no reload, no
+    in-memory retention involved)."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-dead",
+        pool_id="coding",
+        snapshot_ref="catalog-snapshots/missing.json",
+        catalog_sha256="a" * 64,
+    )
+
+    # A brand-new process loads with the dead pin already active.
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "available"},
+    )
+
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    assert _authorize(components, raw_key, "coding") == "revision-one"
+    assert components.unavailable_aliases == ()
+
+
+def test_dead_pin_with_no_loadable_prior_stays_retryable_unavailable(tmp_path: Path) -> None:
+    """An alias whose only revision pins an unservable snapshot (no prior to fall
+    back to) degrades to a retryable-unavailable routing error, never a permanent
+    hard-fail, and does not block a healthy sibling."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    manager.activate_direct_alias(
+        alias_id="orphan",
+        alias_name="orphan",
+        revision_id="orphan-dead",
+        pool_id="orphan",
+        snapshot_ref="catalog-snapshots/missing.json",
+        catalog_sha256="a" * 64,
+    )
+    manager.add_grant(identity_id="default", alias_id="orphan")
+
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "available"},
+    )
+
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    with pytest.raises(GatewayRoutingError):
+        _authorize(components, raw_key, "orphan")
 
 
 def test_concurrent_authorization_survives_pool_recertification_hot_swap(

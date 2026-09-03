@@ -50,6 +50,24 @@ fn error_body_folds_param_and_maps_status_first() {
 }
 
 #[test]
+fn a_text_less_refusal_is_an_invalid_request_error_on_the_messages_surface() {
+    // The Messages envelope maps by status first, so the refusal's 400 lands
+    // on Anthropic's own invalid_request_error type instead of the api_error
+    // a 502 routing failure would have produced.
+    let refused = Failure::new(FailureClass::Refusal, "provider refused the request");
+    assert_eq!(
+        anthropic_error_body(&refused.public_error()),
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "provider refused the request",
+            },
+        })
+    );
+}
+
+#[test]
 fn completed_body_orders_text_before_tool_use_blocks() {
     let events = vec![
         Event::TextDelta("hi".to_string()),
@@ -611,4 +629,47 @@ fn usage_reports_both_cache_legs_out_of_the_folded_input_total() {
             "cache_creation_input_tokens": 45_338,
         })
     );
+}
+
+#[test]
+fn ignored_generation_controls_are_disclosed_by_both_messages_encoders() {
+    // A dropped `output_config.effort` on an empty-ladder Claude (or a
+    // dropped beta token) must reach the caller on the Messages surface the
+    // same way Chat and Responses disclose it: a body-level key on the
+    // message object, both on `message_start` and on the aggregated body.
+    let ignored = vec![
+        "reasoning_effort".to_string(),
+        "anthropic-beta.claude-code-20250219".to_string(),
+    ];
+    let mut stream = MessagesSseEncoder::new_with_ignored("request-abc", "coding", ignored.clone());
+    let frames = stream.start().expect("stream start must encode");
+    let message_start = frames
+        .iter()
+        .find(|frame| frame.starts_with("event: message_start"))
+        .expect("message_start frame");
+    assert!(message_start.contains(
+        "\"x-trustedrouter-onprem-ignored-parameters\":[\"reasoning_effort\",\"anthropic-beta.claude-code-20250219\"]"
+    ));
+
+    let events = vec![Event::TextDelta("hi".to_string()), Event::Completed];
+    let aggregated =
+        completed_messages_body_with_ignored("request-abc", "coding", &events, &ignored)
+            .expect("aggregates");
+    assert_eq!(
+        aggregated.body["x-trustedrouter-onprem-ignored-parameters"],
+        json!(["reasoning_effort", "anthropic-beta.claude-code-20250219"])
+    );
+
+    // Nothing dropped, nothing disclosed: the plain envelope stays byte-identical.
+    let mut plain = MessagesSseEncoder::new("request-abc", "coding");
+    assert!(!plain
+        .start()
+        .expect("plain start must encode")
+        .concat()
+        .contains("x-trustedrouter-onprem-ignored-parameters"));
+    let plain_body = completed_messages_body("request-abc", "coding", &events).expect("aggregates");
+    assert!(plain_body
+        .body
+        .get("x-trustedrouter-onprem-ignored-parameters")
+        .is_none());
 }

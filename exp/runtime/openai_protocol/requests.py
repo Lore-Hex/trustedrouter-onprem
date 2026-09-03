@@ -9,13 +9,7 @@ from typing import Literal, cast
 from openai.types import EmbeddingCreateParams
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
-from pydantic import (
-    BaseModel,
-    Field,
-    JsonValue,
-    TypeAdapter,
-    ValidationError,
-)
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
@@ -23,6 +17,7 @@ from exp.common.models.content import (
     DocumentContentPart,
     MessageContentPart,
     TextContentPart,
+    audio_part_from_input_audio,
     document_part_from_file_data,
     image_part_from_url,
     video_part_from_url,
@@ -41,7 +36,6 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
     SealedReasoningContentBlock,
-    StructuredTextFormat,
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.reasoning_carrier import (
@@ -67,13 +61,18 @@ from exp.runtime.openai_protocol.responses_input import (
     ReplayedReasoning,
     responses_input_messages,
 )
+from exp.runtime.openai_protocol.structured_text import (
+    JSON_OBJECT_TRANSLATION_DISCLOSURE,
+    chat_structured_text,
+    responses_structured_text,
+)
 from exp.runtime.openai_protocol.wire_models import (
     _AdditionalToolsItem,
     _AssistantToolCall,
+    _ChatAudioPart,
     _ChatFilePart,
     _ChatImagePart,
     _ChatRequest,
-    _ChatResponseFormat,
     _ChatTool,
     _ChatVideoPart,
     _ContentPart,
@@ -88,15 +87,13 @@ from exp.runtime.openai_protocol.wire_models import (
     _ResponsesFilePart,
     _ResponsesInputItem,
     _ResponsesRequest,
-    _ResponseText,
     _ResponseTool,
     _TextPart,
 )
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
 _RESPONSES_OFFICIAL = TypeAdapter(ResponseCreateParams)
-# Parametrized to object so the invariant TypeAdapter matches _validate_official;
-# EmbeddingCreateParams is a single TypedDict, unlike the union-typed chat/responses params.
+# object-parametrized: EmbeddingCreateParams is one TypedDict, unlike the chat/responses unions.
 _EMBEDDINGS_OFFICIAL: TypeAdapter[object] = TypeAdapter[object](EmbeddingCreateParams)
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 
@@ -190,7 +187,13 @@ def decode_chat(
             tools=tuple(_chat_tool(tool) for tool in request.tools),
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
-            structured_text=_chat_structured_text(request.response_format),
+            structured_text=chat_structured_text(request.response_format),
+            ignored_parameters=(
+                (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
+                if request.response_format is not None
+                and request.response_format.type == "json_object"
+                else ()
+            ),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -203,6 +206,8 @@ def decode_chat(
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
+            frequency_penalty=request.frequency_penalty,
+            presence_penalty=request.presence_penalty,
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
             reasoning_effort=request.reasoning_effort,
@@ -214,6 +219,7 @@ def decode_chat(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )
@@ -287,8 +293,9 @@ def decode_responses(
         # 2026-08-29). The strict wire model owns those contracts, so the
         # official probe sees a normalized item.
         adapted: list[JsonValue] = []
-        for original in cast("list[JsonValue]", raw):
-            entry = _official_image_details(original) if isinstance(original, dict) else original
+        for index, entry in enumerate(cast("list[JsonValue]", raw)):
+            if isinstance(entry, dict):
+                entry = _official_image_details(entry, f"input.{index}")
             if isinstance(entry, dict) and entry.get("type") == "message":
                 item = {key: value for key, value in entry.items() if key != "phase"}
                 if item.get("id") is not None and "status" not in item:
@@ -346,7 +353,7 @@ def decode_responses(
             provider_native_tools=tuple(native_tools),
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
-            structured_text=_responses_structured_text(request.text),
+            structured_text=responses_structured_text(request.text),
             maximum_output_tokens=request.max_output_tokens,
             maximum_output_tokens_parameter=(
                 "max_output_tokens" if request.max_output_tokens is not None else None
@@ -387,6 +394,7 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )
@@ -413,20 +421,25 @@ def decode_responses(
     )
 
 
-def _official_image_details(entry: JsonObject) -> JsonObject:
+def _official_image_details(entry: JsonObject, param: str) -> JsonObject:
     """Default the detail level of every ``input_image`` part of one item.
 
     The Responses surface treats ``input_image.detail`` as optional and
     resolves an omitted level to ``auto``, while the installed SDK marks the
     field required. Only the official probe sees the resolved default: the
     strict wire model owns the real contract and keeps an unstated level
-    unstated on the provider wire.
+    unstated on the provider wire. An ``input_audio`` part is refused by name.
     """
     content = entry.get("content")
     if not isinstance(content, list):
         return entry
     parts: list[JsonValue] = []
-    for part in cast("list[JsonValue]", content):
+    for index, part in enumerate(cast("list[JsonValue]", content)):
+        if isinstance(part, dict) and part.get("type") == "input_audio":
+            raise unsupported_field(
+                f"{param}.content.{index}.input_audio",
+                message="Audio input is not available on Responses; use Chat Completions.",
+            )
         if isinstance(part, dict) and part.get("type") == "input_image" and "detail" not in part:
             parts.append({**part, "detail": "auto"})
         else:
@@ -598,6 +611,17 @@ def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
         for detail in details:
             if detail["type"] == "value_error":
                 return invalid_field(param, detail["msg"].removeprefix("Value error, ") + ".")
+    for detail in details:
+        # A field validator's own wording states this gateway's exact value
+        # constraint (only our wire models raise these, so the text is
+        # display-safe and never echoes the caller's value).
+        if detail["type"] == "value_error":
+            return invalid_field(
+                param,
+                f"Invalid value for {param!r}: "
+                + detail["msg"].removeprefix("Value error, ")
+                + ".",
+            )
     return invalid_field(param, _shape_message(param, details))
 
 
@@ -669,13 +693,14 @@ def _message_content(
 
     Returns:
         The flattened text and, only for a message that carries an image,
-        a video, or a document, the ordered canonical parts. A text-only
+        a video, audio, or a document, the ordered canonical parts. A text-only
         message keeps its previous representation exactly, so nothing
         downstream changes for it.
 
     Raises:
         OpenAIProtocolError: An image or video reference is not a supported
-            URL or base64 data URL, or a file is not an inline PDF.
+            URL or base64 data URL, an audio part is not base64 WAV or MP3,
+            or a file is not an inline PDF.
     """
     if content is None or isinstance(content, str):
         return content, ()
@@ -700,6 +725,15 @@ def _message_content(
                     f"'{location}' must be an http(s) URL or a base64 data URL "
                     "of an MP4, MPEG, QuickTime, WebM, FLV, 3GPP, or WMV video.",
                 ) from exc
+            continue
+        if isinstance(part, _ChatAudioPart):
+            audio = part.input_audio
+            try:
+                parts.append(audio_part_from_input_audio(audio.data, audio.format))
+            except ValueError as exc:
+                location = f"{param}.{index}.input_audio"
+                hint = f"'{location}' must carry base64 audio data with format 'wav' or 'mp3'."
+                raise invalid_field(location, hint) from exc
             continue
         if isinstance(part, (_ChatFilePart, _ResponsesFilePart)):
             parts.append(_document_part(part, f"{param}.{index}"))
@@ -833,37 +867,6 @@ def _responses_tool_choice(
         if isinstance(name, str):
             return GatewayNamedToolChoice(name=name)
     raise invalid_field("tool_choice")
-
-
-def _chat_structured_text(value: _ChatResponseFormat | None) -> StructuredTextFormat | None:
-    """Convert the Chat JSON Schema response format when requested."""
-    if value is None or value.type == "text":
-        return None
-    schema = value.json_schema
-    if schema is None:
-        raise invalid_field("response_format.json_schema")
-    return StructuredTextFormat(
-        name=schema.name,
-        description=schema.description,
-        json_schema=schema.schema_,
-        strict=schema.strict,
-    )
-
-
-def _responses_structured_text(value: _ResponseText | None) -> StructuredTextFormat | None:
-    """Convert the Responses JSON Schema text format when requested."""
-    if value is None or value.format is None or value.format.type == "text":
-        return None
-    schema = value.format.schema_
-    name = value.format.name
-    if schema is None or name is None:
-        raise invalid_field("text.format")
-    return StructuredTextFormat(
-        name=name,
-        description=value.format.description,
-        json_schema=schema,
-        strict=value.format.strict,
-    )
 
 
 def _include_encrypted_reasoning(include: tuple[str, ...] | None) -> bool:

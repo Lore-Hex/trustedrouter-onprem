@@ -19,6 +19,7 @@ from pydantic import (
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.models.content import (
+    AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
     MessageContentPart,
@@ -145,17 +146,22 @@ def _sum_usage(values: Sequence[Usage]) -> Usage:
         values: Usage records reported by the aggregated operations.
 
     Returns:
-        Summed input and output tokens, with cached input tokens summed only when every
-        record reports them.
+        Summed input and output tokens, with cached and cache-write input tokens
+        summed only when every record reports them.
     """
     cached = tuple(value.cached_input_tokens for value in values)
     cached_total: int | None = None
     if all(item is not None for item in cached):
         cached_total = sum(item for item in cached if item is not None)
+    written = tuple(value.cache_write_input_tokens for value in values)
+    written_total: int | None = None
+    if all(item is not None for item in written):
+        written_total = sum(item for item in written if item is not None)
     return Usage(
         input_tokens=sum(value.input_tokens for value in values),
         output_tokens=sum(value.output_tokens for value in values),
         cached_input_tokens=cached_total,
+        cache_write_input_tokens=written_total,
     )
 
 
@@ -317,6 +323,11 @@ class ModelMessage(ContractModel):
         return tuple(part for part in self.content_parts if part.kind == "video")
 
     @property
+    def audios(self) -> tuple[AudioContentPart, ...]:
+        """Return this message's audio parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "audio")
+
+    @property
     def documents(self) -> tuple[DocumentContentPart, ...]:
         """Return this message's document parts in caller order."""
         return tuple(part for part in self.content_parts if part.kind == "document")
@@ -405,12 +416,17 @@ class ModelCapabilities(ContractModel):
 
     supports_tools: bool | None = None
     supports_embeddings: bool | None = None
+    # Image generation is served only on a positive claim, like embeddings:
+    # ``None`` is unknown and never dispatches to the images surface.
+    supports_image_generation: bool | None = None
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
     supports_top_p: bool | None = None
     supports_top_k: bool | None = None
     supports_logprobs: bool | None = None
+    supports_frequency_penalty: bool | None = None
+    supports_presence_penalty: bool | None = None
     supports_reasoning: bool = False
     reasoning_effort: ReasoningEffort | None = None
     sampling_requires_reasoning_none: bool = False
@@ -490,6 +506,8 @@ class ModelCapabilities(ContractModel):
             "supports_top_p",
             "supports_top_k",
             "supports_logprobs",
+            "supports_frequency_penalty",
+            "supports_presence_penalty",
             "supports_reasoning",
             "reasoning_effort",
             "sampling_requires_reasoning_none",
@@ -506,6 +524,11 @@ class ModelCapabilities(ContractModel):
             "cache_write_cost_per_million_tokens_usd",
         }
         excluded.add("supports_completions")
+        # Image generation is admitted fail-closed on its own surface, so the
+        # claim never changes what a chat or embeddings dispatch may do; keep
+        # it out of the identity like supports_completions so existing traces
+        # and frozen catalogs keep their digests.
+        excluded.add("supports_image_generation")
         return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 

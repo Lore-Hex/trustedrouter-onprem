@@ -205,6 +205,18 @@ impl UpstreamRelay {
         self.first_token_at
     }
 
+    /// Route an abnormal stream termination through the normalizer's recovery.
+    /// The relay is done either way, so mark EOF; when recovery applies (a
+    /// Gemini stream that emitted content) the synthesized terminal is buffered
+    /// for the caller to drain, otherwise the (possibly reclassified) failure
+    /// propagates. See `Normalizer::recover_abnormal_end`.
+    fn recover_or_fail(&mut self, failure: Failure) -> Result<(), Failure> {
+        self.eof = true;
+        let events = self.normalizer.recover_abnormal_end(failure)?;
+        self.pending.extend(events);
+        Ok(())
+    }
+
     /// Yield the next normalized event. `Ok(None)` means the upstream closed
     /// without a terminal event (the caller synthesizes that failure); a
     /// stream whose terminal was already yielded returns `Ok(None)` too, but
@@ -242,24 +254,45 @@ impl UpstreamRelay {
             let chunk = match tokio::time::timeout(bound, self.stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(Some(Err(_))) => {
-                    return Err(Failure::new(
-                        FailureClass::Transport,
-                        "provider transport failed; retry the request",
-                    )
-                    .with_retry(true, true))
+                    // A transport break mid-stream: recover a Gemini partial as
+                    // Incomplete, otherwise surface the retryable transport
+                    // failure. Pre-content it stays a retryable transport error
+                    // either way.
+                    self.recover_or_fail(
+                        Failure::new(
+                            FailureClass::Transport,
+                            "provider transport failed; retry the request",
+                        )
+                        .with_retry(true, true),
+                    )?;
+                    continue;
                 }
                 Ok(None) => {
                     self.eof = true;
                     // Recover a final unterminated SSE frame at EOF, exactly
                     // like the python decoder, so a provider that omits the
                     // closing blank line still settles by its terminal event.
-                    let tail = self.decoder.finish().map_err(|message| {
-                        Failure::new(FailureClass::MalformedResponse, &message)
-                            .with_retry(false, true)
-                    })?;
+                    // A malformed trailing frame, or a normalizer that rejects
+                    // it, is an abnormal end: recover a Gemini partial as
+                    // Incomplete instead of discarding the answer.
+                    let tail = match self.decoder.finish() {
+                        Ok(tail) => tail,
+                        Err(message) => {
+                            self.recover_or_fail(
+                                Failure::new(FailureClass::MalformedResponse, &message)
+                                    .with_retry(false, true),
+                            )?;
+                            continue;
+                        }
+                    };
                     if let Some(frame) = tail {
-                        let events = self.normalizer.feed(&frame)?;
-                        self.pending.extend(events);
+                        match self.normalizer.feed(&frame) {
+                            Ok(events) => self.pending.extend(events),
+                            Err(failure) => {
+                                self.recover_or_fail(failure)?;
+                                continue;
+                            }
+                        }
                     }
                     // A Gemini stream may end cleanly after its last content
                     // frame without a finishReason frame; synthesize the
@@ -288,12 +321,28 @@ impl UpstreamRelay {
                     .record(request_started.elapsed());
                 self.first_byte_recorded = true;
             }
-            let frames = self.decoder.feed(&chunk).map_err(|message| {
-                Failure::new(FailureClass::MalformedResponse, &message).with_retry(false, true)
-            })?;
+            // A malformed frame, or a normalizer that rejects one, is an
+            // abnormal end: recover a Gemini partial as Incomplete, otherwise
+            // surface the failure. Recovery buffers a terminal and marks EOF,
+            // so stop draining this chunk and let the outer loop yield it.
+            let frames = match self.decoder.feed(&chunk) {
+                Ok(frames) => frames,
+                Err(message) => {
+                    self.recover_or_fail(
+                        Failure::new(FailureClass::MalformedResponse, &message)
+                            .with_retry(false, true),
+                    )?;
+                    continue;
+                }
+            };
             for frame in frames {
-                let events = self.normalizer.feed(&frame)?;
-                self.pending.extend(events);
+                match self.normalizer.feed(&frame) {
+                    Ok(events) => self.pending.extend(events),
+                    Err(failure) => {
+                        self.recover_or_fail(failure)?;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -398,6 +447,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_gemini_partial_then_abnormal_frame_ends_incomplete_not_failed() {
+        // A Gemini content frame, its usage, then a structurally malformed frame
+        // (a non-string text part). The relay must route the abnormal end
+        // through recovery: yield the content, fold the usage, and end on an
+        // Incomplete terminal instead of surfacing the malformed failure.
+        let frames = vec![
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"usageMetadata\":{\"promptTokenCount\":9,\"candidatesTokenCount\":3}}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":5}]}}]}\n\n",
+            )),
+        ];
+        let mut relay = UpstreamRelay::from_stream(
+            stream::iter(frames).boxed(),
+            Dialect::GeminiGenerateContent,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let per_chunk = Duration::from_secs(5);
+        let mut seen: Vec<Event> = Vec::new();
+        loop {
+            let event = relay
+                .next_event(deadline, per_chunk, Instant::now())
+                .await
+                .expect("recovery yields events, never the malformed failure");
+            match event {
+                Some(event) => {
+                    let terminal = event.is_terminal();
+                    seen.push(event);
+                    if terminal {
+                        break;
+                    }
+                }
+                None => panic!("the recovered terminal must arrive before EOF"),
+            }
+        }
+        assert!(
+            matches!(seen.first(), Some(Event::TextDelta(text)) if text == "partial"),
+            "the partial content is delivered"
+        );
+        assert!(
+            seen.iter().any(|event| matches!(event, Event::Usage(_))),
+            "last-seen usage is folded so delivered tokens bill"
+        );
+        assert!(
+            matches!(seen.last(), Some(Event::Incomplete)),
+            "the turn ends incomplete, not failed"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stalled_first_byte_trips_the_ttft_bound_not_the_chunk_timeout() {
         // A provider that opened the stream but never sends a byte must fail
         // over in about the time-to-first-byte window, not the (far larger)
@@ -428,5 +532,113 @@ mod tests {
             failure.failover_eligible,
             "a first-byte stall must advance to the next deployment"
         );
+    }
+}
+
+#[cfg(test)]
+mod h2_abort_tests {
+    use super::*;
+    use crate::dialects::Dialect;
+    use crate::events::Event;
+
+    fn sse_chunk(text: &str) -> Bytes {
+        Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n"
+        ))
+    }
+
+    /// Serve one h2c response that streams two deltas, then abort it the
+    /// given way after a pacing delay so the client is mid-body when the
+    /// abort lands (mirroring a proxy whose upstream dies mid-response).
+    async fn relay_over_h2(reset_stream: bool) -> (Vec<Event>, Failure) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (socket, _peer) = listener.accept().await.expect("accept");
+            let mut connection = h2::server::handshake(socket).await.expect("handshake");
+            let accepted = connection.accept().await;
+            // The connection must keep being polled for handshake frames and
+            // window updates to reach the peer.
+            let driver = tokio::spawn(async move {
+                let _ = futures_util::future::poll_fn(|cx| connection.poll_closed(cx)).await;
+            });
+            if let Some(Ok((_request, mut respond))) = accepted {
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(())
+                    .expect("response");
+                let mut stream = respond.send_response(response, false).expect("headers");
+                stream.send_data(sse_chunk("hi"), false).expect("data one");
+                stream
+                    .send_data(sse_chunk("there"), false)
+                    .expect("data two");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if reset_stream {
+                    // The exact shape a fronting proxy (Caddy) produces when
+                    // its own upstream aborts: the h2 stream resets.
+                    stream.send_reset(h2::Reason::INTERNAL_ERROR);
+                    let _ = driver.await;
+                } else {
+                    // Whole-connection abort: every multiplexed stream on the
+                    // connection severs at once.
+                    driver.abort();
+                    drop(stream);
+                }
+            }
+        });
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .expect("client");
+        let response = client
+            .post(format!("http://{address}/v1/chat/completions"))
+            .body("{}")
+            .send()
+            .await
+            .expect("send");
+        let mut relay = UpstreamRelay::new(
+            response,
+            Dialect::OpenAiCompatible,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let per_chunk = Duration::from_secs(5);
+        let mut events = Vec::new();
+        loop {
+            match relay.next_event(deadline, per_chunk, Instant::now()).await {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => panic!("an aborted stream must surface a failure, not clean EOF"),
+                Err(failure) => return (events, failure),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_h2_stream_reset_mid_stream_classifies_and_never_panics() {
+        // Production wire fact (verified live 2026-09-03): the house-lane
+        // proxy negotiates ALPN h2, so its "aborting with incomplete
+        // response" reaches this relay as RST_STREAM, never h1 truncation.
+        let (events, failure) = relay_over_h2(true).await;
+        assert!(
+            matches!(events.as_slice(), [Event::TextDelta(a), Event::TextDelta(b)] if a == "hi" && b == "there"),
+            "delivered deltas precede the abort: {events:?}"
+        );
+        assert_eq!(failure.failure_class, FailureClass::Transport);
+        assert!(failure.failover_eligible, "an aborted rung fails over");
+    }
+
+    #[tokio::test]
+    async fn an_h2_connection_drop_mid_stream_classifies_and_never_panics() {
+        let (events, failure) = relay_over_h2(false).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "delivered deltas precede the abort: {events:?}"
+        );
+        assert_eq!(failure.failure_class, FailureClass::Transport);
+        assert!(failure.failover_eligible);
     }
 }

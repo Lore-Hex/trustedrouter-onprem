@@ -7,7 +7,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import cast
@@ -29,9 +29,10 @@ from exp.runtime.gateway.contracts import (
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,
-    GatewayRequest,
+    GatewayTarget,
     ProjectTarget,
 )
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
@@ -50,7 +51,6 @@ from exp.runtime.gateway.routing import (
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
-from exp.runtime.router.errors import RouterApplicationError
 from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
 
 _DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
@@ -61,6 +61,20 @@ _logger = logging.getLogger(__name__)
 
 class GatewayLifecycleError(ValueError):
     """Local gateway configuration cannot form one ready execution snapshot."""
+
+
+@dataclass(frozen=True)
+class _ServedFallback:
+    """A last-good prior revision served in place of a dead active revision.
+
+    When an alias's active revision pins an unservable snapshot, admission
+    re-keys the request to this prior revision so routing, attribution, and
+    prices all follow the revision actually served.
+    """
+
+    alias_revision_id: str
+    catalog_sha256: str
+    target: GatewayTarget
 
 
 @dataclass(frozen=True)
@@ -75,6 +89,11 @@ class _AliasAuthorityState:
     listing_pools: Mapping[tuple[str, str, str], str]
     proof: ExecutionSnapshot
     unavailable_aliases: tuple[tuple[str, str], ...] = ()
+    # (alias, dead active revision_id) -> the last-good prior revision serving
+    # it. Keyed by alias too (not the revision id alone) so a shared revision id
+    # can never route one alias's request to another alias's fallback target.
+    # Empty unless an alias's active pinned snapshot was unservable at load.
+    fallback_revisions: Mapping[tuple[str, str], _ServedFallback] = field(default_factory=dict)
 
 
 class _AliasAuthorityReloader:
@@ -201,6 +220,7 @@ class _AliasAuthorityReloader:
             listing_pools=listing_pools,
             proof=loaded.proof,
             unavailable_aliases=loaded.unavailable_aliases,
+            fallback_revisions=loaded.fallback_revisions,
         )
         self._routes.swap_catalogs(
             normalized,
@@ -233,6 +253,57 @@ def _revision_served(
     return key in state.normalized_catalogs and key in state.runtime_catalogs
 
 
+def _served_triple(
+    state: _AliasAuthorityState,
+    triple: tuple[str, str, str],
+) -> tuple[str, str, str] | None:
+    """Return the served authority triple for one granted active triple, or None.
+
+    The granted triple names the alias's active revision. When that revision is
+    served it is returned verbatim; when it pins an unservable snapshot its
+    last-good fallback triple is returned; otherwise ``None``.
+    """
+    if triple in state.authorities:
+        return triple
+    alias, active_revision_id, _digest = triple
+    fallback = state.fallback_revisions.get((alias, active_revision_id))
+    if fallback is None:
+        return None
+    return (alias, fallback.alias_revision_id, fallback.catalog_sha256)
+
+
+def _serve_or_fallback(
+    state: _AliasAuthorityState,
+    authorization: AuthorizationSnapshot,
+) -> AuthorizationSnapshot | None:
+    """Return an authorization this generation can serve, or ``None``.
+
+    A revision loaded directly is served verbatim. An active revision whose
+    pinned snapshot was unservable at load is re-keyed to the last-good prior
+    revision loaded in its place, so routing, the ledger, and prices all follow
+    the revision actually served. Returns ``None`` when neither applies (genuine
+    drift, or an alias with no loadable revision at all), so the caller reloads
+    once and, failing that, degrades to a retryable unavailable.
+    """
+    authority = (
+        authorization.alias,
+        authorization.alias_revision_id,
+        authorization.catalog_sha256,
+    )
+    if authority in state.authorities or _revision_served(state, authorization):
+        return authorization
+    fallback = state.fallback_revisions.get((authorization.alias, authorization.alias_revision_id))
+    if fallback is None:
+        return None
+    return authorization.model_copy(
+        update={
+            "alias_revision_id": fallback.alias_revision_id,
+            "catalog_sha256": fallback.catalog_sha256,
+            "target": fallback.target,
+        }
+    )
+
+
 @dataclass(frozen=True)
 class _ReadyControlStore:
     """Filter public authority through the current hot-reloadable ready generation."""
@@ -255,23 +326,31 @@ class _ReadyControlStore:
         )
 
     def granted_alias_authorities(self, *, raw_key: str) -> tuple[tuple[str, str, str], ...]:
-        """Return granted authority triples whose active revision is currently served."""
+        """Return the served authority triple for each granted alias.
+
+        An alias served on its active revision returns that triple; one whose
+        active revision pins an unservable snapshot returns its last-good
+        fallback triple, so a dead-pinned alias still lists and serves under the
+        revision actually served rather than disappearing from the catalog.
+        """
         granted = tuple(self.store.granted_alias_authorities(raw_key=raw_key))
         state = self.reloader.state
-        drifted = next((item for item in granted if item not in state.authorities), None)
+        drifted = next((item for item in granted if _served_triple(state, item) is None), None)
         if drifted is not None:
             try:
                 state = self.reloader.refresh_if_drifted(drifted)
             except GatewayRoutingError:
                 state = self.reloader.state
-        return tuple(item for item in granted if item in state.authorities)
+        return tuple(
+            served for item in granted if (served := _served_triple(state, item)) is not None
+        )
 
     def authorize_request(
         self,
         *,
         raw_key: str,
         alias: str,
-        request: GatewayRequest,
+        request: ServingRequest,
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
@@ -290,17 +369,22 @@ class _ReadyControlStore:
             app_referer=app_referer,
             app_title=app_title,
         )
+        served = _serve_or_fallback(self.reloader.state, authorization)
+        if served is not None:
+            return served
+        # The SQLite authority names a revision this generation has not loaded
+        # (a concurrent activation, or an active revision whose snapshot was
+        # unservable at load); reload once and re-resolve, including last-good.
         authority = (
             authorization.alias,
             authorization.alias_revision_id,
             authorization.catalog_sha256,
         )
-        state = self.reloader.state
-        if authority not in state.authorities and not _revision_served(state, authorization):
-            state = self.reloader.refresh_if_drifted(authority)
-        if authority not in state.authorities and not _revision_served(state, authorization):
-            raise GatewayRoutingError("authorized alias revision is unavailable in this process")
-        return authorization
+        state = self.reloader.refresh_if_drifted(authority)
+        served = _serve_or_fallback(state, authorization)
+        if served is not None:
+            return served
+        raise GatewayRoutingError("authorized alias revision is unavailable in this process")
 
 
 @contextmanager
@@ -505,89 +589,135 @@ def _load_alias_state(
     readiness: list[ExecutionSnapshot] = []
     unavailable_aliases: list[tuple[str, str]] = []
     missing_credential_variables: set[str] = set()
+    fallback_revisions: dict[tuple[str, str], _ServedFallback] = {}
 
     for alias in aliases:
+        # Per-alias fail-safe: no single malformed catalog row (bad rung, missing
+        # revision, bad capabilities, natively unservable alias) may abort the build
+        # because each marks just that alias UNAVAILABLE and serves the rest; this outer
+        # guard backstops any exception the specific handlers below miss.
         try:
-            revision_id, catalog_sha256 = _required_revision(alias)
-            catalog, normalized = _load_snapshot(manager, alias)
-        except GatewayLifecycleError as exc:
-            unavailable_aliases.append((alias.alias_name, str(exc)))
-            continue
-        key = (revision_id, catalog_sha256)
-        runtime_catalog = RuntimeModelCatalog(catalog, environment=environment)
-        if alias.target_kind == "direct":
             try:
-                proof = _direct_readiness(manager, alias, normalized, runtime_catalog)
-            except (GatewayLifecycleError, ModelConnectionError, ModelCredentialError) as exc:
+                revision_id, catalog_sha256 = _required_revision(alias)
+                catalog, normalized = _load_snapshot(manager, alias)
+            except GatewayLifecycleError as exc:
+                # The alias's active revision pins an unservable snapshot (parse
+                # failure or a same-version self-inconsistent digest). Serve the
+                # most recent prior revision that loads instead of 503-ing the
+                # alias, and record the re-key so admission attributes to the
+                # revision served. Imported here to avoid a module import cycle
+                # with the fallback loader, which reuses this module's helpers.
+                from exp.runtime.gateway.alias_fallback import load_last_good_fallback
+
+                fallback = load_last_good_fallback(
+                    manager,
+                    alias,
+                    environment=environment,
+                    project_repository=project_repository,
+                    decision_sink=decision_sink,
+                    exact_models=exact_models,
+                )
+                if fallback is None:
+                    unavailable_aliases.append((alias.alias_name, str(exc)))
+                    continue
+                normalized_catalogs[fallback.key] = fallback.normalized
+                runtime_catalogs[fallback.key] = fallback.runtime_catalog
+                if fallback.activation is not None:
+                    activations[fallback.activation[0]] = fallback.activation[1]
+                readiness.append(fallback.proof)
+                served = fallback.proof.authorization
+                if alias.revision_id is not None:
+                    fallback_revisions[(alias.alias_name, alias.revision_id)] = _ServedFallback(
+                        alias_revision_id=served.alias_revision_id,
+                        catalog_sha256=served.catalog_sha256,
+                        target=served.target,
+                    )
+                _logger.warning(
+                    "gateway alias %r active revision pins an unservable snapshot (%s); "
+                    "serving last-good prior revision %r",
+                    alias.alias_name,
+                    exc,
+                    served.alias_revision_id,
+                )
+                continue
+            key = (revision_id, catalog_sha256)
+            runtime_catalog = RuntimeModelCatalog(catalog, environment=environment)
+            if alias.target_kind == "direct":
+                try:
+                    proof = _direct_readiness(manager, alias, normalized, runtime_catalog)
+                except (GatewayLifecycleError, ModelConnectionError, ModelCredentialError) as exc:
+                    if isinstance(exc, MissingModelCredentialError):
+                        unavailable_aliases.append((alias.alias_name, exc.detail))
+                        missing_credential_variables.add(exc.environment_variable)
+                    else:
+                        unavailable_aliases.append((alias.alias_name, str(exc)))
+                    continue
+                normalized_catalogs[key] = normalized
+                runtime_catalogs[key] = runtime_catalog
+                readiness.append(proof)
+                continue
+            if alias.target_kind != "project":
+                unavailable_aliases.append((alias.alias_name, "unknown target kind"))
+                continue
+            if project_repository is None:
+                unavailable_aliases.append(
+                    (alias.alias_name, "project alias requires a project activation repository")
+                )
+                continue
+            try:
+                project_ref = _required(alias.project_ref, "project reference", alias)
+                activation_ref = _required(alias.activation_ref, "activation reference", alias)
+                activation = project_repository.load(
+                    project_ref,
+                    activation_ref,
+                    runtime_catalog=runtime_catalog,
+                )
+                try:
+                    require_project_activation_authority(
+                        activation,
+                        project_ref=project_ref,
+                        activation_ref=activation_ref,
+                    )
+                except ProjectActivationError as exc:
+                    raise GatewayLifecycleError(str(exc)) from exc
+                runtime = RouterRuntime.from_activation(
+                    activation,
+                    runtime_catalog,
+                    decision_sink=decision_sink,
+                )
+                proof = _project_readiness(
+                    manager,
+                    alias,
+                    normalized,
+                    runtime,
+                    runtime_catalog,
+                    exact_models=exact_models,
+                )
+            except (
+                GatewayLifecycleError,
+                ModelConnectionError,
+                ModelCredentialError,
+                ProjectActivationError,
+                RouterRuntimeIntegrityError,
+            ) as exc:
                 if isinstance(exc, MissingModelCredentialError):
                     unavailable_aliases.append((alias.alias_name, exc.detail))
                     missing_credential_variables.add(exc.environment_variable)
                 else:
                     unavailable_aliases.append((alias.alias_name, str(exc)))
                 continue
+            activations[(project_ref, activation_ref, catalog_sha256)] = runtime
             normalized_catalogs[key] = normalized
             runtime_catalogs[key] = runtime_catalog
             readiness.append(proof)
-            continue
-        if alias.target_kind != "project":
-            unavailable_aliases.append((alias.alias_name, "unknown target kind"))
-            continue
-        if project_repository is None:
-            unavailable_aliases.append(
-                (alias.alias_name, "project alias requires a project activation repository")
+        except Exception as exc:  # noqa: BLE001 - exclude one bad alias; never abort the build.
+            _logger.warning(
+                "gateway alias %r failed to build and was excluded (UNAVAILABLE): %s",
+                alias.alias_name,
+                exc,
             )
-            continue
-        try:
-            project_ref = _required(alias.project_ref, "project reference", alias)
-            activation_ref = _required(alias.activation_ref, "activation reference", alias)
-            activation = project_repository.load(
-                project_ref,
-                activation_ref,
-                runtime_catalog=runtime_catalog,
-            )
-            try:
-                require_project_activation_authority(
-                    activation,
-                    project_ref=project_ref,
-                    activation_ref=activation_ref,
-                )
-            except ProjectActivationError as exc:
-                raise GatewayLifecycleError(str(exc)) from exc
-            runtime = RouterRuntime.from_activation(
-                activation,
-                runtime_catalog,
-                decision_sink=decision_sink,
-            )
-            proof = _project_readiness(
-                manager,
-                alias,
-                normalized,
-                runtime,
-                runtime_catalog,
-                exact_models=exact_models,
-            )
-        except RouterApplicationError as exc:
-            if not _caused_by_connection_error(exc):
-                raise
             unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
-        except (
-            GatewayLifecycleError,
-            ModelConnectionError,
-            ModelCredentialError,
-            ProjectActivationError,
-            RouterRuntimeIntegrityError,
-        ) as exc:
-            if isinstance(exc, MissingModelCredentialError):
-                unavailable_aliases.append((alias.alias_name, exc.detail))
-                missing_credential_variables.add(exc.environment_variable)
-            else:
-                unavailable_aliases.append((alias.alias_name, str(exc)))
-            continue
-        activations[(project_ref, activation_ref, catalog_sha256)] = runtime
-        normalized_catalogs[key] = normalized
-        runtime_catalogs[key] = runtime_catalog
-        readiness.append(proof)
 
     if not readiness:
         unavailable = "; ".join(f"{name} ({why})" for name, why in sorted(unavailable_aliases))
@@ -600,6 +730,16 @@ def _load_alias_state(
         message = f"no granted active alias is locally available{detail}{remediation}"
         raise GatewayLifecycleError(message)
 
+    if unavailable_aliases:
+        # Countable, operator-visible signal (exclusion must never be silent): the
+        # stable "catalog.aliases_excluded" event alerts; the set rides the receipt.
+        excluded = ", ".join(name for name, _why in sorted(unavailable_aliases))
+        _logger.warning(
+            "catalog.aliases_excluded: %d excluded (UNAVAILABLE), serving %d: %s",
+            len(unavailable_aliases),
+            len(readiness),
+            excluded,
+        )
     return _AliasAuthorityState(
         authorities=frozenset(_authority_key(item) for item in readiness),
         normalized_catalogs=normalized_catalogs,
@@ -613,6 +753,7 @@ def _load_alias_state(
         },
         proof=readiness[0],
         unavailable_aliases=tuple(sorted(unavailable_aliases)),
+        fallback_revisions=fallback_revisions,
     )
 
 
@@ -700,6 +841,26 @@ def _load_snapshot(
     return catalog, normalized
 
 
+def _require_native_servability(
+    alias: GatewayAliasView,
+    catalog: NormalizedGatewayCatalog,
+    runtime_catalog: RuntimeModelCatalog,
+) -> None:
+    """Fail readiness (excluding the alias) when the native engine cannot serve it.
+
+    Such an alias used to pass readiness then abort the whole worker at the fleet
+    startup gate; raising here excludes just it (UNAVAILABLE), never a fallback.
+    """
+    # Imported at call time to avoid a module import cycle.
+    from exp.runtime.gateway.native_execution import alias_native_blockers
+
+    reasons = alias_native_blockers(alias.alias_name, catalog, runtime_catalog)
+    if reasons:
+        raise GatewayLifecycleError(
+            f"alias {alias.alias_name!r} cannot be served natively: {'; '.join(reasons)}"
+        )
+
+
 def _direct_readiness(
     manager: GatewayManagement,
     alias: GatewayAliasView,
@@ -717,6 +878,7 @@ def _direct_readiness(
         if deployment is None:
             raise GatewayLifecycleError(f"alias {alias.alias_name!r} deployment is unavailable")
         runtime_catalog.resolve(deployment.source_alias)
+    _require_native_servability(alias, catalog, runtime_catalog)
     authorization = _readiness_authorization(
         manager,
         alias,
@@ -779,6 +941,7 @@ def _project_readiness(
             first_pool = pools[0]
     if first_pool is None:
         raise GatewayLifecycleError(f"project alias {alias.alias_name!r} has no candidates")
+    _require_native_servability(alias, catalog, runtime_catalog)
     authorization = _readiness_authorization(
         manager,
         alias,
@@ -794,16 +957,6 @@ def _project_readiness(
         pool_id=first_pool.pool_id,
         deployment_ids=first_pool.deployment_ids,
     )
-
-
-def _caused_by_connection_error(exception: BaseException) -> bool:
-    """Return whether a project activation failed only at local client construction."""
-    current: BaseException | None = exception
-    while current is not None:
-        if isinstance(current, (ModelConnectionError, ModelCredentialError)):
-            return True
-        current = current.__cause__
-    return False
 
 
 def _readiness_authorization(

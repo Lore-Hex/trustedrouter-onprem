@@ -36,6 +36,11 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "stream_options",
             )
         ),
+        # Forwarded only on BYOK OpenAI-family rungs (the caller pays the
+        # provider directly, so tier pricing is theirs); host-funded routes
+        # drop it with disclosure because the tier changes provider pricing
+        # while the gateway bills catalog rates.
+        _field("service_tier", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "service_tier"),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("stop", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "stop_sequences"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
@@ -52,6 +57,18 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
+        # Sampling penalties: admitted and adapted per rung, honored where the
+        # provider supports them, dropped with disclosure where it does not (a
+        # soft preference whose absence still returns a valid answer).
+        _field("frequency_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
+        _field("presence_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
+        # Accepted only at its no-op default of 1 (the wire model enforces
+        # the value): Copilot hardcodes n:1 on every Chat request.
+        _field("n", CompatibilityDisposition.SUPPORTED),
+        # top_logprobs stays UNSUPPORTED: the gateway response contract does not
+        # project logprob arrays yet, so it cannot be honored on any rung.
+        # rejecting is the honest outcome (never a silent drop of a probability
+        # request). Admit it only once response normalization emits logprobs.
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
@@ -61,23 +78,22 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
+        # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
+        # is admitted per route; ``audio`` and ``modalities`` request audio
+        # OUTPUT, which no route serves.
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
                 "audio",
-                "frequency_penalty",
                 "function_call",
                 "functions",
                 "logit_bias",
                 "modalities",
                 "moderation",
-                "n",
                 "prediction",
-                "presence_penalty",
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",
-                "service_tier",
                 "store",
                 "verbosity",
                 "web_search_options",
@@ -104,6 +120,8 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "store",
             )
         ),
+        # Same BYOK-only forwarding rule as the Chat surface.
+        _field("service_tier", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "service_tier"),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("include", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "encrypted_reasoning"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
@@ -121,6 +139,13 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
+        # Accepted only at their no-op values (the wire models enforce them):
+        # Copilot hardcodes truncation:"disabled" and
+        # prompt_cache_options:{"mode":"implicit"} on every Responses request,
+        # and both describe exactly the behavior this gateway already serves
+        # (context is never truncated; served routes cache implicitly).
+        _field("truncation", CompatibilityDisposition.SUPPORTED),
+        _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
         # Chat surface: accepted and recorded gateway-side, never forwarded.
@@ -136,11 +161,8 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "max_tool_calls",
                 "moderation",
                 "prompt",
-                "prompt_cache_options",
                 "prompt_cache_retention",
-                "service_tier",
                 "stream_options",
-                "truncation",
             )
         ),
     ),
@@ -256,6 +278,37 @@ EMBEDDINGS_MANIFEST = CompatibilityManifest(
         # never forwarded to the provider. The embeddings body carries no
         # safety_identifier / prompt_cache_key, so `user` is the only one.
         _field("user", CompatibilityDisposition.METADATA_ONLY),
+    ),
+)
+
+
+IMAGES_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.IMAGES,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in (
+                "model",
+                "prompt",
+                "n",
+                "size",
+                "quality",
+                "background",
+                "output_format",
+                "output_compression",
+                "moderation",
+                "response_format",
+                "style",
+            )
+        ),
+        # End-user attribution: recorded gateway-side, never forwarded.
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+        # Streaming partial images is a Responses-style event stream the
+        # buffered images surface does not carry; a request asking for it is
+        # refused explicitly rather than silently answered whole.
+        _field("stream", CompatibilityDisposition.UNSUPPORTED),
+        _field("partial_images", CompatibilityDisposition.UNSUPPORTED),
     ),
 )
 

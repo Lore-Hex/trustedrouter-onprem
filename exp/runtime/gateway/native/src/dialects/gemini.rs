@@ -1,5 +1,4 @@
-//! Gemini `streamGenerateContent` frame mapping, mirroring the python
-//! `_gemini_events` mapper, plus its golden-fixture tests.
+//! Gemini `streamGenerateContent` frame mapping plus its golden-fixture tests.
 
 use serde_json::Value;
 
@@ -8,11 +7,11 @@ use crate::errors::{Failure, FailureClass};
 use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
 
 impl Normalizer {
-    /// Normalize one Gemini `streamGenerateContent` SSE frame, mirroring the
-    /// `_gemini_events` mapper: reasoning parts are skipped, whole function
-    /// calls expand to start/arguments/completed, and the terminal candidate
-    /// flushes the latest usage before its finish reason maps to the shared
-    /// completion, incomplete, refusal, or provider-internal outcome.
+    /// Normalize one Gemini `streamGenerateContent` SSE frame: reasoning parts
+    /// are skipped, whole function calls expand to start/arguments/completed,
+    /// and the terminal candidate flushes the latest usage before its finish
+    /// reason maps to the shared completion, incomplete, refusal, or
+    /// provider-internal outcome.
     pub(super) fn feed_gemini(
         &mut self,
         frame: &crate::sse::SseEvent,
@@ -211,12 +210,73 @@ mod gemini_tests {
                     "name": "lookup",
                     "raw_arguments": raw_arguments,
                 }),
+                // thoughtsTokenCount is additive on the Gemini wire, so the
+                // output total carries the folded 5 + 3 and reasoning names
+                // the subset.
                 json!({
                     "kind": "usage",
                     "input_tokens": 11,
-                    "output_tokens": 5,
+                    "output_tokens": 8,
                     "cached_input_tokens": 2,
                     "reasoning_tokens": 3,
+                }),
+                json!({"kind": "completed"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn gemini_thinking_stream_folds_thoughts_into_the_terminal_usage() {
+        // Frame shapes from gemini-3.7-flash streamGenerateContent?alt=sse
+        // (2026-09-03): every chunk carries usageMetadata, the final chunk
+        // adds the thoughtSignature part and STOP. The terminal chunk's counts
+        // win over the earlier partial ones, and Google's totalTokenCount
+        // (11 + 7 + 654 = 672) shows thoughts are additive, so the normalized
+        // output total is 661 with 654 as the reasoning subset.
+        let chunks = [
+            sse(&json!({
+                "candidates": [{"content": {"parts": [{"text": "Sunlight scatters off air "}], "role": "model"}, "index": 0}],
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 3,
+                    "totalTokenCount": 668,
+                    "thoughtsTokenCount": 654,
+                },
+                "modelVersion": "gemini-3.7-flash",
+                "responseId": "resp-1",
+            })),
+            sse(&json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "molecules.", "thoughtSignature": "CikB"}], "role": "model"},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 7,
+                    "totalTokenCount": 672,
+                    "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 11}],
+                    "thoughtsTokenCount": 654,
+                    "serviceTier": "standard",
+                },
+                "modelVersion": "gemini-3.7-flash",
+                "responseId": "resp-1",
+            })),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![
+                json!({"kind": "text_delta", "text": "Sunlight scatters off air "}),
+                json!({"kind": "text_delta", "text": "molecules."}),
+                json!({
+                    "kind": "usage",
+                    "input_tokens": 11,
+                    "output_tokens": 661,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": 654,
                 }),
                 json!({"kind": "completed"}),
             ]
@@ -313,41 +373,40 @@ mod gemini_tests {
     }
 
     #[test]
-    fn gemini_malformed_frames_fail_the_stream() {
-        // A non-text text part fails, exactly like the python mapper.
-        let bad_text = [sse(
-            &json!({"candidates": [{"content": {"parts": [{"text": 5}]}}]}),
-        )];
-        let refs: Vec<&[u8]> = bad_text.iter().map(Vec::as_slice).collect();
-        let (_, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert_eq!(
-            failure.expect("must fail").failure_class,
-            FailureClass::MalformedResponse
-        );
+    fn gemini_malformed_frame_before_content_is_a_retryable_abnormal_end() {
+        // A malformed frame arriving before any content is a Gemini abnormal
+        // end with nothing to salvage: there is no partial answer, so it is
+        // reclassified from a hard malformed reject to a retryable transport
+        // failure (retry the lane, then fail over) rather than being accepted.
+        // The frames are still rejected. None is silently taken as content.
+        let cases: [Value; 3] = [
+            // A non-text text part (python: parts.text must be a string).
+            json!({"candidates": [{"content": {"parts": [{"text": 5}]}}]}),
+            // Null function-call args (python: args must decode to a dict).
+            json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "x", "args": null}}
+            ]}}]}),
+            // Two candidates in one frame.
+            json!({"candidates": [{}, {}]}),
+        ];
+        for payload in &cases {
+            let chunk = sse(payload);
+            let refs: Vec<&[u8]> = [chunk.as_slice()].to_vec();
+            let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+            assert!(events.is_empty(), "a rejected frame emits no content");
+            let failure = failure.expect("a malformed pre-content frame must not succeed");
+            assert_eq!(failure.failure_class, FailureClass::Transport);
+            assert!(failure.retryable_same_deployment);
+            assert!(failure.failover_eligible);
+        }
+    }
 
-        // Null function-call args fail (python: args must decode to a dict).
-        let bad_args = [sse(&json!({"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "x", "args": null}}
-        ]}}]}))];
-        let refs: Vec<&[u8]> = bad_args.iter().map(Vec::as_slice).collect();
-        let (_, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert_eq!(
-            failure.expect("must fail").failure_class,
-            FailureClass::MalformedResponse
-        );
-
-        // Two candidates in one frame fail.
-        let two = [sse(&json!({"candidates": [{}, {}]}))];
-        let refs: Vec<&[u8]> = two.iter().map(Vec::as_slice).collect();
-        let (_, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert_eq!(
-            failure.expect("must fail").failure_class,
-            FailureClass::MalformedResponse
-        );
-
+    #[test]
+    fn gemini_usage_only_close_without_content_still_fails_malformed() {
         // A stream that closes having emitted NO content at all (here only a
-        // usage-only trailer) still fails malformed: there is no real answer to
-        // complete, so the clean-end tolerance does not apply.
+        // usage-only trailer, then a clean EOF) still fails malformed: there is
+        // no real answer to complete, so the clean-end tolerance does not apply
+        // and the abnormal-end recovery never engages (nothing terminated it).
         let empty = [sse(&json!({
             "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 0},
         }))];
@@ -357,6 +416,40 @@ mod gemini_tests {
         assert_eq!(
             failure.expect("must fail").failure_class,
             FailureClass::MalformedResponse
+        );
+    }
+
+    #[test]
+    fn gemini_malformed_frame_after_content_recovers_as_incomplete() {
+        // Content emitted, then a structurally malformed frame: the real answer
+        // is preserved and the turn ends `incomplete` (an early-termination
+        // finish reason), never discarded as malformed. Last-seen usage is
+        // folded so delivered tokens still bill at settle.
+        let chunks = [
+            sse(&json!({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]})),
+            sse(&json!({"usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 3}})),
+            // A non-text text part after content: malformed mid-stream frame.
+            sse(&json!({"candidates": [{"content": {"parts": [{"text": 5}]}}]})),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(
+            failure.is_none(),
+            "a partial answer is recovered, not failed"
+        );
+        assert_eq!(
+            events,
+            vec![
+                json!({"kind": "text_delta", "text": "partial"}),
+                json!({
+                    "kind": "usage",
+                    "input_tokens": 9,
+                    "output_tokens": 3,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": null,
+                }),
+                json!({"kind": "incomplete"}),
+            ]
         );
     }
 

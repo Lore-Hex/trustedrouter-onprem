@@ -24,6 +24,8 @@ mod respond;
 mod responses_retention;
 mod route_batches;
 mod route_chat;
+mod route_embeddings;
+mod route_images;
 mod route_messages;
 mod route_responses;
 mod route_responses_ws;

@@ -9,7 +9,11 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject, sha256_json
-from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST, VideoContentPart
+from exp.common.models.content import (
+    MAXIMUM_DOCUMENTS_PER_REQUEST,
+    AudioContentPart,
+    VideoContentPart,
+)
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
@@ -109,6 +113,37 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
     assert request.structured_text is not None and request.structured_text.strict
     assert request.include_usage
     assert request.metadata == {"cohort": "test"}
+
+
+def test_chat_decoder_translates_json_object_to_a_permissive_schema() -> None:
+    """response_format json_object is admitted and translated to an open, non-strict
+    json_schema so the caller's JSON intent serves on every rung, with disclosure."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "reply as json"}],
+            "response_format": {"type": "json_object"},
+        }
+    ).request
+    assert request.structured_text is not None
+    assert request.structured_text.json_schema == {"type": "object"}
+    assert request.structured_text.strict is False
+    assert request.ignored_parameters == ("response_format->translated(json_object)",)
+
+
+def test_chat_decoder_admits_sampling_penalties() -> None:
+    """frequency_penalty/presence_penalty are admitted at the ingress (adapted per rung
+    downstream) rather than rejected as unsupported fields."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "frequency_penalty": 0.5,
+            "presence_penalty": -0.25,
+        }
+    ).request
+    assert request.frequency_penalty == 0.5
+    assert request.presence_penalty == -0.25
 
 
 def test_chat_legacy_max_tokens_reaches_native_responses_as_max_output_tokens() -> None:
@@ -245,11 +280,6 @@ def test_responses_decoder_rejects_conflicting_reasoning_summary_aliases() -> No
 @pytest.mark.parametrize(
     ("decoder", "payload", "param"),
     (
-        (
-            decode_chat,
-            {"model": "coding", "messages": [{"role": "user", "content": "x"}], "n": 2},
-            "n",
-        ),
         (
             decode_responses,
             {"model": "coding", "input": "x", "background": True},
@@ -2374,3 +2404,272 @@ def test_responses_surface_defines_no_video_part() -> None:
                 ],
             }
         )
+
+
+_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA="
+"""A 44-byte WAV header with an empty data chunk, base64 encoded."""
+
+
+def _input_audio(data: str = _WAV_BASE64, audio_format: str = "wav") -> JsonObject:
+    """Build one Chat ``input_audio`` content part."""
+    return {"type": "input_audio", "input_audio": {"data": data, "format": audio_format}}
+
+
+def test_chat_decoder_retains_audio_parts_in_caller_order() -> None:
+    """A chat ``input_audio`` part is kept beside its text and images in caller order."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first "},
+                        _input_audio(),
+                        {"type": "text", "text": "then "},
+                        _input_audio("SUQzBAAAAAAAAA==", "mp3"),
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        },
+                        {"type": "text", "text": "compare"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "first then compare"
+    assert [part.kind for part in message.content_parts] == [
+        "text",
+        "audio",
+        "text",
+        "audio",
+        "image",
+        "text",
+    ]
+    wav, mp3 = decoded.request.audios
+    assert (wav.media_type, wav.data, wav.audio_format()) == ("audio/wav", _WAV_BASE64, "wav")
+    assert (mp3.media_type, mp3.audio_format()) == ("audio/mpeg", "mp3")
+    assert len(decoded.request.images) == 1
+    assert [part.kind for part in model_request(decoded.request).messages[0].content_parts] == [
+        part.kind for part in message.content_parts
+    ]
+
+
+def test_audio_changes_the_canonical_request_digest() -> None:
+    """A clip changes what the model is asked, so it changes replay identity."""
+    text_only = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "what is said"}]}
+    )
+    with_audio = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "what is said"}, _input_audio()],
+                }
+            ],
+        }
+    )
+    other_audio = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is said"},
+                        _input_audio(_WAV_BASE64, "mp3"),
+                    ],
+                }
+            ],
+        }
+    )
+    digests = {
+        sha256_json(text_only.request),
+        sha256_json(with_audio.request),
+        sha256_json(other_audio.request),
+    }
+    assert len(digests) == 3
+    assert "audio" in with_audio.request.model_dump_json()
+
+
+def test_malformed_chat_input_audio_is_rejected_with_its_field() -> None:
+    """An unusable clip names the exact offending request field."""
+    for part in (_input_audio(audio_format="flac"), _input_audio(data="not base64!")):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part]}]})
+        assert error.value.detail.param == "messages.0.content.0.input_audio"
+        assert "'wav' or 'mp3'" in error.value.detail.message
+
+
+def test_a_request_carries_at_most_the_audio_ceiling() -> None:
+    """The eleventh clip in one request is refused rather than dropped."""
+    part = _input_audio()
+    decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part] * 10}]})
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part] * 11}]})
+    with pytest.raises(ValueError, match="at most 10 audio clips"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content="",
+                    content_parts=tuple(
+                        AudioContentPart(media_type="audio/wav", data=_WAV_BASE64)
+                        for _ in range(11)
+                    ),
+                ),
+            ),
+        )
+
+
+def test_assistant_audio_parts_are_rejected() -> None:
+    """Only a caller message may carry a clip."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {"model": "coding", "messages": [{"role": "assistant", "content": [_input_audio()]}]}
+        )
+
+
+def test_responses_surface_refuses_audio_by_name() -> None:
+    """The Responses API serves no audio input, so a clip is refused, not dropped."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "describe"}, _input_audio()],
+                    }
+                ],
+            }
+        )
+    assert error.value.detail.param == "input.0.content.1.input_audio"
+    assert "Chat Completions" in error.value.detail.message
+
+
+def test_copilot_hardcoded_no_op_values_decode_on_both_openai_surfaces() -> None:
+    """The exact VS Code Copilot custom-endpoint shapes decode end to end.
+
+    Wire-captured from VS Code 1.136 (2026-09-02): Copilot hardcodes ``n: 1``
+    (with ``stream_options.include_usage``, ``temperature: 0.1``,
+    ``top_p: 1``) on every Chat request and ``truncation: "disabled"`` plus
+    ``prompt_cache_options: {"mode": "implicit"}`` on every Responses
+    request; each rejection blocked the whole lane. The values are accepted
+    as already satisfied (this gateway serves one completion, never
+    truncates, and caches implicitly on served routes), never forwarded, and
+    disclose nothing because nothing is ignored.
+    """
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": 0.1,
+            "top_p": 1,
+            "n": 1,
+        }
+    )
+    assert chat.request.temperature == 0.1
+    assert chat.request.include_usage is True
+    assert chat.request.ignored_parameters == ()
+    assert "n" not in chat.request.model_dump(mode="json")
+
+    responses = decode_responses(
+        {
+            "model": "coding",
+            "input": "hello",
+            "truncation": "disabled",
+            "prompt_cache_options": {"mode": "implicit"},
+        }
+    )
+    assert responses.request.ignored_parameters == ()
+    dumped = responses.request.model_dump(mode="json")
+    assert "truncation" not in dumped
+    assert "prompt_cache_options" not in dumped
+
+
+@pytest.mark.parametrize(
+    ("decoder", "payload", "param", "fragment"),
+    (
+        (
+            decode_chat,
+            {"model": "coding", "messages": [{"role": "user", "content": "x"}], "n": 2},
+            "n",
+            "default of 1",
+        ),
+        (
+            decode_responses,
+            {"model": "coding", "input": "x", "truncation": "auto"},
+            "truncation",
+            "never truncates",
+        ),
+        (
+            decode_responses,
+            {"model": "coding", "input": "x", "prompt_cache_options": {"mode": "explicit"}},
+            "prompt_cache_options.mode",
+            "implicit",
+        ),
+        (
+            decode_responses,
+            {
+                "model": "coding",
+                "input": "x",
+                "prompt_cache_options": {"mode": "implicit", "ttl": "5m"},
+            },
+            "prompt_cache_options.ttl",
+            "",
+        ),
+    ),
+)
+def test_non_default_values_of_accepted_no_op_fields_stay_named_rejections(
+    decoder: Callable[[JsonObject], DecodedGatewayRequest],
+    payload: JsonObject,
+    param: str,
+    fragment: str,
+) -> None:
+    """Only the semantically satisfied value of each field is accepted."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decoder(payload)
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == param
+    assert fragment in captured.value.detail.message
+
+
+def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values() -> None:
+    """Doubleword's tier passthrough (PR #728): valid tiers land on the
+    carrier for BYOK forwarding; unknown values (including Anthropic's
+    'fast', which is a speed selector, not an OpenAI tier) reject by name."""
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "x"}],
+            "service_tier": "flex",
+        }
+    )
+    assert chat.request.service_tier == "flex"
+    assert "service_tier" not in chat.request.model_dump(mode="json")
+    responses = decode_responses({"model": "coding", "input": "x", "service_tier": "priority"})
+    assert responses.request.service_tier == "priority"
+
+    invalid_cases: tuple[tuple[JsonObject, Callable[[JsonObject], DecodedGatewayRequest]], ...] = (
+        (
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "x"}],
+                "service_tier": "fast",
+            },
+            decode_chat,
+        ),
+        ({"model": "coding", "input": "x", "service_tier": "turbo"}, decode_responses),
+    )
+    for payload, decoder in invalid_cases:
+        with pytest.raises(OpenAIProtocolError) as captured:
+            decoder(payload)
+        assert captured.value.detail.param == "service_tier"

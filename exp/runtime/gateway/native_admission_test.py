@@ -4,7 +4,7 @@ import base64
 from typing import Literal, cast
 
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
-from exp.common.models.content import TextContentPart, VideoContentPart
+from exp.common.models.content import AudioContentPart, TextContentPart, VideoContentPart
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -13,9 +13,11 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
+    GatewayToolDefinition,
 )
 from exp.runtime.gateway.native_admission import (
     _prefer_cache_capable_rungs,
+    admitted_route_requests,
     protocol_compatible_indexes,
     route_rejection,
 )
@@ -257,3 +259,197 @@ def test_oversized_inline_media_skips_the_bedrock_rung() -> None:
     assert len(errors) == 1
     assert isinstance(errors[0], ProviderParameterError)
     assert errors[0].param == "messages"
+
+
+def test_audio_requests_skip_rungs_whose_wire_cannot_carry_them() -> None:
+    """A clip lands on the declared Chat rung, past Anthropic, Bedrock, and undeclared Gemini."""
+    audio_route = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_audio_input=True
+        )
+    )
+    deployments = (
+        _deployment("claude", provider="anthropic"),
+        _deployment("nova", provider="bedrock", gateway=audio_route),
+        _deployment("gemini", provider="gemini"),
+        _deployment("router", provider="openrouter", gateway=audio_route),
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+        (GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"), client),
+        (GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test"), client),
+        (GatewayWireProfile(dialect="openai_compatible", url="https://openrouter.test"), client),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what is said",
+                content_parts=(
+                    AudioContentPart(media_type="audio/wav", data="UklGRgAAAABXQVZF"),
+                    TextContentPart(text="what is said"),
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    indexes, errors = protocol_compatible_indexes(route, wires, request, public_stream=False)
+    assert indexes == (3,)
+    capabilities = [
+        error.capability for error in errors if isinstance(error, ProviderCapabilityError)
+    ]
+    assert capabilities == ["audio_input", "audio_input", "audio_input"]
+    assert len(errors) == 3
+
+
+def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
+    """Rungs declining for different reasons still serve a tiered request.
+
+    The OpenAI-compatible rung declines parallel tool calls while the
+    Anthropic rung declines the service tier, so no unanimous route-wide
+    capability exists. Yet dropping the disclosed tier lets the Anthropic
+    rung serve instead of surfacing a rejection nobody can act on.
+    """
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    tools_capable = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_parallel_tool_calls=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    no_parallel = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    deployments = (
+        _deployment("shim", gateway=no_parallel),
+        _deployment("native", provider="anthropic", gateway=tools_capable),
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        parallel_tool_calls=True,
+        service_tier="flex",
+        stream=True,
+        include_usage=True,
+    )
+
+    class _CoercionCounter:
+        """Count coercion recordings without a live ledger."""
+
+        recorded = 0
+
+        def record_admission_coercions(self, count: int) -> None:
+            self.recorded += count
+
+    accounting = _CoercionCounter()
+    # The shim rung is BYOK (tier-eligible), so the tier survives route
+    # shaping and the mixed-rejection coercion path is what drops it; a
+    # house-funded shim would instead strip the tier during route shaping
+    # with the same disclosure and no coercion retry.
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://shim.test",
+                billing_customer_managed=True,
+            ),
+            client,
+        ),
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+    )
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native",)
+    assert public.ignored_parameters == ("service_tier",)
+    assert provider.service_tier is None
+    assert accounting.recorded == 1
+
+
+def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_disclosure() -> None:
+    """A dual-lane opus-5 route serves a disabled-thinking request instead of refusing.
+
+    The aggregator rung cannot carry Anthropic thinking at all and the
+    adaptive-only Anthropic rung rejects an explicit ``disabled``, so no rung
+    preserves the request verbatim. The disclosed drop lets the route serve,
+    the Anthropic rung emitting its sole supported mode.
+    """
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    streaming = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    deployments = (
+        _deployment("native", provider="anthropic", gateway=streaming),
+        _deployment("shim", gateway=streaming),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        provider_thinking_config={"type": "disabled"},
+        stream=True,
+        include_usage=True,
+    )
+
+    class _CoercionCounter:
+        """Count coercion recordings without a live ledger."""
+
+        recorded = 0
+
+        def record_admission_coercions(self, count: int) -> None:
+            self.recorded += count
+
+    accounting = _CoercionCounter()
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="anthropic_messages",
+                url="https://anthropic.test",
+                model_id="claude-opus-5",
+                supports_reasoning=True,
+                reasoning_wire_format="anthropic_adaptive",
+            ),
+            client,
+        ),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://shim.test",
+                model_id="anthropic/claude-opus-5",
+            ),
+            client,
+        ),
+    )
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    # With the config gone nothing Anthropic-only remains on the request, so
+    # the whole certified waterfall stays available, native rung first.
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native", "shim")
+    assert public.ignored_parameters == ("thinking.type->adaptive",)
+    assert provider.provider_thinking_config is None
+    assert accounting.recorded == 1

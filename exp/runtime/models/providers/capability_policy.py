@@ -19,6 +19,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pydantic import JsonValue
+
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -30,7 +33,10 @@ from exp.runtime.models.providers.generation_parameter_validation import (
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
-from exp.runtime.models.providers.reasoning_compat import efforts_by_nearness
+from exp.runtime.models.providers.reasoning_compat import (
+    anthropic_adaptive_only_thinking,
+    efforts_by_nearness,
+)
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 
 if TYPE_CHECKING:
@@ -41,6 +47,21 @@ STRICT_TOOLS_DISCLOSURE = "tools.strict->false"
 
 EFFORT_DROP_DISCLOSURE = "reasoning_effort"
 """Disclosure recorded when a zero-reasoning route drops the caller effort."""
+
+THINKING_DROP_DISCLOSURE = "thinking"
+"""Disclosure recorded when a zero-reasoning route drops adaptive thinking."""
+
+THINKING_DISABLED_DISCLOSURE = "thinking.type->adaptive"
+"""Disclosure recorded when an adaptive-only route overrides a disabled thinking config."""
+
+CLOSED_SCHEMA_DISCLOSURE = "json_schema.additionalProperties->false"
+"""Disclosure recorded when an open structured-output schema is closed."""
+
+_SCHEMA_DIALECTS_REQUIRING_CLOSED_OBJECTS = frozenset({"anthropic_messages"})
+"""Wire dialects whose structured-output validator rejects open objects."""
+
+SERVICE_TIER_DROP_DISCLOSURE = "service_tier"
+"""Disclosure recorded when no route rung can carry a processing-tier hint."""
 
 
 @dataclass(frozen=True)
@@ -84,6 +105,11 @@ def coerce_generation_parameters(
         The disclosed substitution to retry with, or ``None`` when nothing
         coercible applies.
     """
+    disabled_thinking = _coerce_disabled_thinking(profiles, request)
+    if disabled_thinking is not None:
+        if admits is not None and not admits(disabled_thinking.request):
+            return None
+        return disabled_thinking
     if request.reasoning_effort is None:
         return None
     ladder: set[str] = set()
@@ -91,6 +117,7 @@ def coerce_generation_parameters(
         ladder.update(profile_reasoning_efforts(profile))
     if not ladder:
         updates: dict[str, object] = {"reasoning_effort": None}
+        disclosures: tuple[str, ...] = (EFFORT_DROP_DISCLOSURE,)
         if request.provider_output_config is not None:
             # The Messages surface carries the same effort verbatim inside
             # output_config; a dropped effort must not reach the provider
@@ -101,13 +128,21 @@ def coerce_generation_parameters(
                 if key != "effort"
             }
             updates["provider_output_config"] = remaining or None
+        if (
+            request.provider_thinking_config is not None
+            and request.provider_thinking_config.get("type") == "adaptive"
+        ):
+            # Adaptive thinking is the effort's own channel on the Messages
+            # surface (the model picks its depth from output_config.effort),
+            # so a route with no reasoning rung cannot honor it either and
+            # the provider rejects it by name. A budgeted config is left
+            # verbatim: its semantics do not depend on an effort level.
+            updates["provider_thinking_config"] = None
+            disclosures = (EFFORT_DROP_DISCLOSURE, THINKING_DROP_DISCLOSURE)
         dropped_request = request.model_copy(update=updates)
         if admits is not None and not admits(dropped_request):
             return None
-        return RequestCoercion(
-            request=dropped_request,
-            disclosures=(EFFORT_DROP_DISCLOSURE,),
-        )
+        return RequestCoercion(request=dropped_request, disclosures=disclosures)
     if request.reasoning_effort in ladder:
         # The effort itself is portable; the verbatim failure lies elsewhere
         # and a snap would change semantics for nothing.
@@ -139,14 +174,56 @@ def coerce_generation_parameters(
     return None
 
 
+def _coerce_disabled_thinking(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Drop a ``thinking.type: disabled`` config the route's model cannot honor.
+
+    The adaptive-thinking Anthropic generation always reasons and rejects an
+    explicit ``disabled`` by name, so on a route whose Anthropic rungs are all
+    adaptive-only the caller's only alternative to a rejection is removing the
+    field. First-party clients pin the thinking mode globally (Claude Code
+    sends its configured mode to every model), so the config is dropped with
+    disclosure and the rung emits its sole supported mode, mirroring how a
+    budgeted ``enabled`` config is translated to adaptive. Routes with a rung
+    that honors ``disabled`` verbatim are left alone: narrowing already picks
+    that rung.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        request: Decoded public request that no rung accepted verbatim.
+
+    Returns:
+        The disclosed drop, or ``None`` when the config is not a rejected
+        ``disabled`` on an adaptive-only Anthropic route.
+    """
+    config = request.provider_thinking_config
+    if config is None or config.get("type") != "disabled":
+        return None
+    anthropic_profiles = [
+        profile for profile in profiles if profile.dialect == "anthropic_messages"
+    ]
+    if not anthropic_profiles or not all(
+        anthropic_adaptive_only_thinking(profile.model_id) for profile in anthropic_profiles
+    ):
+        return None
+    return RequestCoercion(
+        request=request.model_copy(update={"provider_thinking_config": None}),
+        disclosures=(THINKING_DISABLED_DISCLOSURE,),
+    )
+
+
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
     """Build the disclosed coercion for one preflight capability rejection.
 
-    Strict tools are the one coercible capability: degrading ``strict: true``
-    to best-effort schemas weakens a correctness guarantee, so it happens
-    only here, after every rung declined the verbatim request, and only as a
-    disclosed drop. Every other capability names a feature with no
-    approximation and stays fail-closed.
+    Two capabilities are coercible, both only here after every rung declined
+    the verbatim request, and both only as a disclosed drop. Degrading
+    ``strict: true`` tools to best-effort schemas weakens a correctness
+    guarantee. Dropping ``service_tier`` changes pricing and latency
+    semantics, which the caller can act on only when told, so the drop is
+    disclosed rather than silent. Every other capability names a feature with
+    no approximation and stays fail-closed.
 
     Args:
         capability: Stable capability literal from the preflight rejection.
@@ -156,6 +233,13 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
         The disclosed substitution to retry with, or ``None`` when the
         capability cannot be coerced.
     """
+    if capability == "service_tier":
+        if request.service_tier is None:
+            return None
+        return RequestCoercion(
+            request=request.model_copy(update={"service_tier": None}),
+            disclosures=(SERVICE_TIER_DROP_DISCLOSURE,),
+        )
     if capability != "strict_tools" or not any(tool.strict for tool in request.tools):
         return None
     return RequestCoercion(
@@ -169,6 +253,42 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
         ),
         disclosures=(STRICT_TOOLS_DISCLOSURE,),
     )
+
+
+def coerce_route_rejections(
+    errors: Sequence[ProviderParameterError | ProviderCapabilityError],
+    deployment_count: int,
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Pick the one disclosed coercion a set of per-rung rejections allows.
+
+    A unanimous capability rejection may coerce any coercible capability.
+    Mixed rejections may drop only the service tier: rungs declining for
+    different reasons mean some rung offered to preserve any given guarantee,
+    so degrading one (strict tools) would weaken semantics a rung could have
+    kept. But the tier is a routing hint whose only alternative is a
+    rejection the caller cannot act on, so the disclosed drop is offered
+    whenever any rung named it and the per-rung probe decides whether the
+    dropped request actually serves.
+
+    Args:
+        errors: One rejection per declined deployment, in route order.
+        deployment_count: Number of deployments the route offered.
+        request: Decoded request no rung could preserve.
+
+    Returns:
+        The disclosed substitution to retry with, or ``None`` when nothing
+        coercible applies.
+    """
+    capability = route_wide_capability(errors, deployment_count)
+    if capability is not None:
+        return coerce_capability(capability, request)
+    if any(
+        isinstance(error, ProviderCapabilityError) and error.capability == "service_tier"
+        for error in errors
+    ):
+        return coerce_capability("service_tier", request)
+    return None
 
 
 def route_wide_capability(
@@ -199,3 +319,117 @@ def route_wide_capability(
     ):
         return next(iter(capabilities))
     return None
+
+
+def coerce_structured_text_schema(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Close every object in a structured-output schema for a rung that needs it.
+
+    The Anthropic Messages validator rejects a structured-output schema whose
+    objects leave ``additionalProperties`` open, while the OpenAI-family
+    validators accept the same schema, so a caller who tested against one
+    provider gets a post-dispatch 400 from the other. Closing the objects is
+    the only serviceable reading of the request (the provider has no open
+    mode), and it tightens the output contract rather than loosening it, so
+    it happens here as a disclosed coercion instead of a rejection. Schemas
+    already closed everywhere, and routes with no rung on such a dialect,
+    pass through untouched.
+
+    Args:
+        profiles: Ordered wire profiles for the rungs the request will reach.
+        request: Admitted request, after generation-parameter narrowing.
+
+    Returns:
+        The disclosed substitution to dispatch, or ``None`` when nothing
+        needs closing.
+    """
+    if request.structured_text is None:
+        return None
+    if not request.structured_text.strict:
+        # A non-strict schema is permissive by the caller's own declaration
+        # (notably a translated ``json_object`` = "any JSON object"). Closing it
+        # would over-constrain the very intent the caller marked loose. A bare
+        # open object would become "no properties allowed", so it is left as-is
+        # rather than silently tightened.
+        return None
+    if not any(
+        profile.dialect in _SCHEMA_DIALECTS_REQUIRING_CLOSED_OBJECTS for profile in profiles
+    ):
+        return None
+    closed, changed = _close_schema_objects(request.structured_text.json_schema)
+    if not changed:
+        return None
+    return RequestCoercion(
+        request=request.model_copy(
+            update={
+                "structured_text": request.structured_text.model_copy(
+                    update={"json_schema": closed}
+                )
+            }
+        ),
+        disclosures=(CLOSED_SCHEMA_DISCLOSURE,),
+    )
+
+
+_SCHEMA_CHILD_KEYS = ("properties", "$defs", "definitions", "patternProperties")
+"""Schema keys whose values map names to subschemas."""
+
+_SCHEMA_LIST_KEYS = ("anyOf", "oneOf", "allOf", "prefixItems")
+"""Schema keys whose values list subschemas."""
+
+_SCHEMA_SINGLE_KEYS = ("items", "not", "if", "then", "else")
+"""Schema keys whose values are one subschema."""
+
+
+def _close_schema_objects(schema: JsonObject) -> tuple[JsonObject, bool]:
+    """Return ``schema`` with ``additionalProperties: false`` on every object.
+
+    An object is any node typed ``object`` or carrying ``properties``. The
+    walk descends through the standard composition and container keywords
+    and copies only the nodes it changes.
+
+    Args:
+        schema: One JSON Schema node.
+
+    Returns:
+        The closed node and whether any node changed.
+    """
+    changed = False
+    closed: JsonObject = dict(schema)
+    is_object = schema.get("type") == "object" or "properties" in schema
+    if is_object and schema.get("additionalProperties") is not False:
+        closed["additionalProperties"] = False
+        changed = True
+    for key in _SCHEMA_CHILD_KEYS:
+        children = schema.get(key)
+        if isinstance(children, dict):
+            closed_children: dict[str, JsonValue] = {}
+            for name, child in children.items():
+                if isinstance(child, dict):
+                    closed_child, child_changed = _close_schema_objects(child)
+                    changed = changed or child_changed
+                    closed_children[name] = closed_child
+                else:
+                    closed_children[name] = child
+            closed[key] = closed_children
+    for key in _SCHEMA_LIST_KEYS:
+        members = schema.get(key)
+        if isinstance(members, list):
+            closed_members: list[JsonValue] = []
+            for member in members:
+                if isinstance(member, dict):
+                    closed_member, member_changed = _close_schema_objects(member)
+                    changed = changed or member_changed
+                    closed_members.append(closed_member)
+                else:
+                    closed_members.append(member)
+            closed[key] = closed_members
+    for key in _SCHEMA_SINGLE_KEYS:
+        single = schema.get(key)
+        if isinstance(single, dict):
+            closed_single, single_changed = _close_schema_objects(single)
+            changed = changed or single_changed
+            closed[key] = closed_single
+    return (closed if changed else schema), changed

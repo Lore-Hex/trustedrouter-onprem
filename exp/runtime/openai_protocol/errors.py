@@ -110,12 +110,15 @@ def invalid_field(param: str, message: str | None = None) -> OpenAIProtocolError
     )
 
 
-def unsupported_field(param: str, *, capability: bool = False) -> OpenAIProtocolError:
+def unsupported_field(
+    param: str, *, capability: bool = False, message: str | None = None
+) -> OpenAIProtocolError:
     """Build one explicit unsupported field or capability error.
 
     Args:
         param: Public request field path.
         capability: Whether the field is conditionally supported by deployments.
+        message: Optional safe explanation replacing the generic one.
 
     Returns:
         Stable pre-dispatch rejection.
@@ -125,7 +128,8 @@ def unsupported_field(param: str, *, capability: bool = False) -> OpenAIProtocol
     return OpenAIProtocolError(
         status_code=400,
         code=code,
-        message=(
+        message=message
+        or (
             f"The {noun} '{param}' is not supported by this gateway profile. "
             "Remove the field and resend the request."
         ),
@@ -180,6 +184,12 @@ def public_failure_error(
         GatewayFailureClass.TIMEOUT: (504, "deadline_exceeded", "api_error"),
         GatewayFailureClass.CANCELLED: (499, "request_cancelled", "api_error"),
         GatewayFailureClass.GUARDRAIL: (400, "content_filter", "invalid_request_error"),
+        # A refusal with no visible refusal text is the model's answer to the
+        # request content, not a routing failure. OpenAI rejects such prompts
+        # as a 400 ``invalid_request_error`` ("rejected as a result of our
+        # safety system"); the provider billed the processed input, so a 502
+        # would misdescribe a charged call as an infrastructure fault.
+        GatewayFailureClass.REFUSAL: (400, "refusal", "invalid_request_error"),
         GatewayFailureClass.UNAVAILABLE: (503, "gateway_unavailable", "api_error"),
     }
     status, code, error_type = mappings.get(

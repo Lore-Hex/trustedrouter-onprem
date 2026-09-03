@@ -415,6 +415,17 @@ class GatewayDeploymentCapabilities(ContractModel):
     author) only; Gemini and the OpenAI-compatible video wires fetch an
     http(s) URL on the caller's behalf.
     """
+    supports_audio_input: bool = False
+    """Whether this deployment's wire and model can carry caller audio parts.
+
+    Audio is the narrowest attachment: only the OpenAI-compatible Chat
+    ``input_audio`` wire and the Gemini ``inline_data`` wire carry a clip a
+    model serves, and on those wires only specific models (the gpt-audio
+    family, audio-capable Gemini models) accept one. The declaration is never
+    assumed, so a route without it rejects audio at admission rather than
+    answering from the surrounding text. Audio has no remote URL carrier on
+    any public surface, so there is no separate URL declaration.
+    """
     supports_pdf_input: bool = False
     """Whether this deployment's wire and model can carry caller PDF documents.
 
@@ -710,10 +721,32 @@ class ModelRoles(ContractModel):
         return self
 
 
+SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION = 10_000
+"""Upper bound on an authored catalog version this parser accepts as real.
+
+Mirrors the normalized snapshot's sane-range posture: no product will ever ship
+this many authored-catalog schema revisions, so a value beyond it is corruption
+and fails closed rather than being read as a future contract.
+"""
+
+
 class ModelCatalog(ContractModel):
     """The local model aliases, connection metadata, and project role assignments."""
 
-    schema_version: Literal[2] = 2
+    schema_version: int = Field(default=2, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION)
+    """Authored catalog contract revision. Deliberately NOT a ``Literal``.
+
+    Every cross-version hydration parses the authored document first, and a
+    changed ``Literal`` value on a known field raises ``literal_error``, which
+    the forward-compatible read path cannot drop. A literal here makes any
+    future authored revision warm-fatal on every older pod (the same outage
+    class as the 09-02 catalog incident). A newer stamp within the sane range
+    parses under this build's semantics instead. That makes additive revisions
+    safe by construction; a revision that REINTERPRETS existing fields must not
+    reuse this channel. It needs a new field name or a fleet-first tolerance
+    release. Version 1 stays rejected here: it is only readable through
+    ``_migrate_legacy_model_catalog`` on the TOML load path.
+    """
     connections: dict[str, ConnectionConfig]
     models: dict[str, ModelRecord]
     gateway_pools: dict[str, GatewayPoolRecord] = Field(default_factory=dict)

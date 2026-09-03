@@ -33,6 +33,8 @@ class KnownModel:
     supports_top_p: bool | None = None
     supports_top_k: bool | None = None
     supports_logprobs: bool | None = None
+    supports_frequency_penalty: bool | None = None
+    supports_presence_penalty: bool | None = None
     supports_reasoning_effort: bool = False
     reasoning_effort: (
         Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] | None
@@ -241,8 +243,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=30.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.5-pro": _chat(
         input_usd=30.0,
@@ -260,8 +263,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=15.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.4-mini": _chat(
         input_usd=0.75,
@@ -270,8 +274,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=4.5,
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.4-nano": _chat(
         input_usd=0.2,
@@ -280,8 +285,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=1.25,
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.4-pro": _chat(
         input_usd=30.0,
@@ -300,8 +306,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=14.0,
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.2-pro": _chat(
         input_usd=21.0,
