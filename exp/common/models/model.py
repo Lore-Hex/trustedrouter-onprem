@@ -416,6 +416,9 @@ class ModelCapabilities(ContractModel):
 
     supports_tools: bool | None = None
     supports_embeddings: bool | None = None
+    # Image generation is served only on a positive claim, like embeddings:
+    # ``None`` is unknown and never dispatches to the images surface.
+    supports_image_generation: bool | None = None
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
@@ -517,6 +520,11 @@ class ModelCapabilities(ContractModel):
             "cache_write_cost_per_million_tokens_usd",
         }
         excluded.add("supports_completions")
+        # Image generation is admitted fail-closed on its own surface, so the
+        # claim never changes what a chat or embeddings dispatch may do; keep
+        # it out of the identity like supports_completions so existing traces
+        # and frozen catalogs keep their digests.
+        excluded.add("supports_image_generation")
         return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 

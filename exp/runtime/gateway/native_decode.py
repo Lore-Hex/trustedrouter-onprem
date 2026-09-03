@@ -7,6 +7,7 @@ import json
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest, decode_images
 from exp.runtime.openai_protocol.requests import (
     DecodedEmbeddingsRequest,
     DecodedGatewayRequest,
@@ -118,3 +119,23 @@ def _load_object_body(body: str) -> JsonObject:
             )
         )
     return payload
+
+
+def decode_native_images_body(body: str) -> DecodedImagesRequest:
+    """Decode one raw ``/images/generations`` body with the shared images decoder.
+
+    Args:
+        body: Raw request body text.
+
+    Returns:
+        The public alias and canonical image-generation request.
+
+    Raises:
+        NativeDecodeError: The body is not JSON, not an object, or fails shared
+            protocol validation.
+    """
+    payload = _load_object_body(body)
+    try:
+        return decode_images(payload)
+    except OpenAIProtocolError as exc:
+        raise NativeDecodeError(exc) from exc

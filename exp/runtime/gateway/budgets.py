@@ -26,6 +26,7 @@ from exp.runtime.gateway.embeddings_contracts import (
     ServingRequest,
     embeddings_input_ceiling_micro_usd,
 )
+from exp.runtime.gateway.images_contracts import ImagesRequest, images_ceiling_micro_usd
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
@@ -540,16 +541,19 @@ def maximum_attempt_cost_micro_usd(
     request: ServingRequest,
     deployment: ExactModelDeployment,
 ) -> int | None:
-    """Return a conservative integer micro-USD ceiling for one physical call.
-
-    Chat/responses/messages price an input and an output leg; embeddings price an
-    input leg only. Both bound input by canonical byte length (never undercounts).
-    """
+    """Return a conservative micro-USD ceiling for one physical call (per surface)."""
     match request:
         case EmbeddingsRequest():
             return embeddings_input_ceiling_micro_usd(
                 request,
                 input_rate=deployment.gateway.prices.input_micro_usd_per_million_tokens,
+                maximum=MAXIMUM_MICRO_USD,
+            )
+        case ImagesRequest():
+            return images_ceiling_micro_usd(
+                request,
+                input_rate=deployment.gateway.prices.input_micro_usd_per_million_tokens,
+                output_rate=deployment.gateway.prices.output_micro_usd_per_million_tokens,
                 maximum=MAXIMUM_MICRO_USD,
             )
         case GatewayRequest():
@@ -562,18 +566,12 @@ def _completion_attempt_cost_micro_usd(
     request: GatewayRequest,
     deployment: ExactModelDeployment,
 ) -> int | None:
-    """Return a conservative integer micro-USD ceiling for one chat/responses call.
+    """Return a conservative micro-USD ceiling for one chat/responses call.
 
-    Canonical UTF-8 bytes conservatively upper-bound input tokens. The caller's output ceiling
-    wins when present, then the frozen deployment limit, then a reservation-only default bounded
-    by the model's context window, so a missing output ceiling never makes a priced route
-    unpriceable. Cached-input and
-    reasoning counts are subsets of the total input and output counts, so the worst case uses
-    the highest applicable rate in each direction rather than adding subset rates to the same
-    token ceiling. A long-context tier joins the worst case exactly when the byte bound reaches
-    its threshold (bytes never undercount tokens, so a smaller request cannot be repriced), and
-    a reachable tier missing a required rate unprices the route. Unknown required prices still
-    produce ``None`` so an applicable hard limit fails closed.
+    Canonical UTF-8 bytes upper-bound input tokens; the output ceiling is the
+    caller's, else the frozen deployment limit, else a reservation-only default
+    bounded by the context window. Cached and reasoning tokens are subsets of the
+    totals, so the worst case charges the higher rate for the whole leg.
     """
     input_tokens = len(canonical_json_bytes(request))
     # Excluded provider carriers (replayed reasoning, native items, verbatim

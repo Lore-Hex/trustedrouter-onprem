@@ -91,8 +91,7 @@ from exp.runtime.openai_protocol.wire_models import (
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
 _RESPONSES_OFFICIAL = TypeAdapter(ResponseCreateParams)
-# Parametrized to object so the invariant TypeAdapter matches _validate_official;
-# EmbeddingCreateParams is a single TypedDict, unlike the union-typed chat/responses params.
+# object-parametrized: EmbeddingCreateParams is one TypedDict, unlike the chat/responses unions.
 _EMBEDDINGS_OFFICIAL: TypeAdapter[object] = TypeAdapter[object](EmbeddingCreateParams)
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 
