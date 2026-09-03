@@ -318,7 +318,7 @@ dropped value reaches the provider through no channel), and `strict: true` tools
 best-effort schemas. On a reasoning route that accepts sampling only at `reasoning_effort=none`
 (`sampling_requires_reasoning_none`, e.g. gpt-5.6-sol/luna), a `temperature`/`top_p` sent with
 reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_effort_none)` rather
-than rejected — the model accepts sampling, just not at that effort, so the request serves and the
+than rejected. The model accepts sampling, just not at that effort, so the request serves and the
 caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
 control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
 nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
@@ -328,14 +328,14 @@ than rejecting, since a rung's default sampling still returns a valid answer. `f
 and `presence_penalty` are admitted at the ingress and adapted the same way: honored (emitted) where
 every rung supports them (the per-rung `supports_frequency_penalty`/`supports_presence_penalty`
 capability truth), dropped as `frequency_penalty->dropped(unsupported_by_provider)` where a rung does
-not — a soft preference whose absence still returns a valid answer. `top_logprobs` stays rejected
+not. It is a soft preference whose absence still returns a valid answer. `top_logprobs` stays rejected
 (not admitted): the gateway response contract does not project logprob arrays yet, so it cannot be
-honored on any rung and silently dropping a probability request is never acceptable — the reject is
+honored on any rung and silently dropping a probability request is never acceptable. The reject is
 the honest terminal until output normalization emits logprobs. A caller
 `response_format: {type: "json_object"}` is TRANSLATED, not dropped: it is admitted at the Chat
 ingress and rewritten to a permissive non-strict `json_schema` (`{"type":"object"}`, "any JSON
-object") — the serving lanes emit only `json_schema`, so this preserves the caller's JSON intent on
-every rung (dropping it would hand prose to a caller who asked for JSON) — and disclosed as
+object"). The serving lanes emit only `json_schema`, so this preserves the caller's JSON intent on
+every rung (dropping it would hand prose to a caller who asked for JSON), and disclosed as
 `response_format->translated(json_object)`; a non-strict schema is left open (never force-closed to
 `additionalProperties:false`), so its "any object" meaning is not inverted on a schema-closing
 (Anthropic) rung. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim

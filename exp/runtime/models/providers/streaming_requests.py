@@ -371,7 +371,7 @@ def route_generation_parameter_requests(
     # Sampling penalties are soft preferences: a rung that does not carry them
     # still returns a valid answer, so a route with any rung that lacks support
     # drops them with disclosure rather than rejecting. Honoring is gated on the
-    # openai_compatible dialect — the ONLY payload that emits penalties — so a
+    # openai_compatible dialect, the ONLY payload that emits penalties, so a
     # capability flag stamped on a non-emitting dialect (e.g. openai_responses)
     # can never claim "honored" and then silently omit the field. Emission stays
     # in one place; if another dialect ever emits penalties, add it here too.

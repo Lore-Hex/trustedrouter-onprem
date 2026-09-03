@@ -375,8 +375,10 @@ def test_open_structured_output_schema_closes_for_an_anthropic_rung() -> None:
 
 
 def test_non_strict_schema_is_left_open_for_an_anthropic_rung() -> None:
-    """A permissive (non-strict) schema — notably a translated json_object "any JSON
-    object" — is NOT force-closed, which would invert it into "no properties allowed"."""
+    """A permissive schema, notably translated json_object, is not force-closed.
+
+    Closing an "any JSON object" schema would invert it into "no properties allowed".
+    """
     request = _request(
         structured_text=StructuredTextFormat(
             name="json_object", json_schema={"type": "object"}, strict=False

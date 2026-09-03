@@ -350,8 +350,8 @@ def coerce_structured_text_schema(
     if not request.structured_text.strict:
         # A non-strict schema is permissive by the caller's own declaration
         # (notably a translated ``json_object`` = "any JSON object"). Closing it
-        # would over-constrain the very intent the caller marked loose — a bare
-        # open object would become "no properties allowed" — so it is left as-is
+        # would over-constrain the very intent the caller marked loose. A bare
+        # open object would become "no properties allowed", so it is left as-is
         # rather than silently tightened.
         return None
     if not any(

@@ -39,7 +39,7 @@ def compatible_generation_parameter_profile_indexes(
     # Prefer rungs that HONOR the caller's sampling exactly over rungs that can
     # only serve it by dropping temperature/top_p (a reasoning route at an effort
     # other than none). Both are servable, but preserving the caller's intent
-    # wins when a rung can — the drop is a last resort, not a peer of an exact
+    # wins when a rung can. The drop is a last resort, not a peer of an exact
     # rung. Only if no rung honors it do the serve-with-drop rungs stand in.
     exact: list[int] = []
     serviceable: list[int] = []
@@ -57,7 +57,7 @@ def compatible_generation_parameter_profile_indexes(
         return tuple(exact)
     if serviceable:
         return tuple(serviceable)
-    # No rung can serve the request: raise the first rung's OWN rejection — it
+    # No rung can serve the request: raise the first rung's OWN rejection. It
     # names the field the caller can act on, whereas re-checking the whole route
     # would report the route's mixed wire shape and hide that reason.
     raise rejections[0]

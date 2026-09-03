@@ -540,7 +540,7 @@ def test_top_k_narrows_to_a_supporting_rung_then_drops_when_none_support() -> No
 
 def test_penalties_honor_where_supported_and_drop_with_disclosure_otherwise() -> None:
     """Sampling penalties are honored (emitted) where every rung supports them, and
-    dropped+disclosed (a soft preference) where a rung does not — never rejected."""
+    dropped and disclosed (a soft preference) where a rung does not, never rejected."""
     supporting = GatewayWireProfile(
         dialect="openai_compatible",
         url="https://p.test",
@@ -581,7 +581,7 @@ def test_penalties_honor_where_supported_and_drop_with_disclosure_otherwise() ->
 
 def test_penalty_flag_on_a_non_emitting_dialect_still_drops_and_discloses() -> None:
     """A supports_*_penalty flag stamped on a dialect that cannot EMIT penalties
-    (only openai_compatible does) must NOT claim honored — it drops+discloses, never a
+    (only openai_compatible does) must NOT claim honored. It drops and discloses, never a
     silent undisclosed omission (a catalog could mis-stamp e.g. an openai_responses rung)."""
     responses_rung = GatewayWireProfile(
         dialect="openai_responses",
@@ -889,7 +889,7 @@ def test_generation_parameter_selection_serves_with_drop_when_no_rung_honors() -
 
 def test_translated_json_object_narrows_away_from_a_schema_closing_rung() -> None:
     """A translated json_object (open, non-strict schema) narrows to a rung that serves
-    open JSON, and rejects only when every rung is a schema-closing (Anthropic) dialect —
+    open JSON, and rejects only when every rung is a schema-closing (Anthropic) dialect,
     never silently closing 'any object' into 'no properties allowed'. This rides the
     existing non-strict-schema route check (a schema-closing dialect enforces the schema),
     which the strict=False translation now reaches."""
@@ -1162,7 +1162,7 @@ def test_srn_sampling_is_honored_at_explicit_none_reasoning() -> None:
 
 def test_temperature_narrows_to_a_honoring_rung_over_an_srn_rung() -> None:
     """A mixed route [srn rung + a plain rung that honors sampling] narrows temperature/
-    top_p to the honoring rung rather than dropping them on the srn rung — preserving the
+    top_p to the honoring rung rather than dropping them on the srn rung, preserving the
     caller's value when a rung can serve it."""
     srn_rung = GatewayWireProfile(
         dialect="openai_responses",
@@ -1191,7 +1191,7 @@ def test_temperature_narrows_to_a_honoring_rung_over_an_srn_rung() -> None:
 
 def test_genuinely_unsupported_sampling_still_hard_rejects() -> None:
     """A route that never declares temperature (Anthropic constrained [1,1]) still
-    rejects — there is nothing to honor at any effort, so it is not srn-droppable."""
+    rejects. There is nothing to honor at any effort, so it is not srn-droppable."""
     profile = GatewayWireProfile(
         dialect="anthropic_messages",
         url="https://provider.test",

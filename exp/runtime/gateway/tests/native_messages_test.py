@@ -940,7 +940,7 @@ def test_native_drops_unsupported_top_k_with_disclosure(
     assert native.status_code == 200
     assert (
         "top_k->dropped(unsupported_by_provider)"
-        in native.json()["x-experiential-ignored-parameters"]
+        in native.json()["x-trustedrouter-onprem-ignored-parameters"]
     )
 
 
