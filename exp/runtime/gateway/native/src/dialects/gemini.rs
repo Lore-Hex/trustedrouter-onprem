@@ -378,7 +378,7 @@ mod gemini_tests {
         // end with nothing to salvage: there is no partial answer, so it is
         // reclassified from a hard malformed reject to a retryable transport
         // failure (retry the lane, then fail over) rather than being accepted.
-        // The frames are still rejected — none is silently taken as content.
+        // The frames are still rejected. None is silently taken as content.
         let cases: [Value; 3] = [
             // A non-text text part (python: parts.text must be a string).
             json!({"candidates": [{"content": {"parts": [{"text": 5}]}}]}),

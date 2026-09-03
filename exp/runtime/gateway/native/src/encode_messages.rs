@@ -830,7 +830,7 @@ mod aggregate;
 
 pub use aggregate::{completed_messages_body, completed_messages_body_with_ignored};
 
-/// Attach the `x-experiential-ignored-parameters` disclosure to one message
+/// Attach the `x-trustedrouter-onprem-ignored-parameters` disclosure to one message
 /// object when any control was dropped; an empty list adds nothing.
 pub(super) fn disclose_ignored_parameters(message: &mut Value, ignored_parameters: &[String]) {
     if ignored_parameters.is_empty() {
@@ -840,7 +840,7 @@ pub(super) fn disclose_ignored_parameters(message: &mut Value, ignored_parameter
         .as_object_mut()
         .expect("Anthropic message is an object")
         .insert(
-            "x-experiential-ignored-parameters".to_string(),
+            "x-trustedrouter-onprem-ignored-parameters".to_string(),
             json!(ignored_parameters),
         );
 }

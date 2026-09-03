@@ -726,7 +726,7 @@ def _fallback_auth(alias: str, revision: str, digest: str) -> AuthorizationSnaps
 
 def test_fallback_lookup_is_alias_scoped_not_revision_id_only() -> None:
     """A fallback recorded for one alias is never returned for a different alias
-    that happens to share the active revision id — the fallback map is keyed by
+    that happens to share the active revision id. The fallback map is keyed by
     (alias, revision), so it cannot cross an alias authorization boundary."""
     shared_revision = "revision-shared"
     fallback = _ServedFallback(
@@ -767,7 +767,7 @@ def test_fallback_lookup_is_alias_scoped_not_revision_id_only() -> None:
 
 def test_cold_start_clears_a_dead_active_pin_via_last_good(tmp_path: Path) -> None:
     """A FRESH pod whose alias active revision pins an unservable snapshot serves
-    and lists it on the last-good prior revision at startup — the persistent
+    and lists it on the last-good prior revision at startup. The persistent
     dead-pin case cleared automatically on a fresh-image deploy (no reload, no
     in-memory retention involved)."""
     manager, raw_key = _configured_gateway(tmp_path)

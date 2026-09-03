@@ -182,7 +182,7 @@ def test_authored_schema_version_window_and_shape_are_pinned() -> None:
     path cannot drop, so a literal bump would warm-fail every older pod (the
     09-02 incident class on the authored side). If this test fails you changed
     the authored contract: an additive field is fine (old read-tolerant parsers
-    drop it) — update the fingerprint; narrowing the version window back to a
+    drop it). Update the fingerprint; narrowing the version window back to a
     literal, or a revision that reinterprets existing fields, needs a new field
     name or a fleet-first tolerance release instead.
     """

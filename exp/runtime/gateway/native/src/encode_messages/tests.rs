@@ -648,7 +648,7 @@ fn ignored_generation_controls_are_disclosed_by_both_messages_encoders() {
         .find(|frame| frame.starts_with("event: message_start"))
         .expect("message_start frame");
     assert!(message_start.contains(
-        "\"x-experiential-ignored-parameters\":[\"reasoning_effort\",\"anthropic-beta.claude-code-20250219\"]"
+        "\"x-trustedrouter-onprem-ignored-parameters\":[\"reasoning_effort\",\"anthropic-beta.claude-code-20250219\"]"
     ));
 
     let events = vec![Event::TextDelta("hi".to_string()), Event::Completed];
@@ -656,7 +656,7 @@ fn ignored_generation_controls_are_disclosed_by_both_messages_encoders() {
         completed_messages_body_with_ignored("request-abc", "coding", &events, &ignored)
             .expect("aggregates");
     assert_eq!(
-        aggregated.body["x-experiential-ignored-parameters"],
+        aggregated.body["x-trustedrouter-onprem-ignored-parameters"],
         json!(["reasoning_effort", "anthropic-beta.claude-code-20250219"])
     );
 
@@ -666,10 +666,10 @@ fn ignored_generation_controls_are_disclosed_by_both_messages_encoders() {
         .start()
         .expect("plain start must encode")
         .concat()
-        .contains("x-experiential-ignored-parameters"));
+        .contains("x-trustedrouter-onprem-ignored-parameters"));
     let plain_body = completed_messages_body("request-abc", "coding", &events).expect("aggregates");
     assert!(plain_body
         .body
-        .get("x-experiential-ignored-parameters")
+        .get("x-trustedrouter-onprem-ignored-parameters")
         .is_none());
 }

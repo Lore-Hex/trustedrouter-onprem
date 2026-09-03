@@ -217,8 +217,8 @@ def _coerce_disabled_thinking(
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
     """Build the disclosed coercion for one preflight capability rejection.
 
-    Two capabilities are coercible, both only here — after every rung declined
-    the verbatim request — and both only as a disclosed drop. Degrading
+    Two capabilities are coercible, both only here after every rung declined
+    the verbatim request, and both only as a disclosed drop. Degrading
     ``strict: true`` tools to best-effort schemas weakens a correctness
     guarantee. Dropping ``service_tier`` changes pricing and latency
     semantics, which the caller can act on only when told, so the drop is
@@ -266,7 +266,7 @@ def coerce_route_rejections(
     Mixed rejections may drop only the service tier: rungs declining for
     different reasons mean some rung offered to preserve any given guarantee,
     so degrading one (strict tools) would weaken semantics a rung could have
-    kept — but the tier is a routing hint whose only alternative is a
+    kept. But the tier is a routing hint whose only alternative is a
     rejection the caller cannot act on, so the disclosed drop is offered
     whenever any rung named it and the per-rung probe decides whether the
     dropped request actually serves.

@@ -311,7 +311,7 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
 
     The OpenAI-compatible rung declines parallel tool calls while the
     Anthropic rung declines the service tier, so no unanimous route-wide
-    capability exists — yet dropping the disclosed tier lets the Anthropic
+    capability exists. Yet dropping the disclosed tier lets the Anthropic
     rung serve instead of surfacing a rejection nobody can act on.
     """
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting

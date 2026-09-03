@@ -3080,7 +3080,7 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
 
 def test_fallback_served_alias_continuation_degrades_to_resend_not_503(tmp_path: Path) -> None:
     """A continuation on an alias served via its last-good fallback still fails
-    with the 400 'resend the full conversation' error when it cannot resolve —
+    with the 400 'resend the full conversation' error when it cannot resolve,
     never a 503. The fallback re-key is upstream of continuation binding, so it
     adds no 5xx path; a fresh request on the same alias serves via the fallback.
     """
@@ -3101,7 +3101,7 @@ def test_fallback_served_alias_continuation_degrades_to_resend_not_503(tmp_path:
     assert served["request_id"]
 
     # A continuation whose previous_response_id cannot resolve returns the shared
-    # 400 resend error, not a 503 — confirming the re-key never turns an
+    # 400 resend error, not a 503. This confirms the re-key never turns an
     # unresolvable continuation into a server error.
     with pytest.raises(NativeBridgeError) as rejected:
         _admit_responses(control, raw_key, _responses_body(previous_response_id="resp_missing"))
