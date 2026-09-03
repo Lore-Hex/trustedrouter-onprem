@@ -36,6 +36,11 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "stream_options",
             )
         ),
+        # Forwarded only on BYOK OpenAI-family rungs (the caller pays the
+        # provider directly, so tier pricing is theirs); host-funded routes
+        # drop it with disclosure because the tier changes provider pricing
+        # while the gateway bills catalog rates.
+        _field("service_tier", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "service_tier"),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("stop", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "stop_sequences"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
@@ -82,7 +87,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",
-                "service_tier",
                 "store",
                 "verbosity",
                 "web_search_options",
@@ -109,6 +113,8 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "store",
             )
         ),
+        # Same BYOK-only forwarding rule as the Chat surface.
+        _field("service_tier", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "service_tier"),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("include", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "encrypted_reasoning"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
@@ -149,7 +155,6 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "moderation",
                 "prompt",
                 "prompt_cache_retention",
-                "service_tier",
                 "stream_options",
             )
         ),

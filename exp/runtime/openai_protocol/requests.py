@@ -9,13 +9,7 @@ from typing import Literal, cast
 from openai.types import EmbeddingCreateParams
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
-from pydantic import (
-    BaseModel,
-    Field,
-    JsonValue,
-    TypeAdapter,
-    ValidationError,
-)
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
@@ -216,6 +210,7 @@ def decode_chat(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )
@@ -390,6 +385,7 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )
