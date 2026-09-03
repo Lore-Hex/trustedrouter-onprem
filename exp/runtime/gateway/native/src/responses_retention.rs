@@ -6,11 +6,13 @@ use serde_json::{json, Value};
 
 use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::compact_json;
+use crate::errors::PublicError;
 use crate::events::{
     CompletedToolCall, Event, ProviderAssistantMessagePhase, ProviderOutputItemKind,
     ProviderOutputItemStatus,
 };
 use crate::relay::event_retained_bytes;
+use crate::server::AppState;
 
 #[derive(Default)]
 struct RetainedMessage {
@@ -219,16 +221,6 @@ impl ResponsesRetention {
     pub(crate) fn refusal(&self) -> bool {
         self.refusal
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.text.is_empty()
-            && self.messages.is_empty()
-            && self.tool_calls.is_empty()
-            && self
-                .reasoning
-                .values()
-                .all(|reasoning| reasoning.encrypted_content.is_empty())
-    }
 }
 
 /// Build the retention payload consumed by the control plane's `remember`.
@@ -274,6 +266,32 @@ pub(crate) fn remember_argument(
     }))
 }
 
+/// Retain one finished Responses continuation before the terminal frames
+/// flush, mirroring the python service's ordering. Returns the public error
+/// when bounded retention fails closed.
+///
+/// An output-less turn (thinking spent the whole output budget, so the
+/// response is `incomplete` with no items) is retained too: the caller holds
+/// its response id, and `previous_response_id` naming it must resolve to the
+/// conversation so far rather than `previous_response_not_found`.
+pub(crate) async fn remember_continuation(
+    state: &AppState,
+    request_id: &str,
+    retention: &ResponsesRetention,
+    reasoning_content_carrier: Option<&str>,
+) -> Result<(), PublicError> {
+    if retention.overflowed || retention.refusal() {
+        return Ok(());
+    }
+    state
+        .bridge
+        .call(
+            "remember",
+            remember_argument(request_id, retention, reasoning_content_carrier),
+        )
+        .await
+        .map(|_| ())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,7 +423,6 @@ mod tests {
             retention.track(event);
         }
 
-        assert!(!retention.is_empty());
         let payload: Value =
             serde_json::from_str(&remember_argument("request-1", &retention, None))
                 .expect("retention payload is JSON");
