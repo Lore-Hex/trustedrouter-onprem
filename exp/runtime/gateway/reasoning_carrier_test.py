@@ -149,6 +149,75 @@ def test_carrier_round_trip_is_opaque_and_cross_replica_stable() -> None:
     assert claims.issuing_history_sha256 == _HISTORY_SHA256
 
 
+def test_carrier_survives_a_catalog_generation_change_between_turns() -> None:
+    """A carrier decrypts on the next turn after any catalog write or worker skew.
+
+    ``alias_revision_id`` and ``catalog_sha256`` bump on every catalog publish and
+    differ across per-worker in-memory catalog generations, but they do not change
+    the route, credential, or tenant. Binding them would make a carrier
+    undecryptable on the very next turn whenever the catalog was republished (a
+    price sync, a capability restamp) or the turn landed on another worker,
+    orphaning every multi-turn tool loop — the exact hazard the continuation store
+    avoids. The carrier must survive that generation change.
+    """
+    raw_arguments = '{ "q" : "x" }'
+    carrier = seal_reasoning_content(
+        _authority(authorization=_authorization()),
+        issuing_request_id="issuing-request",
+        issuing_route_depth=1,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="visible assistant text",
+        tool_calls=_tool_calls("call-one", raw_arguments=raw_arguments),
+        content="private provider reasoning",
+    )
+
+    # Turn two: same route/credential/tenant, a wholly different catalog generation.
+    next_generation = _authority(
+        authorization=_authorization(
+            alias_revision_id="alias-revision-two",
+            catalog_sha256="f" * 64,
+        )
+    )
+    block, _claims = unseal_reasoning_content(
+        parse_reasoning_content_carrier(carrier),
+        next_generation,
+        assistant_content="visible assistant text",
+        tool_calls=_tool_calls("call-one", raw_arguments=raw_arguments),
+    )
+
+    assert block.content == "private provider reasoning"
+
+
+def test_carrier_survives_a_client_content_and_refusal_normalization() -> None:
+    """A tool-only turn round-trips whether the client echoes empty text or null.
+
+    The gateway may stream a tool-only assistant turn with empty text, and an
+    OpenAI-compatible client is free to echo that as the empty string, as ``null``,
+    or to omit it — all the same visible turn. ``refusal`` never reaches the hash:
+    the wire field is not a ``GatewayMessage`` field, so it is dropped before the
+    turn/history digest, and the digest normalizes blank text to absent. Seal with
+    the empty string, replay as null → the carrier still authenticates.
+    """
+    carrier = seal_reasoning_content(
+        _authority(),
+        issuing_request_id="issuing-request",
+        issuing_route_depth=0,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="",
+        tool_calls=_tool_calls("call-one"),
+        content="hidden reasoning",
+    )
+
+    block, _claims = unseal_reasoning_content(
+        parse_reasoning_content_carrier(carrier),
+        _authority(),
+        assistant_content=None,
+        tool_calls=_tool_calls("call-one"),
+    )
+
+    assert block.content == "hidden reasoning"
+
+
 @pytest.mark.parametrize(
     "changed",
     (
@@ -156,7 +225,6 @@ def test_carrier_round_trip_is_opaque_and_cross_replica_stable() -> None:
         replace(_authority(), identity_id="identity-two"),
         replace(_authority(), virtual_key_id="key-two"),
         replace(_authority(), alias="other-alias"),
-        replace(_authority(), alias_revision_id="alias-revision-two"),
         replace(_authority(), deployment_id="fireworks-rung-two"),
         replace(_authority(), connection_authority_sha256="f" * 64),
         _authority(credential="rotated-provider-secret"),
