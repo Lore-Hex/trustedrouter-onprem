@@ -498,7 +498,7 @@ def test_hunyuan_exposes_plaintext_reasoning_and_round_trips_only_as_carrier(
     sealed = json.loads(control.seal_reasoning_content(seal_argument))["carrier"]
     # The carrier is opaque under the Hunyuan scheme and leaks neither the
     # plaintext reasoning nor the provider credential.
-    assert sealed.startswith("x-experiential-hunyuan-reasoning-v1:")
+    assert sealed.startswith("x-trustedrouter-onprem-hunyuan-reasoning-v1:")
     assert hidden not in sealed
     assert "shared-hunyuan-secret" not in sealed
     assert (
