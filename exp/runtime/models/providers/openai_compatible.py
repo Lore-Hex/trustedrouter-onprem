@@ -47,6 +47,7 @@ from exp.runtime.models.providers.fireworks import (
     is_fireworks_base_url,
     reasoning_content_route_sha256,
 )
+from exp.runtime.models.providers.hunyuan import is_hunyuan_base_url
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -440,6 +441,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         reasoning_effort: str | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
+        reasoning_output_exposed: bool = False,
     ) -> None:
         """Create one compatible client with explicit model wire capabilities."""
         super().__init__(
@@ -460,8 +462,16 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._reasoning_effort = reasoning_effort
         self._token_limit_key: ChatMaxTokensField = chat_max_tokens_field or self.token_limit_key
         self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
+        self._reasoning_output_exposed = reasoning_output_exposed
         self._fireworks_reasoning_route_sha256 = (
             reasoning_content_route_sha256(model) if is_fireworks_base_url(self._base_url) else None
+        )
+        # Tencent Hunyuan returns the model's plaintext reasoning natively and
+        # accepts it back; the gateway exposes it for display and round-trips it
+        # through a domain-separated opaque carrier, so this rung is both a
+        # carrier route and an exposed-plaintext route.
+        self._hunyuan_reasoning_route_sha256 = (
+            reasoning_content_route_sha256(model) if is_hunyuan_base_url(self._base_url) else None
         )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
@@ -486,6 +496,14 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             token_limit_key=self._token_limit_key,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
             fireworks_reasoning_route_sha256=self._fireworks_reasoning_route_sha256,
+            hunyuan_reasoning_route_sha256=self._hunyuan_reasoning_route_sha256,
+            # Expose plaintext reasoning only when the rung explicitly declares
+            # it AND resolves a reasoning-carrier route: an absent capability
+            # fails closed and stays stripped even on the Hunyuan endpoint, so
+            # exposure is per-rung, never per-endpoint.
+            reasoning_output_exposed=(
+                self._reasoning_output_exposed and self._hunyuan_reasoning_route_sha256 is not None
+            ),
         )
 
     def _completion_path(self) -> str:

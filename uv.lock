@@ -637,7 +637,7 @@ wheels = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.3.28"
+version = "0.3.29"
 source = { directory = "exp/runtime/gateway/native" }
 
 [[package]]
@@ -2693,7 +2693,7 @@ wheels = [
 
 [[package]]
 name = "trustedrouter-onprem"
-version = "0.7.28"
+version = "0.7.29"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },

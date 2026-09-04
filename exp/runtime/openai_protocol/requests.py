@@ -41,10 +41,12 @@ from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.reasoning_carrier import (
     FIREWORKS_REASONING_CONTENT_PREFIX,
     parse_reasoning_content_carrier,
+    scheme_for_carrier,
 )
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
 )
+from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
@@ -180,6 +182,12 @@ def decode_chat(
         if isinstance(request.stop, str)
         else request.stop
     )
+    thinking = translate_enable_thinking(request)
+    json_object_disclosure = (
+        (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
+        if request.response_format is not None and request.response_format.type == "json_object"
+        else ()
+    )
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -188,12 +196,7 @@ def decode_chat(
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
-            ignored_parameters=(
-                (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
-                if request.response_format is not None
-                and request.response_format.type == "json_object"
-                else ()
-            ),
+            ignored_parameters=(*json_object_disclosure, *thinking.disclosures),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -210,7 +213,8 @@ def decode_chat(
             presence_penalty=request.presence_penalty,
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
-            reasoning_effort=request.reasoning_effort,
+            reasoning_effort=thinking.reasoning_effort,
+            thinking_default_enable=thinking.thinking_default_enable,
             stream=request.stream,
             include_usage=(
                 request.stream_options is not None and request.stream_options.include_usage
@@ -660,8 +664,16 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
         )
         provider_reasoning: tuple[SealedReasoningContentBlock, ...] = ()
         if message.reasoning_content is not None:
+            # The scheme is fixed by the carrier's own opaque prefix; raw client
+            # text (no known prefix) matches none and is rejected here. Each
+            # provider's carrier only parses under its own scheme.
+            scheme = scheme_for_carrier(message.reasoning_content)
             try:
-                provider_reasoning = (parse_reasoning_content_carrier(message.reasoning_content),)
+                if scheme is None:
+                    raise ValueError("reasoning_content is not a gateway-issued carrier")
+                provider_reasoning = (
+                    parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
+                )
             except ValueError as exc:
                 param = f"{prefix}.{message_index}.reasoning_content"
                 raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
