@@ -12,7 +12,7 @@ everywhere and carried on the surfaces the Anthropic wire caches natively
 top-level automatic marker), and dropped on wires that do not cache a marked
 block because a cache hint changes cost, not semantics; ``image`` and PDF
 ``document`` blocks are retained as canonical content parts so a route that
-declares the matching input capability carries them — including ``image``
+declares the matching input capability carries them, including ``image``
 sub-blocks inside ``tool_result`` content (tool screenshots), which ride the
 tool message's content parts; a document inside ``tool_result`` content is
 rejected loudly because the serving surface cannot preserve it there;

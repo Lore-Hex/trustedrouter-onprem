@@ -15,7 +15,7 @@ from exp.runtime.models.providers.hunyuan import is_hunyuan_base_url
         "https://api.hunyuan.cloud.tencent.com/v1",
         "https://api.hunyuan.cloud.tencent.com/v1/",
         # The TokenHub international MaaS origin the platform's Tencent lane
-        # dispatches through — the endpoint that must resolve a carrier route.
+        # dispatches through, which is the endpoint that must resolve a carrier route.
         "https://tokenhub-intl.tencentcloudmaas.com/v1",
         "https://tokenhub-intl.tencentcloudmaas.com/v1/",
     ],

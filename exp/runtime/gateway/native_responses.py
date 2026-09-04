@@ -190,7 +190,7 @@ def remember_turn(
     lifecycle metadata even when their visible text is empty, and a turn that
     produced no retainable output at all (thinking spent the whole output
     budget, so the response is ``incomplete`` with no items) is retained as the
-    conversation so far — the caller holds that response id, and
+    conversation so far. The caller holds that response id, and
     ``previous_response_id`` naming it must continue the conversation, as
     api.openai.com does for its own ``incomplete`` responses, instead of
     answering ``previous_response_not_found``. One oversize continuation fails

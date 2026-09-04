@@ -4,7 +4,7 @@ Clients express "turn thinking on" three non-canonical ways on
 /v1/chat/completions: the Responses-style nested ``reasoning:{effort}``, the
 Anthropic-style ``thinking:{type}``, and the vLLM-native
 ``chat_template_kwargs:{enable_thinking}``. Each is admitted and translated here
-to the canonical flat ``reasoning_effort`` (never dropped — dropping would leave
+to the canonical flat ``reasoning_effort`` (never dropped, because dropping would leave
 thinking silently off), so one caller payload works in any shape. The
 model-aware default effort for a level-less enable is resolved later, at the
 route adaptation seam, via ``GatewayRequest.thinking_default_enable``.

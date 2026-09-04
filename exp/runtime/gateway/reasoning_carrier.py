@@ -114,7 +114,7 @@ def scheme_for_profile(profile: GatewayWireProfile) -> ReasoningCarrierScheme | 
     reasoning-carrier rung.
 
     At most one per-provider route gate is set on a rung, so this selects the
-    exact scheme whose key domain and prefix the rung's carriers use — a Hunyuan
+    exact scheme whose key domain and prefix the rung's carriers use. A Hunyuan
     rung seals/authenticates only Hunyuan carriers, a Fireworks rung only
     Fireworks. A rung with no reasoning-carrier gate returns None (no authority).
     """
@@ -212,12 +212,12 @@ def reasoning_carrier_authority(
     if route_sha256 is None:
         return None
     credential = _bearer_credential(profile.headers)
-    # The carrier binds routing, credential, and tenant identity — NOT the
+    # The carrier binds routing, credential, and tenant identity, but not the
     # catalog GENERATION. ``alias_revision_id`` and ``catalog_sha256`` bump on
     # every catalog write (a price sync, a capability restamp) and differ across
     # per-worker in-memory catalog generations, so binding them into the AEAD key
     # would make a carrier undecryptable on the very next turn whenever the
-    # catalog was republished or the turn landed on another worker — orphaning
+    # catalog was republished or the turn landed on another worker, orphaning
     # every multi-turn tool loop. This is the exact hazard the continuation store
     # avoids by keying only on stable identity; a real route change still moves
     # ``deployment_id``/``reasoning_route_sha256`` and still fails authentication.

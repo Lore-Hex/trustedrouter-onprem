@@ -458,7 +458,7 @@ def test_hunyuan_rung_without_the_capability_stays_stripped_but_keeps_its_carrie
     """An undeclared rung on the Hunyuan endpoint fails closed on exposure.
 
     The carrier route identity still resolves so tool-loop replay stays sealed,
-    but the caller never sees plaintext ``reasoning_content`` — closing the hole
+    but the caller never sees plaintext ``reasoning_content``, closing the hole
     where endpoint detection alone would expose every model on the endpoint.
     """
     profile = OpenAICompatibleClient(

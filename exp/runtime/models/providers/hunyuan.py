@@ -10,8 +10,8 @@ mirroring :mod:`exp.runtime.models.providers.fireworks`.
 
 Two OpenAI-compatible origins serve these models:
 
-- ``https://api.hunyuan.cloud.tencent.com/v1`` — the mainland Hunyuan root.
-- ``https://tokenhub-intl.tencentcloudmaas.com/v1`` — Tencent's TokenHub
+- ``https://api.hunyuan.cloud.tencent.com/v1``: the mainland Hunyuan root.
+- ``https://tokenhub-intl.tencentcloudmaas.com/v1``: Tencent's TokenHub
   international (Singapore) MaaS gateway, which is the origin the platform's
   Tencent lane actually dispatches through. TokenHub is multi-model, exactly
   like the Fireworks host: recognizing it here resolves a reasoning-carrier

@@ -265,7 +265,7 @@ impl ChatSseEncoder {
             Event::ReasoningContentDelta { delta, .. } => {
                 // On an exposure-gated rung (Tencent/DeepSeek), the model's
                 // plaintext reasoning is returned to the caller as
-                // `choices[].delta.reasoning_content` — the tokens are already
+                // `choices[].delta.reasoning_content`; the tokens are already
                 // billed. Elsewhere it stays dropped (the Chat wire has no
                 // reasoning field by default); the sealed round-trip carrier at
                 // the terminal is emitted independently regardless.
@@ -620,7 +620,7 @@ pub fn completed_chat_body_with_carrier(
     });
     if matches!(terminal, Event::Completed) && has_tool_calls && reasoning.is_some() {
         // A tool turn's reasoning round-trips as the sealed opaque carrier
-        // (never raw plaintext — that would be a CoT-injection vector on the
+        // (never raw plaintext, which would be a CoT-injection vector on the
         // way back in), so `reasoning_content` carries the carrier.
         let carrier = reasoning_content_carrier.ok_or_else(|| {
             invalid_provider_stream(

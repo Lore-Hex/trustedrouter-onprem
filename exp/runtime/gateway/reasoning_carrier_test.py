@@ -157,7 +157,7 @@ def test_carrier_survives_a_catalog_generation_change_between_turns() -> None:
     the route, credential, or tenant. Binding them would make a carrier
     undecryptable on the very next turn whenever the catalog was republished (a
     price sync, a capability restamp) or the turn landed on another worker,
-    orphaning every multi-turn tool loop — the exact hazard the continuation store
+    orphaning every multi-turn tool loop, which is the exact hazard the continuation store
     avoids. The carrier must survive that generation change.
     """
     raw_arguments = '{ "q" : "x" }'
@@ -193,7 +193,7 @@ def test_carrier_survives_a_client_content_and_refusal_normalization() -> None:
 
     The gateway may stream a tool-only assistant turn with empty text, and an
     OpenAI-compatible client is free to echo that as the empty string, as ``null``,
-    or to omit it — all the same visible turn. ``refusal`` never reaches the hash:
+    or to omit it, all representing the same visible turn. ``refusal`` never reaches the hash:
     the wire field is not a ``GatewayMessage`` field, so it is dropped before the
     turn/history digest, and the digest normalizes blank text to absent. Seal with
     the empty string, replay as null → the carrier still authenticates.
@@ -502,7 +502,7 @@ def test_carrier_domains_isolate_fireworks_and_hunyuan() -> None:
     Same credential and route context, so the ONLY thing separating them is the
     per-scheme key-derivation + credential-identity domain. Proven, not asserted by
     construction: (1) the two authorities derive different AEAD keys and fingerprints;
-    (2) each carrier is rejected — with one opaque error — when replayed under the
+    (2) each carrier is rejected with one opaque error when replayed under the
     other provider's scheme+authority.
     """
     fireworks = _authority()
@@ -556,7 +556,7 @@ def test_carrier_domains_isolate_fireworks_and_hunyuan() -> None:
 
     # Deeper: even bypassing the prefix (force the Fireworks scheme to parse the
     # Fireworks carrier) but presenting the Hunyuan authority key, the AEAD tag fails
-    # — the domain-separated key cannot decrypt the other provider's envelope.
+    # because the domain-separated key cannot decrypt the other provider's envelope.
     with pytest.raises(ValueError, match="authentication failed"):
         unseal_reasoning_content(
             parse_reasoning_content_carrier(fireworks_carrier, scheme=FIREWORKS_SCHEME),

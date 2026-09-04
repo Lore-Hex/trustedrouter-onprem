@@ -529,7 +529,7 @@ fn a_tool_call_cut_off_by_the_output_budget_is_incomplete_not_malformed() {
     // Live shape (Tencent TokenHub glm-5.3, max_tokens=32, staging
     // 2026-09-03): the call starts, two argument fragments arrive, then the
     // provider finishes with `length`. The truncated call is dropped and the
-    // stream ends Incomplete — the caller's remedy is a larger budget, so a
+    // stream ends Incomplete. The caller's remedy is a larger budget, so a
     // 502 "malformed response" was the wrong verdict.
     let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
     let started = normalizer
