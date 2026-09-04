@@ -33,7 +33,7 @@ use crate::respond::{
     escalation_error, finish_stream_terminal, json_response, latin1_header, read_body,
     send_bounded, settle_stream_end, sse_body_response,
 };
-use crate::responses_retention::{remember_argument, ResponsesRetention};
+use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
@@ -209,6 +209,13 @@ pub(crate) async fn responses(
         // Bytes over four approximates input tokens; a timeout heuristic
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        // A turn that ends before any semantic output is still a response
+        // the caller can continue from; the waterfall retains it in flight.
+        output_less_retention: Some(remember_argument(
+            &admission.request_id,
+            &ResponsesRetention::default(),
+            None,
+        )),
     };
     let won = acquire_attempt(&context, &mut guard).await;
 
@@ -275,27 +282,6 @@ pub(crate) async fn responses(
     }
 }
 
-/// Retain one completed Responses continuation before the terminal frames
-/// flush, mirroring the python service's ordering. Returns the public error
-/// when bounded retention fails closed.
-async fn remember_continuation(
-    state: &AppState,
-    request_id: &str,
-    retention: &ResponsesRetention,
-    reasoning_content_carrier: Option<&str>,
-) -> Result<(), PublicError> {
-    if retention.overflowed || retention.refusal() || retention.is_empty() {
-        return Ok(());
-    }
-    state
-        .bridge
-        .call(
-            "remember",
-            remember_argument(request_id, retention, reasoning_content_carrier),
-        )
-        .await
-        .map(|_| ())
-}
 /// Answer one Responses attempt that the waterfall already settled: a
 /// successful terminal with no semantic output, or an exhausted ladder
 /// flushing withheld refusal output ahead of the failing terminal.

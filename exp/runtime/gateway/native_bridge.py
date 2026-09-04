@@ -92,6 +92,7 @@ from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_reasoning import (
     authenticate_reasoning_history,
     has_active_reasoning_content,
+    seal_reasoning_carrier_content,
     strip_stale_reasoning_history,
     unseal_reasoning_history,
 )
@@ -106,10 +107,8 @@ from exp.runtime.gateway.native_settlement import (
 )
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
-    parse_reasoning_carrier_tool_calls,
     reasoning_carrier_authority,
-    reasoning_history_sha256,
-    seal_reasoning_content,
+    scheme_for_profile,
 )
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers import (
@@ -138,6 +137,33 @@ from exp.runtime.openai_protocol.state import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+def _log_reasoning_continuation_rejection(
+    authorization: AuthorizationSnapshot, stage: str, reason: object
+) -> None:
+    """Record why a reasoning-carrier continuation failed, for operators only.
+
+    The caller sees one opaque 400 (naming the differing bound claim would be an
+    authentic-continuation oracle), but an operator needs the exact reason to tell
+    a genuine tamper from a benign authority drift. Nothing here carries a
+    credential or the plaintext reasoning; the catalog-generation fields make a
+    cross-worker or post-republish drift obvious when diffed against the issuing
+    turn's admission log.
+    """
+    _logger.warning(
+        "reasoning carrier continuation rejected",
+        extra={
+            "operation": "native_reasoning_continuation",
+            "stage": stage,
+            "reason": str(reason),
+            "request_id": authorization.request_id,
+            "alias": authorization.alias,
+            "alias_revision_id": authorization.alias_revision_id,
+            "catalog_sha256": authorization.catalog_sha256,
+        },
+    )
+
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
@@ -328,6 +354,7 @@ class NativeControlPlane(
                 request,
             )
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
+            _log_reasoning_continuation_rejection(authorization, "authenticate", exc)
             error = invalid_field(
                 "messages.reasoning_content",
                 "'messages.reasoning_content' must be an authentic continuation for this route.",
@@ -352,6 +379,7 @@ class NativeControlPlane(
                 request,
             )
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
+            _log_reasoning_continuation_rejection(authorization, "unseal", exc)
             error = invalid_field(
                 "messages.reasoning_content",
                 "'messages.reasoning_content' must be an authentic continuation for this route.",
@@ -362,6 +390,9 @@ class NativeControlPlane(
             and verified_reasoning_route is not None
             and pinned_reasoning_route.deployment != verified_reasoning_route.deployment
         ):
+            _log_reasoning_continuation_rejection(
+                authorization, "route_pin", "authenticate and unseal resolved different deployments"
+            )
             raise NativeBridgeError(
                 invalid_field(
                     "messages.reasoning_content",
@@ -500,6 +531,7 @@ class NativeControlPlane(
                     deployment.gateway.capabilities,
                     model_capabilities=deployment.capabilities,
                     public_stream=public_request.stream,
+                    route_provider=deployment.provider,
                 )
                 upstream_payload = dialect_stream_payload(profile, provider_request)
                 upstream_body, dispatch_signer = frozen_dispatch(profile, client, upstream_payload)
@@ -527,13 +559,17 @@ class NativeControlPlane(
                         body_sha256=sha256_bytes(upstream_body.encode("utf-8")),
                     )
                 )
+                carrier_scheme = scheme_for_profile(profile)
                 carrier_authorities.append(
-                    reasoning_carrier_authority(
+                    None
+                    if carrier_scheme is None
+                    else reasoning_carrier_authority(
                         authorization=authorization,
                         exact_model_id=route.snapshot.exact_model_id,
                         pool_id=route.snapshot.pool_id,
                         deployment=deployment,
                         profile=profile,
+                        scheme=carrier_scheme,
                     )
                 )
             if continuation_context is not None:
@@ -755,60 +791,7 @@ class NativeControlPlane(
 
     def seal_reasoning_content(self, argument: str) -> str:
         """Seal one winning Fireworks turn before terminal settlement."""
-        try:
-            data = json.loads(argument)
-            if not isinstance(data, dict):
-                raise ValueError("reasoning carrier argument must be an object")
-            request_id = data.get("request_id")
-            route_depth = data.get("route_depth")
-            assistant_content = data.get("assistant_content")
-            route_sha256 = data.get("route_sha256")
-            content = data.get("content")
-            if (
-                not isinstance(request_id, str)
-                or not request_id
-                or isinstance(route_depth, bool)
-                or not isinstance(route_depth, int)
-                or (assistant_content is not None and not isinstance(assistant_content, str))
-                or not isinstance(route_sha256, str)
-                or not isinstance(content, str)
-            ):
-                raise ValueError("reasoning carrier argument has invalid field types")
-            tool_calls = parse_reasoning_carrier_tool_calls(data.get("tool_calls"))
-            entry = self._accounting.entry(request_id)
-            if (
-                entry is None
-                or entry.active_attempt_id is None
-                or entry.attempt_depths.get(entry.active_attempt_id) != route_depth
-                or route_depth < 0
-                or route_depth >= len(entry.reasoning_carrier_authorities)
-            ):
-                raise ValueError("reasoning carrier attempt is not active")
-            authority = entry.reasoning_carrier_authorities[route_depth]
-            if authority is None or authority.reasoning_route_sha256 != route_sha256:
-                raise ValueError("reasoning carrier route differs from the active attempt")
-            # Carriers exist only on message-bearing surfaces: fail loud, never duck-type.
-            if not isinstance(entry.request, GatewayRequest):
-                raise ValueError("reasoning carrier is not valid for this request surface")
-            carrier = seal_reasoning_content(
-                authority,
-                issuing_request_id=request_id,
-                issuing_route_depth=route_depth,
-                issuing_history_sha256=reasoning_history_sha256(entry.request.messages),
-                assistant_content=assistant_content,
-                tool_calls=tool_calls,
-                content=content,
-            )
-        except Exception as exc:  # noqa: BLE001 - never disclose authority or content.
-            raise NativeBridgeError(
-                public_failure_error(
-                    GatewayFailure(
-                        failure_class=GatewayFailureClass.MALFORMED_RESPONSE,
-                        safe_message="the provider returned malformed reasoning continuation data",
-                    )
-                )
-            ) from exc
-        return json.dumps({"carrier": carrier}, separators=(",", ":"))
+        return seal_reasoning_carrier_content(self._accounting, argument)
 
     def claim_scope(self, argument: str) -> str:
         """Resolve the replay-store scope for one keyed request.
@@ -910,14 +893,17 @@ class NativeControlPlane(
         return json.dumps(scope, separators=(",", ":"))
 
     def remember(self, argument: str) -> str:
-        """Retain one completed Responses continuation within strict bounds.
+        """Retain one finished Responses continuation within strict bounds.
 
         Args:
             argument: JSON object with ``request_id``, aggregated ``text``,
-                ``refusal`` presence, and completed ``tool_calls``.
+                ``refusal`` presence, and completed ``tool_calls``; an
+                output-less turn carries all of them empty and is retained as
+                the conversation so far.
 
         Returns:
-            An empty JSON object; retention that does not apply is a no-op.
+            An empty JSON object; retention that does not apply (a
+            ``store: false`` caller, a refusal) is a no-op.
 
         Raises:
             NativeBridgeError: The continuation exceeds the bounded store or

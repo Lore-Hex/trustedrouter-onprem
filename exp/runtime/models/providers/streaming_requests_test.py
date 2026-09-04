@@ -9,6 +9,7 @@ from exp.common.models.content import (
     AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
+    MediaHandle,
     TextContentPart,
     VideoContentPart,
 )
@@ -34,6 +35,8 @@ from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
 from exp.runtime.models.providers.streaming_requests import (
+    TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+    TOOL_RESULT_IMAGE_PLACEHOLDER,
     anthropic_messages_stream_payload,
     bedrock_converse_stream_payload,
     dialect_stream_payload,
@@ -401,6 +404,56 @@ def test_route_rejects_reasoning_summary_outside_native_responses() -> None:
 
     assert raised.value.code == "unsupported_parameter"
     assert raised.value.param == "reasoning.generate_summary"
+
+
+def _tool_image_message() -> GatewayMessage:
+    """One tool message carrying a screenshot beside its text."""
+    return GatewayMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="tool said:",
+        content_parts=(
+            TextContentPart(text="tool said:"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+        ),
+    )
+
+
+def test_a_mixed_route_degrades_tool_result_images_with_disclosure() -> None:
+    """A non-Anthropic rung cannot express a tool-result image, so the route
+    substitutes positional placeholder text and discloses the drop instead of
+    rejecting a block the caller cannot remove from history."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
+    )
+    profiles = (
+        GatewayWireProfile(dialect="anthropic_messages", url="https://a.test"),
+        GatewayWireProfile(dialect="openai_compatible", url="https://b.test"),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    tool_message = provider_request.messages[-1]
+    assert tool_message.content_parts == ()
+    assert tool_message.content == "tool said:" + TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public_request.ignored_parameters
+    # The public request keeps the caller's original history.
+    assert public_request.messages[-1].images
+
+
+def test_an_all_anthropic_route_keeps_tool_result_images() -> None:
+    """Single-dialect Anthropic routes carry the screenshot verbatim."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
+    )
+    profiles = (GatewayWireProfile(dialect="anthropic_messages", url="https://a.test"),)
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert provider_request.messages[-1].images
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in public_request.ignored_parameters
 
 
 def test_route_accepts_reasoning_summary_on_native_anthropic() -> None:
@@ -1203,6 +1256,55 @@ def test_genuinely_unsupported_sampling_still_hard_rejects() -> None:
 
     assert raised.value.code == "unsupported_parameter"
     assert raised.value.param == "temperature"
+
+
+def test_thinking_default_enable_resolves_the_required_default_effort() -> None:
+    """A level-less enable resolves to the route's required default effort."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://p.test",
+        model_id="provider/reasoner",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="medium",
+        supported_reasoning_efforts=("none", "low", "medium", "high"),
+        reasoning_effort_required=True,
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    _public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert provider.reasoning_effort == "medium"
+
+
+def test_thinking_default_enable_falls_back_to_the_lowest_non_none_effort() -> None:
+    """When the model requires no default, a level-less enable picks the lowest tier."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://p.test",
+        model_id="provider/optional-reasoner",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        supported_reasoning_efforts=("none", "low", "high"),
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    _public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert provider.reasoning_effort == "low"
+
+
+def test_thinking_default_enable_on_a_non_reasoning_route_surfaces() -> None:
+    """A route that supports no reasoning effort cannot enable thinking → rejects."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible", url="https://p.test", model_id="provider/plain"
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((profile,), request)
+
+    assert raised.value.code == "unsupported_parameter"
 
 
 def test_payload_builder_rejects_conditional_sampling_without_admission() -> None:
@@ -3178,6 +3280,34 @@ def test_anthropic_payload_carries_document_blocks_in_caller_order() -> None:
         },
         {"type": "text", "text": " compare"},
     ]
+
+
+def test_anthropic_files_handles_add_the_files_api_beta_header() -> None:
+    """A request carrying an Anthropic Files handle dispatches with the beta token."""
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_FILES_API_BETA,
+        anthropic_request_headers,
+    )
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="describe",
+                content_parts=(
+                    ImageContentPart(handle=MediaHandle(provider="anthropic", reference="file_a")),
+                    TextContentPart(text="describe"),
+                ),
+            ),
+        ),
+    )
+    headers = anthropic_request_headers({"x-api-key": "k"}, request)
+    assert headers["anthropic-beta"] == ANTHROPIC_FILES_API_BETA
+    merged = anthropic_request_headers(
+        {"x-api-key": "k", "anthropic-beta": ANTHROPIC_FILES_API_BETA}, request
+    )
+    assert merged["anthropic-beta"] == ANTHROPIC_FILES_API_BETA
 
 
 _WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA="

@@ -3,8 +3,17 @@
 import base64
 from typing import Literal, cast
 
+import pytest
+
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
-from exp.common.models.content import AudioContentPart, TextContentPart, VideoContentPart
+from exp.common.models.content import (
+    AudioContentPart,
+    ImageContentPart,
+    MediaHandle,
+    TextContentPart,
+    VideoContentPart,
+)
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -261,6 +270,73 @@ def test_oversized_inline_media_skips_the_bedrock_rung() -> None:
     assert errors[0].param == "messages"
 
 
+def test_media_handle_requests_land_only_on_the_uploading_providers_rung() -> None:
+    """A waterfall skips undeclared and foreign-provider rungs for a handle.
+
+    An OpenAI Files handle passes an Anthropic rung that declares handles
+    (wrong provider), an OpenAI rung that never declared them, and lands on
+    the declared OpenAI rung. When no rung can serve, the provider mismatch
+    is the rejection the caller sees.
+    """
+    handles = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_image_input=True,
+            supports_media_handle_input=True,
+        )
+    )
+    inline_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_image_input=True
+        )
+    )
+    deployments = (
+        _deployment("claude", provider="anthropic", gateway=handles),
+        _deployment("gpt-inline", provider="openai", gateway=inline_only),
+        _deployment("gpt-files", provider="openai", gateway=handles),
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.RESPONSES)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+        (GatewayWireProfile(dialect="openai_responses", url="https://openai.test"), client),
+        (GatewayWireProfile(dialect="openai_responses", url="https://openai.test"), client),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="describe",
+                content_parts=(
+                    ImageContentPart(handle=MediaHandle(provider="openai", reference="file-abc")),
+                    TextContentPart(text="describe"),
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    indexes, errors = protocol_compatible_indexes(route, wires, request, public_stream=False)
+    assert indexes == (2,)
+    capabilities = [
+        error.capability for error in errors if isinstance(error, ProviderCapabilityError)
+    ]
+    assert capabilities == ["media_handle_provider", "media_handle_input"]
+
+    without_openai = _mixed_route(
+        "maximize_availability", deployments[:2], GatewayApiSurface.RESPONSES
+    )
+    indexes, errors = protocol_compatible_indexes(
+        without_openai, wires[:2], request, public_stream=False
+    )
+    assert indexes == ()
+    rejection = route_rejection(errors)
+    assert isinstance(rejection, ProviderCapabilityError)
+    assert rejection.capability == "media_handle_provider"
+    assert rejection.detail is not None and "uploaded to openai" in rejection.detail
+
+
 def test_audio_requests_skip_rungs_whose_wire_cannot_carry_them() -> None:
     """A clip lands on the declared Chat rung, past Anthropic, Bedrock, and undeclared Gemini."""
     audio_route = GatewayDeploymentMetadata(
@@ -452,4 +528,143 @@ def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_discl
     assert tuple(item.deployment_id for item in narrowed.deployments) == ("native", "shim")
     assert public.ignored_parameters == ("thinking.type->adaptive",)
     assert provider.provider_thinking_config is None
+    assert accounting.recorded == 1
+
+
+_TOOL_IMAGE_PNG = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+"""One valid single-pixel PNG, base64 encoded (the owner-reported repro image)."""
+
+
+def _tool_screenshot_route_request(*, stream: bool) -> GatewayRequest:
+    """Decode the owner-reported wedged-session repro through the real surface.
+
+    The exact wire body: a user text turn, an assistant ``tool_use``, and a
+    user ``tool_result`` whose content is one base64 PNG image sub-block.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+
+    body: JsonObject = {
+        "model": "coding",
+        "max_tokens": 128,
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "read the screenshot"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call-1", "name": "computer", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-1",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": _TOOL_IMAGE_PNG,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+    return decode_messages(body).request.model_copy(update={"include_usage": True})
+
+
+class _AdmissionCoercionCounter:
+    """Count coercion recordings without a live ledger."""
+
+    def __init__(self) -> None:
+        self.recorded = 0
+
+    def record_admission_coercions(self, count: int) -> None:
+        self.recorded += count
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_tool_result_image_passes_through_on_a_vision_anthropic_route(stream: bool) -> None:
+    """The repro serves verbatim on an image-capable Anthropic route."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    vision = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supports_image_input=True,
+        )
+    )
+    deployments = (_deployment("claude", provider="anthropic", gateway=vision),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.MESSAGES)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+    )
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        wires,
+        _tool_screenshot_route_request(stream=stream),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    tool_message = provider.messages[-1]
+    assert tool_message.role == "tool"
+    assert [part.kind for part in tool_message.content_parts] == ["image"]
+    assert tool_message.images[0].data == _TOOL_IMAGE_PNG
+    assert public.ignored_parameters == ()
+    assert accounting.recorded == 0
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream: bool) -> None:
+    """The repro serves with a disclosed placeholder instead of a 400.
+
+    The image is baked into the caller's history, so a rejection wedges every
+    later turn of the session; a fable-5.1-style non-vision route answers the
+    degraded request while ``ignored_parameters`` tells the caller what was
+    dropped.
+    """
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.models.providers.streaming_requests import (
+        TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+        TOOL_RESULT_IMAGE_PLACEHOLDER,
+    )
+
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    deployments = (_deployment("claude", provider="anthropic", gateway=text_only),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.MESSAGES)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+    )
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        wires,
+        _tool_screenshot_route_request(stream=stream),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    tool_message = provider.messages[-1]
+    assert tool_message.content_parts == ()
+    assert tool_message.content == TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public.ignored_parameters
     assert accounting.recorded == 1

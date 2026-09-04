@@ -55,6 +55,15 @@ CHAT_MANIFEST = CompatibilityManifest(
             "structured_output",
         ),
         _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        # Alternate enable-thinking shapes admitted and TRANSLATED to the canonical
+        # reasoning_effort at decode (the Responses-style nested `reasoning`, the
+        # Anthropic-style `thinking`, the vLLM-native `chat_template_kwargs`), so a
+        # caller's one payload turns thinking on in any shape.
+        _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field(
+            "chat_template_kwargs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"
+        ),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Sampling penalties: admitted and adapted per rung, honored where the
@@ -65,6 +74,13 @@ CHAT_MANIFEST = CompatibilityManifest(
         # Accepted only at its no-op default of 1 (the wire model enforces
         # the value): Copilot hardcodes n:1 on every Chat request.
         _field("n", CompatibilityDisposition.SUPPORTED),
+        # Retention request accepted only at its no-op default of false (the
+        # wire model enforces the value): OpenAI-style agents (omp, opencode,
+        # pi) hardcode store:false on every Chat request to opt out of
+        # provider-side retention. This gateway never retains Chat output on
+        # any rung, so false is already satisfied and store:true is rejected:
+        # silently dropping a retention request would be dishonest.
+        _field("store", CompatibilityDisposition.SUPPORTED),
         # top_logprobs stays UNSUPPORTED: the gateway response contract does not
         # project logprob arrays yet, so it cannot be honored on any rung.
         # rejecting is the honest outcome (never a silent drop of a probability
@@ -94,7 +110,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",
-                "store",
                 "verbosity",
                 "web_search_options",
             )

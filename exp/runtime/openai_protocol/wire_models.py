@@ -70,18 +70,31 @@ class _ChatImagePart(_WireModel):
     image_url: _ChatImageUrl
 
 
+_MAXIMUM_FILE_ID_CHARACTERS = 512
+"""Longest OpenAI Files handle accepted on the wire."""
+
+
 class _ResponsesImagePart(_WireModel):
     """One Responses ``input_image`` content part.
 
-    Responses carries the reference as a bare string, and ``file_id`` names
-    an uploaded file this gateway does not host, so only the null form of
-    that field is accepted.
+    Responses carries the reference as a bare ``image_url`` string, or as the
+    ``file_id`` of an image the caller already uploaded to OpenAI Files.
+    Exactly one of the two is present.
     """
 
     type: Literal["input_image"]
-    image_url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
+    image_url: str | None = Field(
+        default=None, min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS
+    )
     detail: _ImageDetail | None = None
-    file_id: None = None
+    file_id: str | None = Field(default=None, min_length=1, max_length=_MAXIMUM_FILE_ID_CHARACTERS)
+
+    @model_validator(mode="after")
+    def _require_one_carrier(self) -> _ResponsesImagePart:
+        """Require exactly one of ``image_url`` or ``file_id``."""
+        if (self.image_url is None) == (self.file_id is None):
+            raise ValueError("input_image needs exactly one of image_url or file_id")
+        return self
 
 
 _MAXIMUM_VIDEO_URL_CHARACTERS = MAXIMUM_VIDEO_BASE64_BYTES + 128
@@ -133,15 +146,24 @@ _MAXIMUM_FILE_DATA_CHARACTERS = MAXIMUM_DOCUMENT_BASE64_BYTES + 128
 
 
 class _ChatFile(_WireModel):
-    """Chat Completions ``file`` payload: inline ``file_data`` with a filename.
+    """Chat Completions ``file`` payload: inline ``file_data`` or a ``file_id``.
 
-    ``file_id`` names an uploaded file this gateway does not host, so only
-    the null form of that field is accepted.
+    Exactly one of the inline bytes or the OpenAI Files handle is present;
+    the optional filename accompanies either.
     """
 
-    file_data: str = Field(min_length=1, max_length=_MAXIMUM_FILE_DATA_CHARACTERS)
+    file_data: str | None = Field(
+        default=None, min_length=1, max_length=_MAXIMUM_FILE_DATA_CHARACTERS
+    )
     filename: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
-    file_id: None = None
+    file_id: str | None = Field(default=None, min_length=1, max_length=_MAXIMUM_FILE_ID_CHARACTERS)
+
+    @model_validator(mode="after")
+    def _require_one_carrier(self) -> _ChatFile:
+        """Require exactly one of ``file_data`` or ``file_id``."""
+        if (self.file_data is None) == (self.file_id is None):
+            raise ValueError("file needs exactly one of file_data or file_id")
+        return self
 
 
 class _ChatFilePart(_WireModel):
@@ -154,9 +176,9 @@ class _ChatFilePart(_WireModel):
 class _ResponsesFilePart(_WireModel):
     """One Responses ``input_file`` content part.
 
-    Exactly one of inline ``file_data`` or a remote ``file_url`` is present;
-    ``file_id`` names an uploaded file this gateway does not host, so only
-    the null form of that field is accepted.
+    Exactly one of inline ``file_data``, a remote ``file_url``, or the
+    ``file_id`` of a file the caller already uploaded to OpenAI Files is
+    present.
     """
 
     type: Literal["input_file"]
@@ -165,13 +187,14 @@ class _ResponsesFilePart(_WireModel):
     )
     file_url: str | None = Field(default=None, min_length=1, max_length=8_192)
     filename: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
-    file_id: None = None
+    file_id: str | None = Field(default=None, min_length=1, max_length=_MAXIMUM_FILE_ID_CHARACTERS)
 
     @model_validator(mode="after")
     def _require_one_carrier(self) -> _ResponsesFilePart:
-        """Require exactly one of ``file_data`` or ``file_url``."""
-        if (self.file_data is None) == (self.file_url is None):
-            raise ValueError("input_file needs exactly one of file_data or file_url")
+        """Require exactly one of ``file_data``, ``file_url``, or ``file_id``."""
+        carriers = sum(value is not None for value in (self.file_data, self.file_url, self.file_id))
+        if carriers != 1:
+            raise ValueError("input_file needs exactly one of file_data, file_url, or file_id")
         return self
 
 
@@ -342,6 +365,35 @@ class _ChatStreamOptions(_WireModel):
     include_usage: bool = False
 
 
+class _ChatReasoning(_WireModel):
+    """Nested ``reasoning`` object on a Chat request (the Responses shape some
+    clients also send on /v1/chat/completions). Translated to the canonical flat
+    ``reasoning_effort``; only ``effort`` is accepted here."""
+
+    effort: ReasoningEffort | None = None
+
+
+class _ThinkingConfig(_WireModel):
+    """Anthropic-style ``thinking`` enable/disable config on a Chat request.
+
+    Translated to the canonical reasoning control: ``enabled`` turns thinking on
+    at the model's default effort, ``disabled`` maps to ``reasoning_effort=none``.
+    ``budget_tokens`` has no canonical equivalent and is disclosed as not carried.
+    """
+
+    type: Literal["enabled", "disabled"]
+    budget_tokens: int | None = Field(default=None, ge=0)
+
+
+class _ChatTemplateKwargs(_WireModel):
+    """vLLM/Hunyuan-native ``chat_template_kwargs`` on a Chat request.
+
+    Only ``enable_thinking`` is recognized and translated to the canonical
+    reasoning control; the field is never forwarded verbatim to any wire."""
+
+    enable_thinking: bool | None = None
+
+
 class _ChatRequest(_WireModel):
     """Closed gateway Chat Completions request profile."""
 
@@ -373,6 +425,25 @@ class _ChatRequest(_WireModel):
             )
         return value
 
+    store: bool | None = None
+    """Provider-side retention opt-out, accepted only at its no-op of false.
+
+    OpenAI agents hardcode ``store: false`` on every Chat request to refuse
+    retention; this gateway never retains Chat output, so false is already
+    satisfied and any other value (true, which would ask the gateway to retain
+    for distillation/evals) stays a named rejection.
+    """
+
+    @field_validator("store")
+    @classmethod
+    def _require_no_retention(cls, value: bool | None) -> bool | None:
+        """Accept retention only as already satisfied (the gateway retains nothing)."""
+        if value:
+            raise ValueError(
+                "supported only at false: this gateway does not retain Chat completions output"
+            )
+        return value
+
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
@@ -381,6 +452,9 @@ class _ChatRequest(_WireModel):
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
+    reasoning: _ChatReasoning | None = None
+    thinking: _ThinkingConfig | None = None
+    chat_template_kwargs: _ChatTemplateKwargs | None = None
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None

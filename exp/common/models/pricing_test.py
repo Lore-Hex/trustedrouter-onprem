@@ -280,6 +280,68 @@ def test_observed_cache_write_is_priced_without_double_counting() -> None:
     assert economics.cost_usd.provenance == "estimated"
 
 
+def test_cache_write_only_usage_reconciles_input_cost() -> None:
+    """Reconcile cache-write tokens accurately when cached input is none."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=4.0,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=2.0,
+        maximum_attempts=1,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+
+    economics = reconcile_completion_economics(
+        reservation,
+        OperationEconomics(
+            usage=Usage(
+                input_tokens=100,
+                output_tokens=10,
+                cached_input_tokens=None,
+                cache_write_input_tokens=40,
+            )
+        ),
+    )
+
+    assert economics.cost_usd is not None
+    # 60 tokens @ $1.0 + 40 tokens @ $2.0 + 10 @ $4.0 = 180 micro-USD = $0.00018
+    assert economics.cost_usd.value == pytest.approx(0.00018)
+    assert economics.cost_usd.provenance == "estimated"
+
+
+def test_cache_write_only_usage_uses_conservative_unknown_remainder_rate() -> None:
+    """Unknown remainder uses higher rate when cached rate exceeds ordinary input."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=4.0,
+        cached_input_usd_per_million_tokens=3.0,
+        cache_write_usd_per_million_tokens=2.0,
+        maximum_attempts=1,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+
+    economics = reconcile_completion_economics(
+        reservation,
+        OperationEconomics(
+            usage=Usage(
+                input_tokens=100,
+                output_tokens=10,
+                cached_input_tokens=None,
+                cache_write_input_tokens=40,
+            )
+        ),
+    )
+
+    assert economics.cost_usd is not None
+    # 60 tokens @ max($1, $3) + 40 @ $2 + 10 @ $4 = 180 + 80 + 40 = 300 micro-USD = $0.00030
+    assert economics.cost_usd.value == pytest.approx(0.00030)
+    assert economics.cost_usd.provenance == "estimated"
+
+
 def _model() -> ModelSnapshot:
     """Return one exact completion model snapshot."""
     return ModelSnapshot(

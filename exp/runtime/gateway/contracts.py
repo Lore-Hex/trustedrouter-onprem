@@ -12,6 +12,7 @@ from exp.common.models.content import (
     AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
+    MediaHandle,
     MessageContentPart,
     VideoContentPart,
     require_attachment_ceilings,
@@ -23,6 +24,24 @@ from exp.common.models.gateway_catalog import (
     FailoverMode,
 )
 from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.runtime.gateway.reasoning_blocks import (
+    EncryptedReasoningBlock as EncryptedReasoningBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import (
+    OpaqueReasoningContentBlock as OpaqueReasoningContentBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import (
+    ProviderReasoningBlock as ProviderReasoningBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import (
+    RedactedThinkingBlock as RedactedThinkingBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import (
+    SealedReasoningContentBlock as SealedReasoningContentBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import (
+    ThinkingBlock as ThinkingBlock,
+)
 
 GatewayAliasName = ArtifactId
 OrganizationId = ArtifactId
@@ -146,77 +165,6 @@ class GatewayNamedToolChoice(ContractModel):
     """A request to require one named caller-defined function."""
 
     name: str = Field(min_length=1, max_length=256)
-
-
-class ThinkingBlock(ContractModel):
-    """One verbatim Anthropic extended-thinking block from assistant history.
-
-    ``signature`` is an opaque cryptographic value the provider issued with
-    the block; it must round-trip byte-exact or the provider rejects the
-    replayed turn, so it is never normalized or re-encoded.
-    """
-
-    kind: Literal["thinking"] = "thinking"
-    text: str = ""
-    signature: str | None = None
-
-
-class RedactedThinkingBlock(ContractModel):
-    """One opaque Anthropic redacted-thinking block from assistant history."""
-
-    kind: Literal["redacted_thinking"] = "redacted_thinking"
-    data: str
-
-
-class EncryptedReasoningBlock(ContractModel):
-    """One opaque OpenAI Responses reasoning item replayed with the input.
-
-    ``encrypted_content`` is the provider-issued opaque payload a stateless
-    caller (``store: false``) replays so the model can resume its own prior
-    reasoning; it must reach the provider byte-exact.
-    """
-
-    kind: Literal["encrypted_reasoning"] = "encrypted_reasoning"
-    id: str = Field(min_length=1, max_length=256)
-    encrypted_content: str = Field(min_length=1)
-    output_index: int | None = Field(default=None, ge=0, exclude=True)
-    status: Literal["in_progress", "completed", "incomplete"] | None = Field(
-        default=None,
-        exclude=True,
-    )
-
-
-class OpaqueReasoningContentBlock(ContractModel):
-    """Authenticated Fireworks reasoning retained only inside the gateway.
-
-    The provider-issued text is never accepted directly from a caller. Public
-    decoding creates a sealed block, and admission replaces it with this
-    plaintext form only after authenticating the carrier against the exact
-    current deployment and credential authority.
-    """
-
-    kind: Literal["reasoning_content"] = "reasoning_content"
-    route_sha256: Sha256
-    content: str = Field(min_length=1, max_length=8 * 1024 * 1024)
-    carrier_size_bytes: int = Field(default=0, ge=0, exclude=True)
-
-
-class SealedReasoningContentBlock(ContractModel):
-    """One bounded, still-encrypted Fireworks continuation carrier."""
-
-    kind: Literal["sealed_reasoning_content"] = "sealed_reasoning_content"
-    carrier: str = Field(min_length=1)
-    deployment_hint: str = Field(min_length=1, max_length=256)
-
-
-ProviderReasoningBlock = Annotated[
-    ThinkingBlock
-    | RedactedThinkingBlock
-    | EncryptedReasoningBlock
-    | OpaqueReasoningContentBlock
-    | SealedReasoningContentBlock,
-    Field(discriminator="kind"),
-]
 
 
 class GatewayMessage(ContractModel):
@@ -397,10 +345,17 @@ class GatewayMessage(ContractModel):
             if (self.content or "") not in ("".join(texts), "\n\n".join(texts)):
                 raise ValueError("provider text blocks must flatten to the message content")
         if self.content_parts:
-            if self.role != "user":
-                raise ValueError("content parts are valid only for user messages")
+            # Tool messages carry attachments too: Anthropic tool_result blocks
+            # accept image sub-blocks (tool screenshots), and the block is baked
+            # into caller history, so the canonical model must be able to hold it.
+            if self.role not in ("user", "tool"):
+                raise ValueError("content parts are valid only for user and tool messages")
             if all(part.kind == "text" for part in self.content_parts):
                 raise ValueError("content parts are retained only for multimodal messages")
+            if self.role == "tool" and any(
+                part.kind not in ("text", "image") for part in self.content_parts
+            ):
+                raise ValueError("tool messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")
@@ -445,6 +400,8 @@ class GatewayRequest(ContractModel):
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
+    # Level-less enable-thinking; the route seam resolves the concrete effort.
+    thinking_default_enable: bool = False
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
     reasoning_summary_parameters: tuple[
         Literal["reasoning.generate_summary", "reasoning.summary"], ...
@@ -656,6 +613,17 @@ class GatewayRequest(ContractModel):
         """Return every document this request carries, in message and part order."""
         return tuple(part for message in self.messages for part in message.documents)
 
+    @property
+    def media_handles(self) -> tuple[MediaHandle, ...]:
+        """Return every provider media handle this request carries, in caller order."""
+        return tuple(
+            part.handle
+            for message in self.messages
+            for part in message.content_parts
+            if isinstance(part, (ImageContentPart, VideoContentPart, DocumentContentPart))
+            and part.handle is not None
+        )
+
     @field_validator("stop")
     @classmethod
     def _require_unique_stop_sequences(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -707,6 +675,11 @@ class GatewayRequest(ContractModel):
             raise ValueError("include_usage is valid only for streaming requests")
         parts = (part for message in self.messages for part in message.content_parts)
         require_attachment_ceilings(parts)
+        if len({handle.provider for handle in self.media_handles}) > 1:
+            raise ValueError(
+                "media handles in one request must all name the same provider; "
+                "no single route can resolve handles from two providers"
+            )
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_summary is valid only for Responses requests")
         if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:

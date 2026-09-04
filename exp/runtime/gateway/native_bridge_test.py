@@ -166,6 +166,48 @@ def test_pdf_capability_errors_explain_the_document_refusal(
 
 @pytest.mark.parametrize(
     ("surface", "param"),
+    [
+        (GatewayApiSurface.CHAT_COMPLETIONS, "messages"),
+        (GatewayApiSurface.RESPONSES, "input"),
+        (GatewayApiSurface.MESSAGES, "messages"),
+    ],
+)
+def test_media_handle_capability_errors_name_the_provider_holding_the_upload(
+    surface: GatewayApiSurface, param: str
+) -> None:
+    """A refused handle names the conversation field and, when known, the provider."""
+    undeclared = _public_capability_error(
+        ProviderCapabilityError(capability="media_handle_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    detail = (
+        "The request references media uploaded to openai, which only an openai route "
+        "can resolve, but the selected model alias routes to gemini."
+    )
+    mismatched = _public_capability_error(
+        ProviderCapabilityError(capability="media_handle_provider", detail=detail),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    generic = _public_capability_error(
+        ProviderCapabilityError(capability="media_handle_provider"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    assert (undeclared.detail.param, mismatched.detail.param) == (param, param)
+    assert undeclared.detail.code == mismatched.detail.code == "unsupported_capability"
+    assert "cannot reference media uploaded to a provider" in undeclared.detail.message
+    assert mismatched.detail.message == detail
+    assert "different provider than the selected model route" in generic.detail.message
+    assert "media_handle" not in undeclared.detail.message
+
+
+@pytest.mark.parametrize(
+    ("surface", "param"),
     [(GatewayApiSurface.CHAT_COMPLETIONS, "messages"), (GatewayApiSurface.RESPONSES, "input")],
 )
 def test_audio_capability_error_explains_the_refusal(
@@ -451,6 +493,144 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     rotated_messages = cast("list[JsonObject]", rotated_payload["messages"])
     assert after_rotation["route_reason"] == "direct"
     assert "reasoning_content" not in rotated_messages[1]
+
+
+def test_hunyuan_exposes_plaintext_reasoning_and_round_trips_only_as_carrier(
+    tmp_path: Path,
+) -> None:
+    """Hunyuan returns plaintext reasoning for display yet round-trips it sealed.
+
+    The rung is marked as an exposed-plaintext reasoning route on the wire (so
+    the data plane returns ``reasoning_content`` to the caller), while the
+    tool-loop round-trip token stays the domain-separated opaque carrier: a
+    second replica unseals the exact turn and forwards the plaintext upstream,
+    the Fireworks-only ``reasoning_history`` wire flag never appears, and a
+    tampered turn fails closed.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.hunyuan.cloud.tencent.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"},
+        )
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    # The rung declares plaintext exposure and a Hunyuan carrier route identity,
+    # and is not a Fireworks route.
+    assert initial["reasoning_output_exposed"] is True
+    assert initial["fireworks_reasoning_route_sha256"] is None
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    assert isinstance(route_sha256, str)
+
+    hidden = "let me reason about the tool call privately"
+    seal_argument = json.dumps(
+        {
+            "request_id": initial["request_id"],
+            "route_depth": initial["route_depth"],
+            "route_sha256": route_sha256,
+            "content": hidden,
+            "assistant_content": None,
+            "tool_calls": [{"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}],
+        }
+    )
+    sealed = json.loads(control.seal_reasoning_content(seal_argument))["carrier"]
+    # The carrier is opaque under the Hunyuan scheme and leaks neither the
+    # plaintext reasoning nor the provider credential.
+    assert sealed.startswith("x-trustedrouter-onprem-hunyuan-reasoning-v1:")
+    assert hidden not in sealed
+    assert "shared-hunyuan-secret" not in sealed
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_id": initial["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                    "tool_names": ["lookup"],
+                    "failure": None,
+                }
+            )
+        )
+        == "{}"
+    )
+
+    continuation_body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    replica = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"},
+        )
+    )
+    continued = _admit(replica, raw_key, continuation_body)
+    route = cast("list[JsonObject]", continued["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    # The sealed carrier unseals to the exact plaintext forwarded upstream on the
+    # assistant turn, and Hunyuan omits the Fireworks-only reasoning_history flag.
+    assert messages[1]["reasoning_content"] == hidden
+    assert "reasoning_history" not in payload
+
+    # A tampered tool turn fails closed at the carrier authority.
+    modified_turn = json.loads(continuation_body)
+    modified_turn["messages"][1]["tool_calls"][0]["function"]["arguments"] = '{"tampered":true}'
+    with pytest.raises(NativeBridgeError) as modified:
+        _admit(replica, raw_key, json.dumps(modified_turn))
+    assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+
+
+def test_hunyuan_endpoint_without_exposure_capability_strips_reasoning(
+    tmp_path: Path,
+) -> None:
+    """A Hunyuan-endpoint rung that does not declare exposure keeps reasoning stripped.
+
+    Exposure is gated on the explicit per-rung capability, not the base URL, so a
+    model added to the Tencent endpoint without ``reasoning_output_exposed`` fails
+    closed: the data plane still recognizes the carrier route (round-trips stay
+    sealed) but never surfaces plaintext ``reasoning_content`` to the caller.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.hunyuan.cloud.tencent.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"},
+        )
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    # No exposure capability -> plaintext stays stripped even on the Hunyuan URL,
+    # while the carrier route identity still resolves so replay stays sealed.
+    assert initial["reasoning_output_exposed"] is False
+    assert isinstance(initial["hunyuan_reasoning_route_sha256"], str)
+    assert initial["fireworks_reasoning_route_sha256"] is None
 
 
 def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: Path) -> None:
@@ -3076,6 +3256,37 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
             previous_response_id=response_id,
         )
     assert crossed.value.detail.code == "previous_response_not_found"
+
+
+def test_responses_output_less_turn_is_continuable(tmp_path: Path) -> None:
+    """A turn retained with no text, items, or calls continues as the input so far.
+
+    The data plane remembers an output-less turn (thinking exhausted the
+    budget, terminal ``incomplete``) with every retention field empty; the
+    control plane must retain the conversation rather than treat empty output
+    as nothing to remember, or the response id it already handed out dies
+    ``previous_response_not_found`` on the next turn.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    first = _admit_responses(control, raw_key, _responses_body())
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "text": "",
+                    "message_outputs": [],
+                    "refusal": False,
+                    "encrypted_reasoning": [],
+                    "tool_calls": [],
+                }
+            )
+        )
+        == "{}"
+    )
+    response_id = stable_public_id("resp", _admitted_request_id(first))
+    second = _admit_responses(control, raw_key, _responses_body(previous_response_id=response_id))
+    assert [message["role"] for message in _payload_messages(second)] == ["user", "user"]
 
 
 def test_fallback_served_alias_continuation_degrades_to_resend_not_503(tmp_path: Path) -> None:

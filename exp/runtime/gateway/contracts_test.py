@@ -835,6 +835,71 @@ def test_videos_join_semantic_identity_while_cache_markers_stay_out() -> None:
     assert first.videos == (first.messages[0].content_parts[0],)
 
 
+def test_media_handles_join_semantic_identity_and_never_mix_providers() -> None:
+    """A handle changes the canonical digest; two providers in one request refuse.
+
+    The digest must separate two handles to different uploads, separate a
+    handle from the same media inline, and ignore a cache marker placed on
+    a handle-carrying image. No route can serve handles from two providers,
+    so the request itself fails validation.
+    """
+    from exp.common.core.artifacts import sha256_json
+    from exp.common.models.content import ImageContentPart, MediaHandle, TextContentPart
+
+    def request(*parts: ImageContentPart) -> GatewayRequest:
+        """Build one Chat request carrying the given image parts before a text run."""
+        return GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content="what is this?",
+                    content_parts=(*parts, TextContentPart(text="what is this?")),
+                ),
+            ),
+        )
+
+    openai_a = MediaHandle(provider="openai", reference="file-a")
+    openai_b = MediaHandle(provider="openai", reference="file-b")
+    first = request(ImageContentPart(handle=openai_a))
+    second = request(ImageContentPart(handle=openai_b))
+    marked = request(ImageContentPart(handle=openai_a, cache_control={"type": "ephemeral"}))
+    owned = request(
+        ImageContentPart(
+            handle=MediaHandle(provider="bedrock", reference="s3://bkt/a.png"),
+            media_type="image/png",
+        )
+    )
+    unowned = request(
+        ImageContentPart(
+            handle=MediaHandle(
+                provider="bedrock", reference="s3://bkt/a.png", bucket_owner="123456789012"
+            ),
+            media_type="image/png",
+        )
+    )
+    dumped = first.model_dump(mode="json")
+    part = dumped["messages"][0]["content_parts"][0]
+    assert part["handle"] == {"provider": "openai", "reference": "file-a", "bucket_owner": None}
+    assert "cache_control" not in part
+    assert sha256_json(first) != sha256_json(second)
+    assert sha256_json(first) == sha256_json(marked)
+    assert sha256_json(owned) != sha256_json(unowned)
+    assert first.media_handles == (openai_a,)
+    assert request(
+        ImageContentPart(handle=openai_a), ImageContentPart(handle=openai_b)
+    ).media_handles == (
+        openai_a,
+        openai_b,
+    )
+
+    with pytest.raises(ValidationError, match="same provider"):
+        request(
+            ImageContentPart(handle=openai_a),
+            ImageContentPart(handle=MediaHandle(provider="anthropic", reference="file_a")),
+        )
+
+
 def test_audio_joins_semantic_identity_while_cache_markers_stay_out() -> None:
     """Audio parts change the canonical digest; cache-only markers never do."""
     from exp.common.core.artifacts import sha256_json
@@ -905,4 +970,42 @@ def test_service_tier_is_serialization_inert_but_binds_replay_identity() -> None
             surface=GatewayApiSurface.MESSAGES,
             messages=messages,
             service_tier="flex",
+        )
+
+
+def test_tool_messages_carry_text_and_image_parts_only() -> None:
+    """A tool screenshot rides the tool message; other media kinds stay out."""
+    from exp.common.models.content import (
+        DocumentContentPart,
+        ImageContentPart,
+        TextContentPart,
+    )
+
+    message = GatewayMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="tool said:",
+        content_parts=(
+            TextContentPart(text="tool said:"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+        ),
+    )
+    assert [part.kind for part in message.content_parts] == ["text", "image"]
+    assert message.images
+
+    with pytest.raises(ValidationError, match="text and image parts"):
+        GatewayMessage(
+            role="tool",
+            tool_call_id="call-1",
+            content="",
+            content_parts=(DocumentContentPart(media_type="application/pdf", data="aGk="),),
+        )
+    with pytest.raises(ValidationError, match="valid only for user and tool"):
+        GatewayMessage(
+            role="assistant",
+            content="hi",
+            content_parts=(
+                TextContentPart(text="hi"),
+                ImageContentPart(media_type="image/png", data="aGk="),
+            ),
         )

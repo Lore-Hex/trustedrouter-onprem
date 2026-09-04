@@ -13,15 +13,6 @@ from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models.content import (
-    DocumentContentPart,
-    MessageContentPart,
-    TextContentPart,
-    audio_part_from_input_audio,
-    document_part_from_file_data,
-    image_part_from_url,
-    video_part_from_url,
-)
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
@@ -41,10 +32,12 @@ from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.reasoning_carrier import (
     FIREWORKS_REASONING_CONTENT_PREFIX,
     parse_reasoning_content_carrier,
+    scheme_for_carrier,
 )
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
 )
+from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
@@ -52,6 +45,7 @@ from exp.runtime.openai_protocol.manifest import (
     RESPONSES_MANIFEST,
     disposition_map,
 )
+from exp.runtime.openai_protocol.media_parts import message_content
 from exp.runtime.openai_protocol.responses_input import (
     ReplayedFunctionCall,
     ReplayedFunctionOutput,
@@ -69,13 +63,8 @@ from exp.runtime.openai_protocol.structured_text import (
 from exp.runtime.openai_protocol.wire_models import (
     _AdditionalToolsItem,
     _AssistantToolCall,
-    _ChatAudioPart,
-    _ChatFilePart,
-    _ChatImagePart,
     _ChatRequest,
     _ChatTool,
-    _ChatVideoPart,
-    _ContentPart,
     _CustomToolCall,
     _CustomToolCallOutput,
     _EmbeddingsRequest,
@@ -84,11 +73,9 @@ from exp.runtime.openai_protocol.wire_models import (
     _ResponseFunctionCall,
     _ResponseMessage,
     _ResponseReasoningItem,
-    _ResponsesFilePart,
     _ResponsesInputItem,
     _ResponsesRequest,
     _ResponseTool,
-    _TextPart,
 )
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
@@ -180,6 +167,12 @@ def decode_chat(
         if isinstance(request.stop, str)
         else request.stop
     )
+    thinking = translate_enable_thinking(request)
+    json_object_disclosure = (
+        (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
+        if request.response_format is not None and request.response_format.type == "json_object"
+        else ()
+    )
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -188,12 +181,7 @@ def decode_chat(
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
-            ignored_parameters=(
-                (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
-                if request.response_format is not None
-                and request.response_format.type == "json_object"
-                else ()
-            ),
+            ignored_parameters=(*json_object_disclosure, *thinking.disclosures),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -210,7 +198,8 @@ def decode_chat(
             presence_penalty=request.presence_penalty,
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
-            reasoning_effort=request.reasoning_effort,
+            reasoning_effort=thinking.reasoning_effort,
+            thinking_default_enable=thinking.thinking_default_enable,
             stream=request.stream,
             include_usage=(
                 request.stream_options is not None and request.stream_options.include_usage
@@ -660,12 +649,20 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
         )
         provider_reasoning: tuple[SealedReasoningContentBlock, ...] = ()
         if message.reasoning_content is not None:
+            # The scheme is fixed by the carrier's own opaque prefix; raw client
+            # text (no known prefix) matches none and is rejected here. Each
+            # provider's carrier only parses under its own scheme.
+            scheme = scheme_for_carrier(message.reasoning_content)
             try:
-                provider_reasoning = (parse_reasoning_content_carrier(message.reasoning_content),)
+                if scheme is None:
+                    raise ValueError("reasoning_content is not a gateway-issued carrier")
+                provider_reasoning = (
+                    parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
+                )
             except ValueError as exc:
                 param = f"{prefix}.{message_index}.reasoning_content"
                 raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
-        content, content_parts = _message_content(
+        content, content_parts = message_content(
             message.content, f"{prefix}.{message_index}.content"
         )
         converted.append(
@@ -679,117 +676,6 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             )
         )
     return tuple(converted)
-
-
-def _message_content(
-    content: str | tuple[_ContentPart, ...] | None,
-    param: str,
-) -> tuple[str | None, tuple[MessageContentPart, ...]]:
-    """Flatten wire content parts, retaining attachments in the caller's order.
-
-    Args:
-        content: Wire content: plain text, ordered parts, or absent.
-        param: Public parameter path used to report an invalid attachment.
-
-    Returns:
-        The flattened text and, only for a message that carries an image,
-        a video, audio, or a document, the ordered canonical parts. A text-only
-        message keeps its previous representation exactly, so nothing
-        downstream changes for it.
-
-    Raises:
-        OpenAIProtocolError: An image or video reference is not a supported
-            URL or base64 data URL, an audio part is not base64 WAV or MP3,
-            or a file is not an inline PDF.
-    """
-    if content is None or isinstance(content, str):
-        return content, ()
-    parts: list[MessageContentPart] = []
-    for index, part in enumerate(content):
-        if isinstance(part, _TextPart):
-            # An empty text part carries no content and contributes nothing to
-            # the flattened text, while Anthropic and Gemini reject an empty
-            # block outright. Real clients emit one beside an attachment
-            # (OpenCode 1.18.26, captured live 2026-09-02), so it is dropped
-            # here rather than failing a turn that does carry an image.
-            if part.text:
-                parts.append(TextContentPart(text=part.text))
-            continue
-        if isinstance(part, _ChatVideoPart):
-            try:
-                parts.append(video_part_from_url(part.video_url.url))
-            except ValueError as exc:
-                location = f"{param}.{index}.video_url"
-                raise invalid_field(
-                    location,
-                    f"'{location}' must be an http(s) URL or a base64 data URL "
-                    "of an MP4, MPEG, QuickTime, WebM, FLV, 3GPP, or WMV video.",
-                ) from exc
-            continue
-        if isinstance(part, _ChatAudioPart):
-            audio = part.input_audio
-            try:
-                parts.append(audio_part_from_input_audio(audio.data, audio.format))
-            except ValueError as exc:
-                location = f"{param}.{index}.input_audio"
-                hint = f"'{location}' must carry base64 audio data with format 'wav' or 'mp3'."
-                raise invalid_field(location, hint) from exc
-            continue
-        if isinstance(part, (_ChatFilePart, _ResponsesFilePart)):
-            parts.append(_document_part(part, f"{param}.{index}"))
-            continue
-        url, detail = (
-            (part.image_url.url, part.image_url.detail)
-            if isinstance(part, _ChatImagePart)
-            else (part.image_url, part.detail)
-        )
-        try:
-            parts.append(image_part_from_url(url, detail=detail))
-        except ValueError as exc:
-            location = f"{param}.{index}.image_url"
-            raise invalid_field(
-                location,
-                f"'{location}' must be an http(s) URL or a base64 data URL "
-                "of a PNG, JPEG, GIF, or WebP image.",
-            ) from exc
-    text = "".join(part.text for part in parts if part.kind == "text")
-    if all(part.kind == "text" for part in parts):
-        return text, ()
-    return text, tuple(parts)
-
-
-def _document_part(part: _ChatFilePart | _ResponsesFilePart, param: str) -> DocumentContentPart:
-    """Convert one ``file`` or ``input_file`` part into the canonical document.
-
-    Args:
-        part: Validated caller file part.
-        param: Public parameter path of the part, used to report an invalid file.
-
-    Returns:
-        The canonical document part carrying the caller's bytes or URL.
-
-    Raises:
-        OpenAIProtocolError: The file data is not an inline PDF.
-    """
-    if isinstance(part, _ChatFilePart):
-        file_data, filename, location = part.file.file_data, part.file.filename, f"{param}.file"
-    elif part.file_data is None:
-        try:
-            return DocumentContentPart(url=part.file_url, name=part.filename or None)
-        except ValueError as exc:
-            raise invalid_field(
-                f"{param}.file_url", f"'{param}.file_url' must be an http(s) URL."
-            ) from exc
-    else:
-        file_data, filename, location = part.file_data, part.filename, param
-    try:
-        return document_part_from_file_data(file_data, name=filename)
-    except ValueError as exc:
-        raise invalid_field(
-            f"{location}.file_data",
-            f"'{location}.file_data' must be the base64 bytes of a PDF, bare or as a "
-            "data:application/pdf;base64 URL, within the size limit.",
-        ) from exc
 
 
 def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:

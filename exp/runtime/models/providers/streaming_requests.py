@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
+    GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
 )
@@ -50,6 +51,47 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
+
+TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeholder"
+"""Disclosure recorded when tool-result images degrade to placeholder text.
+
+A tool screenshot is baked into the caller's conversation history: rejecting
+it wedges every later turn of a multi-turn session, which is strictly worse
+than a disclosed degrade. Top-level user images keep the fail-closed contract
+because the caller can re-send those differently.
+"""
+
+TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: this model route cannot carry tool-result images]"
+"""Text substituted for each dropped tool-result image, in block position."""
+
+
+def strip_tool_result_images(
+    messages: tuple[GatewayMessage, ...],
+) -> tuple[GatewayMessage, ...] | None:
+    """Replace tool-message image parts with positional placeholder text.
+
+    Args:
+        messages: The request's canonical messages.
+
+    Returns:
+        The degraded messages, or ``None`` when no tool message carries an
+        image (nothing to strip).
+    """
+    if not any(message.role == "tool" and message.images for message in messages):
+        return None
+    out: list[GatewayMessage] = []
+    for message in messages:
+        if message.role != "tool" or not message.images:
+            out.append(message)
+            continue
+        content = "".join(
+            part.text if part.kind == "text" else TOOL_RESULT_IMAGE_PLACEHOLDER
+            for part in message.content_parts
+        )
+        out.append(message.model_copy(update={"content": content, "content_parts": ()}))
+    return tuple(out)
+
+
 GATEWAY_GENERATION_PARAMETER_CONTRACT_VERSION = 2
 """Version of the route admission and provider wire-translation contract."""
 
@@ -203,6 +245,7 @@ def dialect_stream_payload(
             reasoning_effort=required_reasoning_effort,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
             fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
+            hunyuan_reasoning_route_sha256=profile.hunyuan_reasoning_route_sha256,
             forwards_service_tier=profile.billing_customer_managed,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")
@@ -389,6 +432,34 @@ def route_generation_parameter_requests(
         penalty_honored(profile, presence=True) for profile in profiles
     ):
         ignore("presence_penalty", "presence_penalty->dropped(unsupported_by_provider)")
+    if request.thinking_default_enable and request.reasoning_effort is None:
+        # A level-less "enable thinking" (from a translated thinking:{enabled} or
+        # chat_template_kwargs:{enable_thinking:true}) resolves to the model's own
+        # default effort here, at the serving route: a route-wide required default
+        # when portable, else the LOWEST portable non-none tier (default-not-high
+        # avoids surprising cost). A route that supports no reasoning effort cannot
+        # enable thinking, so it surfaces rather than silently not thinking.
+        portable = set(REASONING_EFFORTS)
+        for profile in profiles:
+            portable.intersection_update(_profile_reasoning_efforts(profile))
+        portable_non_none = tuple(e for e in REASONING_EFFORTS if e in portable and e != "none")
+        if not portable_non_none:
+            raise ProviderParameterError(
+                message=(
+                    "This model route cannot enable thinking: it supports no reasoning "
+                    "effort. Remove the enable-thinking field or choose a reasoning model."
+                ),
+                param=effort_path,
+                code="unsupported_parameter",
+            )
+        required_defaults = {
+            profile.reasoning_effort
+            for profile in profiles
+            if profile.reasoning_effort_required and profile.reasoning_effort in portable_non_none
+        }
+        provider_updates["reasoning_effort"] = (
+            next(iter(required_defaults)) if len(required_defaults) == 1 else portable_non_none[0]
+        )
     if request.reasoning_effort is not None:
         portable_efforts = set(REASONING_EFFORTS)
         for profile in profiles:
@@ -471,6 +542,22 @@ def route_generation_parameter_requests(
             param=path,
             code="unsupported_parameter",
         )
+
+    # Only the Anthropic wire defines an image carrier inside a tool result.
+    # A route with any other dialect degrades tool-result images to positional
+    # placeholder text with disclosure instead of rejecting: the block is baked
+    # into the caller's history, so a rejection wedges the whole session, and a
+    # silent drop at encoding would misstate what the model saw. All-Anthropic
+    # routes keep the images; a non-vision rung then rejects at preflight and
+    # the route-wide coercion applies the same disclosed degrade.
+    if any(message.role == "tool" and message.images for message in request.messages) and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        stripped = strip_tool_result_images(request.messages)
+        if stripped is not None:
+            provider_updates["messages"] = stripped
+            if TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in ignored:
+                ignored.append(TOOL_RESULT_IMAGE_DROP_DISCLOSURE)
 
     if any(message.tool_is_error for message in request.messages) and not all(
         profile.dialect == "anthropic_messages" for profile in profiles

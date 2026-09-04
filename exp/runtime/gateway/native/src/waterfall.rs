@@ -68,6 +68,17 @@ pub struct DeploymentWire {
     pub upstream_body: Option<String>,
     #[serde(default)]
     pub fireworks_reasoning_route_sha256: Option<String>,
+    /// Tencent Hunyuan preserved-thinking route identity; like the Fireworks
+    /// field it turns on provider reasoning-content capture and stamps each
+    /// delta with this exact route, but seals under the Hunyuan carrier scheme.
+    #[serde(default)]
+    pub hunyuan_reasoning_route_sha256: Option<String>,
+    /// When true, this rung returns the model's plaintext `reasoning_content`
+    /// to the caller for display (Tencent/DeepSeek think mode). The sealed
+    /// round-trip carrier is emitted independently; elsewhere reasoning stays
+    /// stripped. Defaults false so every other provider is unchanged.
+    #[serde(default)]
+    pub reasoning_output_exposed: bool,
     pub idempotency_key: String,
     /// Deployment override for the flat first-byte allowance; the serving
     /// configuration's default applies when absent.
@@ -114,6 +125,14 @@ pub struct WaterfallContext<'a> {
     /// divided by four. An allowance heuristic only, never a billing
     /// quantity.
     pub approximate_input_tokens: f64,
+    /// The bridge `remember` argument retaining an output-less turn: a
+    /// successful terminal reached before any semantic output still answers
+    /// the caller with a response id, and a response id the caller received
+    /// must stay continuable (api.openai.com persists `incomplete` responses
+    /// too). Only the Responses route carries one; it runs ahead of the
+    /// attempt's settlement so the control plane can still resolve the
+    /// request's continuation context.
+    pub output_less_retention: Option<String>,
 }
 
 /// The effective first-byte allowance for one attempt: the deployment's (or
@@ -247,6 +266,9 @@ enum AttemptEnd {
     },
     /// Accounting failed mid-attempt; the request is answered internal.
     Accounting,
+    /// The attempt settled, but retaining its output-less continuation
+    /// failed; the public retention error answers the caller.
+    Retention(PublicError),
 }
 
 /// Run one certified waterfall to its committed or terminal attempt.
@@ -342,6 +364,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             AttemptEnd::Committed(committed) => return Won::Committed(committed),
             AttemptEnd::Settled(settled) => return Won::Settled(settled),
             AttemptEnd::Accounting => return Won::Failed(PublicError::internal()),
+            AttemptEnd::Retention(error) => return Won::Failed(error),
             AttemptEnd::Ladder {
                 failure,
                 refusal_eligible,
@@ -510,7 +533,11 @@ async fn run_attempt(
         }
     };
     guard.mark_opened();
-    let mut relay = match wire.fireworks_reasoning_route_sha256.clone() {
+    let mut relay = match wire
+        .fireworks_reasoning_route_sha256
+        .clone()
+        .or_else(|| wire.hunyuan_reasoning_route_sha256.clone())
+    {
         Some(route_sha256) => UpstreamRelay::new_with_reasoning_content_route(
             response,
             dialect,
@@ -642,9 +669,15 @@ async fn run_attempt(
                         opened: true,
                     };
                 }
-                // A successful terminal with no semantic output: settle, then
-                // answer with the tracked usage ahead of the terminal so the
-                // encoders keep the client-visible token accounting.
+                // A successful terminal with no semantic output: retain the
+                // output-less continuation while the attempt is still in
+                // flight, settle, then answer with the tracked usage ahead of
+                // the terminal so the encoders keep the client-visible token
+                // accounting.
+                let retention_failure = match &ctx.output_less_retention {
+                    Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
+                    None => None,
+                };
                 let outcome = if matches!(event, Event::Incomplete) {
                     "incomplete"
                 } else {
@@ -655,6 +688,12 @@ async fn run_attempt(
                     .await
                 {
                     return AttemptEnd::Accounting;
+                }
+                if let Some(error) = retention_failure {
+                    // The provider outcome settled above, exactly like a
+                    // committed attempt's retention failure; only the HTTP
+                    // result reports it.
+                    return AttemptEnd::Retention(error);
                 }
                 let mut events = Vec::with_capacity(2);
                 if let Some(tracked) = usage {
@@ -682,6 +721,8 @@ mod tests {
             upstream_payload: Value::Null,
             upstream_body: None,
             fireworks_reasoning_route_sha256: None,
+            hunyuan_reasoning_route_sha256: None,
+            reasoning_output_exposed: false,
             idempotency_key: "op".to_string(),
             time_to_first_byte_base_seconds: base,
             time_to_first_byte_seconds_per_million_input_tokens: slope,
