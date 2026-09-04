@@ -9,6 +9,7 @@ from exp.common.models.content import (
     AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
+    MediaHandle,
     TextContentPart,
     VideoContentPart,
 )
@@ -3227,6 +3228,34 @@ def test_anthropic_payload_carries_document_blocks_in_caller_order() -> None:
         },
         {"type": "text", "text": " compare"},
     ]
+
+
+def test_anthropic_files_handles_add_the_files_api_beta_header() -> None:
+    """A request carrying an Anthropic Files handle dispatches with the beta token."""
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_FILES_API_BETA,
+        anthropic_request_headers,
+    )
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="describe",
+                content_parts=(
+                    ImageContentPart(handle=MediaHandle(provider="anthropic", reference="file_a")),
+                    TextContentPart(text="describe"),
+                ),
+            ),
+        ),
+    )
+    headers = anthropic_request_headers({"x-api-key": "k"}, request)
+    assert headers["anthropic-beta"] == ANTHROPIC_FILES_API_BETA
+    merged = anthropic_request_headers(
+        {"x-api-key": "k", "anthropic-beta": ANTHROPIC_FILES_API_BETA}, request
+    )
+    assert merged["anthropic-beta"] == ANTHROPIC_FILES_API_BETA
 
 
 _WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA="

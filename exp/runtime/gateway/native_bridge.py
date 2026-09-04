@@ -501,6 +501,7 @@ class NativeControlPlane(
                     deployment.gateway.capabilities,
                     model_capabilities=deployment.capabilities,
                     public_stream=public_request.stream,
+                    route_provider=deployment.provider,
                 )
                 upstream_payload = dialect_stream_payload(profile, provider_request)
                 upstream_body, dispatch_signer = frozen_dispatch(profile, client, upstream_payload)

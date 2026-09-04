@@ -62,6 +62,7 @@ _PDF_URL_INPUT_OPTION = typer.Option(
 )
 
 _VIDEO_INPUT_OPTION = typer.Option(False, "--supports-video-input")
+_MEDIA_HANDLE_INPUT_OPTION = typer.Option(False, "--supports-media-handle-input")
 _VIDEO_URL_INPUT_OPTION = typer.Option(
     None,
     "--supports-video-url-input/--no-supports-video-url-input",
@@ -84,6 +85,16 @@ video input, so a route on those providers must not claim it."""
 
 VIDEO_URL_PROVIDERS = frozenset({"gemini", "openai-compatible", "openrouter", "vertex"})
 """Video providers whose wire fetches a caller video URL on the gateway's behalf."""
+
+MEDIA_HANDLE_PROVIDERS = frozenset({"anthropic", "bedrock", "gemini", "openai", "vertex"})
+"""Providers whose inference wire resolves a handle to media uploaded to that provider.
+
+OpenAI (``file_id`` on Chat ``file`` and Responses ``input_image`` /
+``input_file``), Anthropic (``file`` source), Gemini (Files API URI), Vertex
+(``gs://`` object), and Bedrock (``s3Location``). Azure OpenAI file ids live in
+a separate namespace that a bare ``file_id`` cannot name, and the
+OpenAI-compatible Chat wire (OpenRouter, Fireworks) defines no uploaded-media
+reference, so a route on those providers must not claim handle input."""
 
 AUDIO_PROVIDERS = frozenset({"azure", "gemini", "openai-compatible", "openrouter", "vertex"})
 """Providers whose wire defines a caller audio carrier some model serves.
@@ -181,6 +192,42 @@ def _declared_video_input(
     return True, supports_video_url_input
 
 
+def _declared_media_handle_input(
+    *,
+    provider: str,
+    supports_media_handle_input: bool,
+    supports_image_input: bool,
+    supports_video_input: bool,
+    supports_pdf_input: bool,
+) -> bool:
+    """Resolve the route's uploaded-media handle declaration.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        supports_media_handle_input: Explicit operator declaration.
+        supports_image_input: Whether the route carries image content.
+        supports_video_input: Whether the route carries video content.
+        supports_pdf_input: Whether the route carries PDF documents.
+
+    Returns:
+        Whether the route may forward a caller's provider media handle.
+
+    Raises:
+        ValueError: Handle input is claimed without any media input, or on a
+            provider whose wire resolves no uploaded-media reference.
+    """
+    if not supports_media_handle_input:
+        return False
+    if not (supports_image_input or supports_video_input or supports_pdf_input):
+        raise ValueError(
+            "--supports-media-handle-input requires --supports-image-input, "
+            "--supports-video-input, or --supports-pdf-input"
+        )
+    if provider not in MEDIA_HANDLE_PROVIDERS:
+        raise ValueError(f"provider {provider!r} resolves no uploaded-media handle")
+    return True
+
+
 def _declared_audio_input(
     *,
     provider: str,
@@ -273,6 +320,7 @@ def alias_create(
     supports_audio_input: bool = _AUDIO_INPUT_OPTION,
     supports_pdf_input: bool = _PDF_INPUT_OPTION,
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
+    supports_media_handle_input: bool = _MEDIA_HANDLE_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
     input_price: int | None = typer.Option(None, "--input-price", min=0),
     cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
@@ -309,6 +357,7 @@ def alias_create(
             supports_audio_input=supports_audio_input,
             supports_pdf_input=supports_pdf_input,
             supports_pdf_url_input=supports_pdf_url_input,
+            supports_media_handle_input=supports_media_handle_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
                 input_micro_usd_per_million_tokens=input_price,
@@ -366,6 +415,7 @@ def alias_update(
     supports_audio_input: bool = _AUDIO_INPUT_OPTION,
     supports_pdf_input: bool = _PDF_INPUT_OPTION,
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
+    supports_media_handle_input: bool = _MEDIA_HANDLE_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
     input_price: int | None = typer.Option(None, "--input-price", min=0),
     cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
@@ -402,6 +452,7 @@ def alias_update(
             supports_audio_input=supports_audio_input,
             supports_pdf_input=supports_pdf_input,
             supports_pdf_url_input=supports_pdf_url_input,
+            supports_media_handle_input=supports_media_handle_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
                 input_micro_usd_per_million_tokens=input_price,
@@ -482,6 +533,7 @@ def _activate(
     supports_audio_input: bool,
     supports_pdf_input: bool,
     supports_pdf_url_input: bool | None,
+    supports_media_handle_input: bool,
     maximum_output_tokens: int | None,
     prices: GatewayTokenPrices,
     pricing_source: str | None,
@@ -564,6 +616,13 @@ def _activate(
                     provider_model=provider_model,
                     supports_pdf_input=supports_pdf_input,
                     supports_pdf_url_input=supports_pdf_url_input,
+                ),
+                supports_media_handle_input=_declared_media_handle_input(
+                    provider=provider,
+                    supports_media_handle_input=supports_media_handle_input,
+                    supports_image_input=supports_image_input,
+                    supports_video_input=declared_video_input,
+                    supports_pdf_input=supports_pdf_input,
                 ),
             ),
             prices=prices,

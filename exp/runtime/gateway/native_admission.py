@@ -208,7 +208,10 @@ def route_rejection(
     carry the picture: the caller inlines the bytes. Reporting the text-only
     rung's refusal would tell them to drop the image instead. The URL
     rejection therefore wins whenever some rung raised it; otherwise the
-    first rung's own rejection stays the answer.
+    first rung's own rejection stays the answer. A provider-scoped media
+    handle is the same story one step further: the rejection that names the
+    provider holding the upload beats a rung that merely declares no handle
+    support, since only the named provider can ever resolve the handle.
 
     Args:
         errors: One rejection per declined deployment, in route order.
@@ -216,9 +219,10 @@ def route_rejection(
     Returns:
         The rejection to surface to the caller.
     """
-    for error in errors:
-        if isinstance(error, ProviderCapabilityError) and error.capability == "image_url_input":
-            return error
+    for preferred in ("media_handle_provider", "image_url_input"):
+        for error in errors:
+            if isinstance(error, ProviderCapabilityError) and error.capability == preferred:
+                return error
     return errors[0]
 
 
@@ -361,6 +365,7 @@ def protocol_compatible_indexes(
                 deployment.gateway.capabilities,
                 model_capabilities=deployment.capabilities,
                 public_stream=public_stream,
+                route_provider=deployment.provider,
             )
             dialect_stream_payload(profile, provider_request)
         except (ProviderParameterError, ProviderCapabilityError) as exc:
