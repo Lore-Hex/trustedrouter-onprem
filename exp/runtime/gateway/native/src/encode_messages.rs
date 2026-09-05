@@ -303,6 +303,7 @@ impl MessagesSseEncoder {
                 index,
                 call_id,
                 name,
+                ..
             } => self.tool_started(*index, call_id, name),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments_delta(*index, delta),
             Event::ToolCallCompleted { index, call } => {
@@ -373,6 +374,16 @@ impl MessagesSseEncoder {
                 Ok(self.advance())
             }
             Event::ServerToolResult { block, .. } => self.server_tool_result(block),
+            // Hosted tool items enter only through Responses-native tool
+            // declarations, which never admit on the Messages surface.
+            Event::HostedToolItemStarted { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. } => Err(invalid_provider_stream(
+                "Messages cannot represent a provider-hosted Responses tool item.",
+            )),
+            // OpenAI text annotations have no Messages representation; the
+            // text itself streams through its delta events.
+            Event::ProviderTextAnnotation { .. } => Ok(Vec::new()),
             Event::Usage(usage) => {
                 if usage.has_token_counts() {
                     self.usage = Some(usage.clone());

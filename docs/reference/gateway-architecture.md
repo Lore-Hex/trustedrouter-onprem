@@ -173,7 +173,23 @@ declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_sear
 `tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native
 Responses route; echoed message items accept `id`/`phase` with `status`
 optional (non-assistant identity drops); and freeform custom tool calls stream end to end with
-their native event names, including continuation retention.
+their native event names, including continuation retention. The item-level `namespace` on
+`function_call` (plus the `name`/`namespace` pair on `function_call_output` and the
+`custom_tool_call` namespace) round-trips verbatim through decode, the client stream, and
+continuation retention: the provider rejects a namespaced call replayed without it, so the
+field joins replay identity when present and absent items keep their exact pre-existing shape.
+The SDK 3.0 programmatic tool-calling `caller` object on `function_call`,
+`function_call_output`, and `custom_tool_call` gets the same verbatim round trip (validated only
+as an object; its internal shape is the provider's). `function_call_output.output` accepts the
+SDK list form: text and image parts map onto the canonical tool message and re-emit typed, an
+all-text list keeps the plain-string wire shape, and any other part kind is a named 400. A
+reasoning input item without `encrypted_content` (a `store: true` replay by item id) carries
+verbatim to homogeneous native Responses routes and the provider judges resolvability. Off the
+native Responses wire, tool-call and tool-result attribution (`namespace`/`caller`/output
+`name`) drops with per-field disclosure. The call itself always survives, and a
+Messages-surface effort the route cannot serve rejects as `output_config.effort` with
+"effort parameter … not supported" phrasing, the exact predicate Claude Code's built-in
+drop-and-retry recovery latches on.
 
 Provider client-errors stay sanitized: no provider error prose or body content ever reaches the
 caller. The one provider-derived fact a 4xx rejection may relay is the parameter path the provider
@@ -301,6 +317,19 @@ and usage, `message_stop`, or one terminal `error` event); the non-streaming bod
 Anthropic message object. Completed streams stop with `end_turn` (`tool_use` when tool calls are
 present) and token-limited streams with `max_tokens`. The Anthropic protocol defines no
 idempotency header, so this surface never joins the keyed replay stores.
+
+Exposure-gated reasoning rungs (Tencent Hunyuan and DeepSeek, rows the catalog stamps
+`reasoning_output_exposed`) return the model's plaintext `reasoning_content` on every non-tool
+Chat turn, and the caller may echo that text back verbatim on later assistant turns: the
+decoder carries it as an `exposed_reasoning_content` block, route narrowing forwards it only to
+rungs that expose their reasoning (a route with no exposing rung rejects it by name as
+`messages.reasoning_content`; a mixed waterfall prefers the exposing rung and discloses the drop
+on the others), and the payload builder writes it back onto the wire unchanged. The provider's
+own API accepts and does not validate that text, so it is ordinary caller-owned history, exactly
+like a prior assistant `content`. A TOOL turn's reasoning still round-trips only as the sealed,
+rung-pinned carrier (`x-trustedrouter-onprem-hunyuan-reasoning-v1:`), which the same decoder recognizes
+by prefix. This is what lets a Terminus-style loop (commands parsed from assistant text, output
+fed back as user messages) and Harbor's interleaved-thinking replay both preserve thinking.
 
 Route admission preserves caller capabilities in three verbatim-preference layers before any
 coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`), generation

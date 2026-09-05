@@ -77,6 +77,7 @@ impl ReasoningCarrierState {
                 index,
                 call_id,
                 name,
+                ..
             } => {
                 if self.tool_ids.contains_key(index)
                     || self
@@ -295,10 +296,21 @@ impl ChatSseEncoder {
             | Event::ServerToolResult { .. } => Err(invalid_provider_stream(
                 "Chat cannot represent a provider server tool.",
             )),
+            // Hosted tool items enter only through Responses-native tool
+            // declarations, which never admit on the Chat surface.
+            Event::HostedToolItemStarted { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. } => Err(invalid_provider_stream(
+                "Chat cannot represent a provider-hosted Responses tool item.",
+            )),
+            // OpenAI text annotations have no Chat representation; the text
+            // itself streams through its delta events.
+            Event::ProviderTextAnnotation { .. } => Ok(Vec::new()),
             Event::ToolCallStarted {
                 index,
                 call_id,
                 name,
+                ..
             } => {
                 if self.tool_indices.contains_key(index) {
                     return Err(invalid_provider_stream(
@@ -699,6 +711,8 @@ mod tests {
                 delta: "hidden provider reasoning".to_string(),
             },
             Event::ToolCallStarted {
+                namespace: None,
+                caller: None,
                 index: 0,
                 call_id: "call-one".to_string(),
                 name: "lookup".to_string(),
@@ -710,6 +724,8 @@ mod tests {
             Event::ToolCallCompleted {
                 index: 0,
                 call: crate::events::CompletedToolCall {
+                    namespace: None,
+                    caller: None,
                     call_id: "call-one".to_string(),
                     name: "lookup".to_string(),
                     raw_arguments: "{}".to_string(),
@@ -788,11 +804,15 @@ mod tests {
                 delta: "hidden".to_string(),
             },
             Event::ToolCallStarted {
+                namespace: None,
+                caller: None,
                 index: 1,
                 call_id: "call-one".to_string(),
                 name: "first".to_string(),
             },
             Event::ToolCallStarted {
+                namespace: None,
+                caller: None,
                 index: 0,
                 call_id: "call-zero".to_string(),
                 name: "second".to_string(),
@@ -800,6 +820,8 @@ mod tests {
             Event::ToolCallCompleted {
                 index: 0,
                 call: crate::events::CompletedToolCall {
+                    namespace: None,
+                    caller: None,
                     call_id: "call-zero".to_string(),
                     name: "second".to_string(),
                     raw_arguments: "{\"order\":0}".to_string(),
@@ -811,6 +833,8 @@ mod tests {
             Event::ToolCallCompleted {
                 index: 1,
                 call: crate::events::CompletedToolCall {
+                    namespace: None,
+                    caller: None,
                     call_id: "call-one".to_string(),
                     name: "first".to_string(),
                     raw_arguments: "{\"order\":1}".to_string(),

@@ -413,10 +413,86 @@ def test_chat_decoder_rejects_duplicate_assistant_tool_call_ids() -> None:
     assert captured.value.detail.param == "messages.0"
 
 
+def test_chat_decoder_accepts_plaintext_reasoning_as_exposed_history() -> None:
+    """Plaintext ``reasoning_content`` decodes as caller-owned exposed history.
+
+    An exposure-gated rung (Tencent/DeepSeek) returns plaintext reasoning on
+    every non-tool turn; a Terminus/Harbor loop echoes it back verbatim. The
+    decoder carries it as an ``exposed_reasoning_content`` block. Route
+    admission, not the decoder, decides which rungs may replay it.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "run ls"},
+                {
+                    "role": "assistant",
+                    "content": '{"command": "ls"}',
+                    "reasoning_content": "The user wants a directory listing.",
+                },
+                {"role": "user", "content": "a.txt b.txt"},
+            ],
+        }
+    )
+    block = decoded.request.messages[1].provider_reasoning[0]
+    assert block.kind == "exposed_reasoning_content"
+    assert block.content == "The user wants a directory listing."
+    # A reasoning-only assistant turn (content null from an exposed rung's
+    # length-cut thinking turn, echoed exactly as returned) decodes too.
+    reasoning_only = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "think"},
+                {"role": "assistant", "content": None, "reasoning_content": "ran out of room"},
+                {"role": "user", "content": "continue"},
+            ],
+        }
+    )
+    assert reasoning_only.request.messages[1].content is None
+    assert (
+        reasoning_only.request.messages[1].provider_reasoning[0].kind == "exposed_reasoning_content"
+    )
+    # A tool-call turn's reasoning is only ever issued as the sealed carrier,
+    # so plaintext there was never ours and is rejected by name.
+    with pytest.raises(OpenAIProtocolError) as tool_turn:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": "look it up"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "plaintext on a tool turn",
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+                ],
+            }
+        )
+    assert tool_turn.value.detail.param == "messages.1.reasoning_content"
+    # An empty string is not reasoning; it names its field.
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "assistant", "content": "x", "reasoning_content": ""}],
+            }
+        )
+    assert raised.value.detail.param == "messages.0.reasoning_content"
+
+
 @pytest.mark.parametrize(
     "reasoning_content",
     (
-        "raw provider reasoning",
         FIREWORKS_REASONING_CONTENT_PREFIX,
         f"{FIREWORKS_REASONING_CONTENT_PREFIX}not-base64:payload",
     ),
@@ -424,7 +500,7 @@ def test_chat_decoder_rejects_duplicate_assistant_tool_call_ids() -> None:
 def test_chat_decoder_rejects_unbound_or_malformed_reasoning_content(
     reasoning_content: str,
 ) -> None:
-    """Public Chat input accepts only a bounded gateway-issued carrier."""
+    """A value under a known carrier prefix must parse as that carrier."""
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_chat(
             {
@@ -1095,7 +1171,7 @@ def test_responses_decoder_preserves_multiple_official_output_message_phases() -
     ("item", "param"),
     (
         (
-            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": ""},
             "input.0.encrypted_content",
         ),
         (
@@ -1285,13 +1361,17 @@ def test_responses_decoder_rejects_unknown_include_paths() -> None:
         )
     assert raised.value.detail.param == "include"
 
-    with pytest.raises(OpenAIProtocolError):
-        decode_responses(
-            {
-                "model": "coding",
-                "input": [{"type": "reasoning", "id": "rs_1", "summary": []}],
-            }
-        )
+    # An id-only reasoning item (store=true replay, encrypted_content is
+    # SDK-optional) is no longer a 400: it carries verbatim to the native
+    # Responses wire and the provider judges resolvability.
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [{"type": "reasoning", "id": "rs_1", "summary": []}],
+        }
+    )
+    native = decoded.request.messages[-1].provider_native_item
+    assert native == {"type": "reasoning", "id": "rs_1", "summary": []}
 
 
 def test_chat_decoder_accepts_the_ultra_reasoning_effort() -> None:
@@ -1432,7 +1512,7 @@ def test_responses_union_errors_name_the_item_field_not_the_branch() -> None:
                         "call_id": "call-1",
                         "name": "get_weather",
                         "arguments": "{}",
-                        "caller": {"type": "direct"},
+                        "caller": "direct",
                     },
                 ],
             }
@@ -2840,3 +2920,581 @@ def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values
         with pytest.raises(OpenAIProtocolError) as captured:
             decoder(payload)
         assert captured.value.detail.param == "service_tier"
+
+
+def test_a_namespaced_function_call_round_trips_its_namespace_verbatim() -> None:
+    """The exact Codex namespaced wire shape reaches the provider unchanged.
+
+    OpenAI rejects a namespaced call replayed without its namespace ("Missing
+    namespace for function_call 'spawn_agent'. It does not exist in the
+    default namespace. Round-trip the model's function_call item with its
+    namespace field included."), and the item is baked into the caller's
+    history, so dropping or rejecting the field wedges every later turn.
+    """
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "spawn a worker"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_x",
+                    "name": "spawn_agent",
+                    "namespace": "collaboration",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_x",
+                    "name": "spawn_agent",
+                    "namespace": "collaboration",
+                    "output": "spawned",
+                },
+            ],
+        }
+    )
+    call = decoded.request.messages[1].tool_calls[0]
+    assert call.provider_namespace == "collaboration"
+    tool_message = decoded.request.messages[2]
+    assert tool_message.provider_tool_name == "spawn_agent"
+    assert tool_message.provider_tool_namespace == "collaboration"
+
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[-2] == {
+        "type": "function_call",
+        "call_id": "call_x",
+        "name": "spawn_agent",
+        "arguments": "{}",
+        "namespace": "collaboration",
+    }
+    assert payload_input[-1] == {
+        "type": "function_call_output",
+        "call_id": "call_x",
+        "output": "spawned",
+        "name": "spawn_agent",
+        "namespace": "collaboration",
+    }
+
+
+def test_a_namespace_free_function_call_keeps_its_exact_wire_shape() -> None:
+    """Histories from before namespaced tools re-emit byte-identically."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "function_call", "call_id": "call_p", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_p", "output": "ok"},
+            ],
+        }
+    )
+    assert decoded.request.messages[0].tool_calls[0].provider_namespace is None
+    assert decoded.request.messages[1].provider_tool_name is None
+    assert decoded.request.messages[1].provider_tool_namespace is None
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[-2] == {
+        "type": "function_call",
+        "call_id": "call_p",
+        "name": "f",
+        "arguments": "{}",
+    }
+    assert payload_input[-1] == {
+        "type": "function_call_output",
+        "call_id": "call_p",
+        "output": "ok",
+    }
+
+
+def test_a_malformed_function_call_namespace_names_its_field() -> None:
+    """An unusable namespace value reports its own input location."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_x",
+                        "name": "spawn_agent",
+                        "namespace": "",
+                        "arguments": "{}",
+                    }
+                ],
+            }
+        )
+    assert error.value.detail.param == "input.0.namespace"
+
+
+def test_hosted_tool_item_echoes_decode_as_verbatim_native_items() -> None:
+    """A stateless turn-2 request echoes prior hosted-tool output items
+    (web_search_call, mcp_call, ...) and their caller-authored outputs; each
+    decodes as a shallow native item carried byte-for-byte at its position,
+    with provider-authored items on the assistant role and caller-authored
+    outputs on the tool role."""
+    web_search = {
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "completed",
+        "action": {"type": "search", "query": "current stable Python"},
+    }
+    mcp_call = {
+        "type": "mcp_call",
+        "id": "mcp_1",
+        "server_label": "deepwiki",
+        "name": "ask_question",
+        "arguments": '{"q": "pi"}',
+        "output": "3.14159",
+        "status": "completed",
+    }
+    computer_output = {
+        "type": "computer_call_output",
+        "call_id": "call_c1",
+        "output": {"type": "computer_screenshot", "image_url": "https://example.com/shot.png"},
+    }
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "search then act"},
+                web_search,
+                mcp_call,
+                computer_output,
+                {"role": "user", "content": "continue"},
+            ],
+        }
+    )
+    messages = decoded.request.messages
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    natives = [
+        message.provider_native_item
+        for message in messages
+        if message.provider_native_item is not None
+    ]
+    assert natives == [web_search, mcp_call, computer_output]
+
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol", decoded.request, supports_temperature=False
+    )
+    assert payload["input"] == [
+        {"role": "user", "content": "search then act"},
+        web_search,
+        mcp_call,
+        computer_output,
+        {"role": "user", "content": "continue"},
+    ]
+
+
+def test_annotation_bearing_assistant_echoes_decode_and_drop_on_replay() -> None:
+    """A cited web-search answer served by this gateway carries populated
+    ``annotations`` on its ``output_text`` part; the caller resends it
+    verbatim on turn 2 and the echo must decode (a 400 here wedges every
+    later turn of the session). The display-only annotations are validated
+    and dropped on replay, like echoed reasoning summary parts."""
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "search"},
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Python 3.14.7.",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://www.python.org/doc/versions/",
+                                    "title": "Python versions",
+                                    "start_index": 0,
+                                    "end_index": 14,
+                                }
+                            ],
+                            "logprobs": [],
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    echo = decoded.request.messages[1]
+    assert echo.role == "assistant"
+    assert echo.content == "Python 3.14.7."
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol", decoded.request, supports_temperature=False
+    )
+    replayed = cast("list[JsonObject]", payload["input"])[1]
+    content = cast("list[JsonObject]", replayed["content"])
+    assert content[0]["annotations"] == []
+
+
+def test_hosted_tool_echo_annotations_require_a_typed_object() -> None:
+    """Malformed annotation echoes stay a named 400, never a silent accept."""
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_responses(
+            {
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "x",
+                                "annotations": [{"url": "https://example.com"}],
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+    assert rejected.value.status_code == 400
+
+
+def test_responses_decoder_names_a_duplicate_call_id_instead_of_crashing() -> None:
+    """A canonical-contract violation in replayed history is a named 400.
+
+    Two echoed ``function_call`` items sharing one ``call_id`` violate the
+    canonical assistant-message contract during history reconstruction,
+    after the wire models have already passed. That exception must map to
+    the field-specific protocol error every other invalid shape gets: before
+    the mapping it escaped decode as an unclassified 500 whose "retry the
+    request" guidance is wrong for caller-shaped input.
+    """
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_responses(
+            {
+                "model": "gpt-5.6-sol",
+                "tools": [{"type": "function", "name": "a", "parameters": {"type": "object"}}],
+                "input": [
+                    {"role": "user", "content": "t"},
+                    {"type": "function_call", "call_id": "dup", "name": "a", "arguments": "{}"},
+                    {"type": "function_call", "call_id": "dup", "name": "a", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "dup", "output": "x"},
+                    {"type": "function_call_output", "call_id": "dup", "output": "y"},
+                ],
+            }
+        )
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail.param == "input"
+    assert "tool call IDs must be unique" in rejected.value.detail.message
+
+
+def test_a_caller_attributed_function_call_round_trips_its_caller_verbatim() -> None:
+    """The SDK 3.0 programmatic tool-calling attribution reaches the provider unchanged.
+
+    ``caller`` (for example ``{"type": "program", "id": ...}``) arrives on
+    function_call, function_call_output, and custom_tool_call items; each is
+    baked into the caller's history, so dropping or rejecting the field would
+    wedge every later turn of a session the provider itself serves.
+    """
+    caller = {"type": "program", "caller_id": "call_prog"}
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "run the program"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_c",
+                    "name": "lookup",
+                    "caller": caller,
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_c",
+                    "caller": caller,
+                    "output": "found",
+                },
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_free",
+                    "name": "freeform",
+                    "caller": caller,
+                    "input": "raw text",
+                },
+            ],
+        }
+    )
+    call = decoded.request.messages[1].tool_calls[0]
+    assert call.provider_caller == caller
+    tool_message = decoded.request.messages[2]
+    assert tool_message.provider_tool_caller == caller
+    native = decoded.request.messages[3].provider_native_item
+    assert native is not None and native["caller"] == caller
+
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[-3] == {
+        "type": "function_call",
+        "call_id": "call_c",
+        "name": "lookup",
+        "arguments": "{}",
+        "caller": caller,
+    }
+    assert payload_input[-2] == {
+        "type": "function_call_output",
+        "call_id": "call_c",
+        "output": "found",
+        "caller": caller,
+    }
+    assert payload_input[-1] == {
+        "type": "custom_tool_call",
+        "call_id": "call_free",
+        "name": "freeform",
+        "caller": caller,
+        "input": "raw text",
+    }
+
+
+def test_a_caller_free_function_call_keeps_its_exact_wire_shape() -> None:
+    """Histories from before programmatic tool calling re-emit byte-identically."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "function_call", "call_id": "call_p", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_p", "output": "ok"},
+            ],
+        }
+    )
+    assert decoded.request.messages[0].tool_calls[0].provider_caller is None
+    assert decoded.request.messages[1].provider_tool_caller is None
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert "caller" not in payload_input[-2]
+    assert "caller" not in payload_input[-1]
+
+
+def test_a_list_valued_function_output_maps_onto_canonical_tool_parts() -> None:
+    """A tool that returns an image beside text serves instead of a 400.
+
+    The SDK types ``function_call_output.output`` as a union of plain text
+    and a content-part list; the list form decodes onto the canonical tool
+    message (text and image parts) and re-emits as the typed list, so the
+    history round-trips on the native Responses wire.
+    """
+    image_url = "data:image/png;base64,aGk="
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "function_call", "call_id": "call_s", "name": "shot", "arguments": "{}"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_s",
+                    "output": [
+                        {"type": "input_text", "text": "screenshot:"},
+                        {"type": "input_image", "image_url": image_url},
+                    ],
+                },
+            ],
+        }
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.content == "screenshot:"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[-1]["type"] == "function_call_output"
+    output_value = cast(list[JsonObject], payload_input[-1]["output"])
+    assert output_value[0] == {"type": "input_text", "text": "screenshot:"}
+    assert output_value[1]["type"] == "input_image"
+    assert output_value[1]["image_url"] == image_url
+
+
+def test_an_all_text_list_function_output_flattens_to_the_plain_string_form() -> None:
+    """A text-only part list keeps the exact pre-list message and wire shape."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "function_call", "call_id": "call_t", "name": "f", "arguments": "{}"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_t",
+                    "output": [
+                        {"type": "input_text", "text": "part one "},
+                        {"type": "input_text", "text": "part two"},
+                    ],
+                },
+            ],
+        }
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.content == "part one part two"
+    assert tool_message.content_parts == ()
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[-1]["output"] == "part one part two"
+
+
+def test_a_file_part_inside_a_function_output_is_rejected_by_name() -> None:
+    """The canonical tool message carries text and image parts only."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {"type": "function_call", "call_id": "call_f", "name": "f", "arguments": "{}"},
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_f",
+                        "output": [
+                            {
+                                "type": "input_file",
+                                "file_data": "data:application/pdf;base64,aGk=",
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+    assert error.value.status_code == 400
+    assert error.value.detail.param == "input.1.output"
+
+
+def test_a_custom_tool_call_output_list_carries_verbatim() -> None:
+    """The freeform result item is opaque: a list output rides the raw item."""
+    output_value = [{"type": "input_text", "text": "raw"}]
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_free",
+                    "output": output_value,
+                }
+            ],
+        }
+    )
+    native = decoded.request.messages[-1].provider_native_item
+    assert native is not None and native["output"] == output_value
+
+
+def test_a_tool_message_name_round_trips_on_both_openai_wires() -> None:
+    """The legacy role:"function" name on a tool result serves instead of a 400.
+
+    hermes-agent (and other agent frameworks) sends name:"<function>" on
+    every tool-result message; the provider serves the shape (probed live
+    2026-09-05), and the field is baked into history, so the previous
+    "Invalid value for 'messages.N.name'" rejection wedged every session on
+    its first tool call.
+    """
+    from exp.runtime.models.providers.streaming_requests import (
+        openai_compatible_stream_payload,
+        openai_responses_stream_payload,
+    )
+
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_probe1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_probe1",
+                    "name": "read_file",
+                    "content": "contents",
+                },
+            ],
+        }
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.provider_tool_name == "read_file"
+
+    chat_payload = openai_compatible_stream_payload("chat-fixture", decoded.request)
+    chat_messages = cast(list[JsonObject], chat_payload["messages"])
+    assert chat_messages[-1] == {
+        "role": "tool",
+        "content": "contents",
+        "tool_call_id": "call_probe1",
+        "name": "read_file",
+    }
+
+    responses_payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    responses_input = cast(list[JsonObject], responses_payload["input"])
+    assert responses_input[-1]["name"] == "read_file"
+
+
+def test_a_name_free_tool_message_keeps_its_exact_chat_wire_shape() -> None:
+    """Histories without the legacy attribution re-emit byte-identically."""
+    from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
+
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            ],
+        }
+    )
+    assert decoded.request.messages[-1].provider_tool_name is None
+    chat_payload = openai_compatible_stream_payload("chat-fixture", decoded.request)
+    chat_messages = cast(list[JsonObject], chat_payload["messages"])
+    assert chat_messages[-1] == {"role": "tool", "content": "ok", "tool_call_id": "call_1"}
+
+
+def test_a_name_on_a_non_tool_message_stays_a_named_400() -> None:
+    """The participant-name field on other roles keeps the explicit rejection."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi", "name": "alice"}],
+            }
+        )
+    assert error.value.status_code == 400
+    assert error.value.detail.param == "messages.0"
+    assert "name is valid only for tool messages" in str(error.value.detail.message)

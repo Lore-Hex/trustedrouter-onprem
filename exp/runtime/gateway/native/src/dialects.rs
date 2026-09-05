@@ -102,6 +102,24 @@ fn malformed(message: &str) -> Failure {
     Failure::new(FailureClass::MalformedResponse, message).with_retry(false, true)
 }
 
+/// One provider-supplied discriminator (an item or event type) reduced to a
+/// token safe to embed in a malformed-stream reason. The reason crosses into
+/// the operator log at the failure boundary, so anything but a short
+/// identifier-shaped token is replaced rather than relayed: the next unknown
+/// wire shape must be diagnosable from logs without ever logging payload.
+fn bounded_wire_token(candidate: &str) -> String {
+    let identifier = !candidate.is_empty()
+        && candidate.len() <= 64
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if identifier {
+        candidate.to_string()
+    } else {
+        "non-identifier".to_string()
+    }
+}
+
 fn refusal_failure() -> Failure {
     Failure::new(FailureClass::Refusal, "provider refused the request")
 }
@@ -111,11 +129,100 @@ fn provider_stream_failed() -> Failure {
     Failure::new(FailureClass::ProviderInternal, "provider stream failed").with_retry(true, true)
 }
 
+/// Longest provider-declared error detail retained for the ledger, matching
+/// the python `GatewayFailure.provider_detail` bound.
+const MAXIMUM_STREAM_ERROR_DETAIL_CHARS: usize = 240;
+
+/// Reduce one provider-declared stream error to a bounded single-line detail.
+///
+/// A provider that opens the stream and then declares its own failure names
+/// the mechanism only inside that frame; dropping it left every such kill an
+/// undiagnosable "provider stream failed" (2026-09-05: gpt-6-astra streams
+/// dying ~120ms post-dispatch with the reason discarded). The code reduces
+/// to an identifier-shaped token; the message reduces to one bounded line
+/// (cut at the first control character, whitespace collapsed) and is then
+/// held to the same identifier screen the caller-facing attribution path
+/// uses, so a sentence naming request-specific or infrastructure handles
+/// drops while its code token survives. The detail is attached only to
+/// failure classes that never relay `provider_detail` to callers (the
+/// stream-failure family), so it reaches the ledger and alert samples
+/// without widening the caller-facing sanitization boundary.
+fn provider_error_detail(code: Option<&str>, message: Option<&str>) -> Option<String> {
+    let code = code
+        .filter(|value| !value.is_empty())
+        .map(bounded_wire_token);
+    let line = message.and_then(|message| {
+        let cut: String = message
+            .chars()
+            .take_while(|character| !character.is_control())
+            .collect();
+        let collapsed = cut.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!collapsed.is_empty()
+            && !collapsed
+                .split(' ')
+                .any(|word| crate::param_attribution::carries_provider_identifier(word, &[])))
+        .then_some(collapsed)
+    });
+    let detail = match (code, line) {
+        (None, None) => return None,
+        (Some(code), None) => code,
+        (None, Some(line)) => line,
+        (Some(code), Some(line)) => format!("{code}: {line}"),
+    };
+    Some(
+        detail
+            .chars()
+            .take(MAXIMUM_STREAM_ERROR_DETAIL_CHARS)
+            .collect(),
+    )
+}
+
+/// Emit the structured operator line naming one provider-declared failure.
+fn log_provider_declared_failure(dialect: &str, detail: &str) {
+    let line = serde_json::json!({
+        "event": "provider_declared_failure",
+        "dialect": dialect,
+        "detail": detail,
+    });
+    eprintln!("exp-gateway-native: {line}");
+}
+
+/// Build the provider-declared stream failure carrying its bounded detail,
+/// and emit the structured operator line naming it.
+fn provider_stream_failed_with_detail(
+    dialect: &str,
+    code: Option<&str>,
+    message: Option<&str>,
+) -> Failure {
+    let detail = provider_error_detail(code, message);
+    if let Some(detail) = &detail {
+        log_provider_declared_failure(dialect, detail);
+    }
+    provider_stream_failed().with_provider_detail(detail)
+}
+
 fn parse_object(data: &str) -> Result<Map<String, Value>, Failure> {
     match serde_json::from_str::<Value>(data) {
         Ok(Value::Object(object)) => Ok(object),
         Ok(_) => Err(malformed("provider stream event must be a JSON object")),
-        Err(_) => Err(malformed("provider stream event is not valid JSON")),
+        Err(error) => {
+            // The frame bytes are never logged, hashed, or otherwise derived
+            // from (a frame is provider payload, and even an unkeyed digest
+            // of low-entropy content invites dictionary guessing): the size
+            // and serde's positional description (token category and
+            // line/column, never input bytes) name the parse failure and
+            // correlate identical malformed frames across requests.
+            let line = serde_json::json!({
+                "event": "malformed_stream_frame",
+                "bytes": data.len(),
+                "reason": error.to_string(),
+            });
+            eprintln!("exp-gateway-native: {line}");
+            Err(malformed(&format!(
+                "provider stream event is not valid JSON: {error} ({} bytes)",
+                data.len()
+            )))
+        }
     }
 }
 
@@ -155,13 +262,54 @@ fn complete_streamed_tool(
             }
         });
     }
-    let call = tool.complete().map_err(|message| malformed(&message))?;
+    let call = tool.complete().map_err(|message| {
+        // The offending bytes are never logged, hashed, or otherwise derived
+        // from (tool arguments are model output and can carry tenant
+        // content, and even an unkeyed digest of low-entropy arguments
+        // invites dictionary guessing): the operator line carries only the
+        // tool name, the size, and the parse reason, which together
+        // correlate identical unparsable shapes across requests.
+        let line = serde_json::json!({
+            "event": "malformed_tool_arguments",
+            "name": tool.name,
+            "bytes": tool.raw_arguments.len(),
+            "reason": message,
+        });
+        eprintln!("exp-gateway-native: {line}");
+        malformed(&format!("{message} ({} bytes)", tool.raw_arguments.len()))
+    })?;
     events.push(if tool.server {
         Event::ServerToolUseCompleted { index, call }
     } else {
         Event::ToolCallCompleted { index, call }
     });
     Ok(())
+}
+
+/// Complete one streamed tool call the provider itself marked truncated.
+///
+/// A call whose accumulated arguments still parse as a JSON object completes
+/// normally; one left mid-fragment by the output budget is DROPPED (marked
+/// completed without a `ToolCallCompleted`), because the provider never
+/// finished it and the caller's remedy is a larger budget, not a retry of a
+/// "malformed" provider. Only a provider-declared truncation (a Chat
+/// `finish_reason == "length"` terminal, or a Responses function item whose
+/// own status is `incomplete`) may use this; every other completion keeps the
+/// strict object contract.
+fn complete_streamed_tool_truncated(
+    index: u32,
+    tool: &mut ToolAccumulator,
+    events: &mut Vec<Event>,
+) -> Result<(), Failure> {
+    let parses = tool.custom
+        || tool.raw_arguments.is_empty()
+        || require_json_object_text(&tool.raw_arguments).is_ok();
+    if parses {
+        complete_streamed_tool(index, tool, events)
+    } else {
+        tool.completed = true;
+        Ok(())
+    }
 }
 
 fn finish_open_tools(tools: &mut BTreeMap<u32, ToolAccumulator>) -> Result<Vec<Event>, Failure> {
@@ -174,32 +322,27 @@ fn finish_open_tools(tools: &mut BTreeMap<u32, ToolAccumulator>) -> Result<Vec<E
     Ok(events)
 }
 
-/// Finish open tools on a stream the provider cut off at its output budget.
-///
-/// A call whose accumulated arguments still parse as a JSON object completes
-/// normally; one left mid-fragment by the truncation is DROPPED (marked
-/// completed without a `ToolCallCompleted`), because the provider never
-/// finished it and the caller's remedy is a larger budget, not a retry of a
-/// "malformed" provider. Only the `finish_reason == "length"` terminal may use
-/// this; every other terminal keeps the strict object contract.
+/// Finish open tools on a stream the provider cut off at its output budget,
+/// applying the truncated-call contract of [`complete_streamed_tool_truncated`].
 fn finish_open_tools_truncated(
     tools: &mut BTreeMap<u32, ToolAccumulator>,
 ) -> Result<Vec<Event>, Failure> {
     let mut events = Vec::new();
     for (index, tool) in tools.iter_mut() {
-        if tool.completed {
-            continue;
-        }
-        let parses = tool.custom
-            || tool.raw_arguments.is_empty()
-            || require_json_object_text(&tool.raw_arguments).is_ok();
-        if parses {
-            complete_streamed_tool(*index, tool, &mut events)?;
-        } else {
-            tool.completed = true;
+        if !tool.completed {
+            complete_streamed_tool_truncated(*index, tool, &mut events)?;
         }
     }
     Ok(events)
+}
+
+/// One open OpenAI Responses hosted-tool output item, bound by exact
+/// provider identity and carrying its last-seen verbatim JSON so a stream
+/// whose terminal arrives before the item's `done` can still close it.
+struct OpenAiHostedItem {
+    item_type: String,
+    item_id: String,
+    item: String,
 }
 
 /// Incremental normalizer of one upstream SSE stream into gateway events.
@@ -216,6 +359,7 @@ pub struct Normalizer {
     accumulated_summary_bytes: usize,
     reasoning_summaries: BTreeMap<(u32, u32), String>,
     openai_output_items: BTreeMap<u32, (ProviderOutputItemKind, Option<String>)>,
+    openai_hosted_items: BTreeMap<u32, OpenAiHostedItem>,
     openai_completed_output_items: BTreeSet<u32>,
     // Anthropic accumulation.
     input_tokens: u64,
@@ -253,6 +397,7 @@ impl Normalizer {
             accumulated_summary_bytes: 0,
             reasoning_summaries: BTreeMap::new(),
             openai_output_items: BTreeMap::new(),
+            openai_hosted_items: BTreeMap::new(),
             openai_completed_output_items: BTreeSet::new(),
             input_tokens: 0,
             output_tokens: 0,
@@ -306,6 +451,7 @@ impl Normalizer {
                 .len()
                 .saturating_add(self.reasoning_summaries.len())
                 .saturating_add(self.openai_output_items.len())
+                .saturating_add(self.openai_hosted_items.len())
                 >= MAXIMUM_RETAINED_PROVIDER_ENTRIES
         {
             return Err(Failure::new(
@@ -333,6 +479,11 @@ impl Normalizer {
         kind: ProviderOutputItemKind,
         item_id: Option<String>,
     ) -> Result<bool, Failure> {
+        if self.openai_hosted_items.contains_key(&output_index) {
+            return Err(malformed(
+                "OpenAI output item changed identity or type during streaming",
+            ));
+        }
         if let Some(existing) = self.openai_output_items.get(&output_index) {
             return if existing == &(kind, item_id) {
                 Ok(false)
@@ -619,5 +770,181 @@ mod recover_abnormal_end_tests {
             .recover_abnormal_end(incoming())
             .expect_err("a terminated stream does not re-recover");
         assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    }
+}
+
+#[cfg(test)]
+mod stream_error_detail_tests {
+    use super::*;
+
+    fn frame(payload: serde_json::Value) -> SseEvent {
+        SseEvent {
+            event: None,
+            data: payload.to_string(),
+        }
+    }
+
+    fn failed_detail(events: &[Event]) -> Option<String> {
+        match events.last() {
+            Some(Event::Failed(failure)) => failure.provider_detail.clone(),
+            other => panic!("expected a failed terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_shaped_words_drop_the_whole_detail_line() {
+        // The identifier screen treats any letter+digit label as a handle,
+        // which covers key and token shapes: a sentence carrying one drops
+        // entirely (never partially redacted), for every dialect that feeds
+        // the shared detail path, Bedrock exception messages included.
+        for message in [
+            "Invalid key sk-abc123def provided.",
+            "The access key AKIA9X7EXAMPLE is not authorized for this model.",
+            "Bearer eyJhbGciOi9 was rejected.",
+        ] {
+            assert_eq!(
+                provider_error_detail(None, Some(message)),
+                None,
+                "a credential-shaped word must drop the sentence: {message}"
+            );
+            assert_eq!(
+                provider_error_detail(Some("validation_error"), Some(message)).as_deref(),
+                Some("validation_error"),
+                "the safe code token alone survives: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_error_detail_is_one_bounded_line() {
+        assert_eq!(provider_error_detail(None, None), None);
+        assert_eq!(
+            provider_error_detail(Some("server_error"), None).as_deref(),
+            Some("server_error")
+        );
+        assert_eq!(
+            provider_error_detail(Some("server_error"), Some("The model failed  to respond."))
+                .as_deref(),
+            Some("server_error: The model failed to respond.")
+        );
+        // The line cuts at the first control character: a payload dump never
+        // rides past its first row.
+        assert_eq!(
+            provider_error_detail(None, Some("first line\nsecond line")).as_deref(),
+            Some("first line")
+        );
+        // A hostile code reduces to the shared identifier token.
+        assert_eq!(
+            provider_error_detail(Some("weird code!{}"), None).as_deref(),
+            Some("non-identifier")
+        );
+        // The composed detail never exceeds the python provider_detail bound.
+        let long = "x".repeat(400);
+        let bounded = provider_error_detail(Some("code"), Some(&long)).expect("bounded");
+        assert_eq!(bounded.chars().count(), 240);
+    }
+
+    /// Every dialect's provider-declared stream failure carries its bounded
+    /// mechanism into `provider_detail` (ledger-only for these classes), so
+    /// the next post-open kill is diagnosable from the ledger instead of an
+    /// opaque "provider stream failed" (2026-09-05: gpt-6-astra kills ~120ms
+    /// post-dispatch across 20 orgs with the reason discarded on the wire).
+    #[test]
+    fn responses_failed_terminal_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"code": "server_error", "message": "The model failed."},
+                },
+            })))
+            .expect("failed terminal normalizes");
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("server_error: The model failed.")
+        );
+    }
+
+    #[test]
+    fn responses_error_frame_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "type": "error",
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached for gpt-6-astra.",
+                "param": null,
+                "sequence_number": 1,
+            })))
+            .expect("error frame normalizes");
+        // The model id trips the identifier screen (letters+digits label), so
+        // the sentence drops while the code token survives: the mechanism
+        // stays named without relaying a label-shaped word to the ledger.
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("rate_limit_exceeded")
+        );
+    }
+
+    #[test]
+    fn compatible_error_frame_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "error": {"code": 502, "message": "upstream connect error"},
+            })))
+            .expect("error frame normalizes");
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("502: upstream connect error")
+        );
+    }
+
+    #[test]
+    fn anthropic_error_frame_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"},
+            })))
+            .expect("error frame normalizes");
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("overloaded_error: Overloaded")
+        );
+    }
+
+    #[test]
+    fn gemini_error_envelope_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "error": {"code": 503, "status": "UNAVAILABLE", "message": "Overloaded."},
+            })))
+            .expect("error envelope normalizes");
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("UNAVAILABLE: Overloaded.")
+        );
+    }
+
+    #[test]
+    fn unparsable_stream_frames_name_size_and_parse_position() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let failure = normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: "<html>502 Bad Gateway</html>".to_string(),
+            })
+            .expect_err("a non-JSON frame is malformed");
+        assert!(
+            failure.safe_message.contains("not valid JSON")
+                && failure.safe_message.contains("(28 bytes)"),
+            "reason must carry the parse diagnosis: {}",
+            failure.safe_message
+        );
     }
 }

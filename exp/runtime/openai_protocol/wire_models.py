@@ -38,15 +38,30 @@ _EchoedItemStatus = Literal["in_progress", "completed", "incomplete"]
 class _TextPart(_WireModel):
     """One supported text-only content part.
 
-    Echoed ``output_text`` parts carry empty ``annotations`` and ``logprobs``
-    arrays (this gateway emits them and callers resend prior output verbatim
-    on continuations); only a populated value is rejected as unsupported.
+    Echoed ``output_text`` parts carry ``annotations`` and ``logprobs``
+    arrays: this gateway emits them and callers resend prior output verbatim
+    on continuations. Hosted web-search answers carry populated annotation
+    objects (URL citations), which are validated shallowly and dropped on
+    replay: the provider derives nothing from echoed display metadata, and
+    the cited text itself rides ``text``. A populated ``logprobs`` echo stays
+    rejected because this gateway never emits one.
     """
 
     type: Literal["text", "input_text", "output_text"]
     text: str
-    annotations: tuple[()] | None = None
+    annotations: tuple[JsonObject, ...] | None = None
     logprobs: tuple[()] | None = None
+
+    @field_validator("annotations")
+    @classmethod
+    def _require_typed_annotations(
+        cls, value: tuple[JsonObject, ...] | None
+    ) -> tuple[JsonObject, ...] | None:
+        """Require each echoed annotation to be a typed object."""
+        for annotation in value or ():
+            if not isinstance(annotation.get("type"), str) or not annotation["type"]:
+                raise ValueError("each annotation must carry a non-empty type")
+        return value
 
 
 _ImageDetail = Literal["auto", "low", "high"]
@@ -247,6 +262,16 @@ class _Message(_WireModel):
     content: str | tuple[_ContentPart, ...] | None = None
     tool_calls: tuple[_AssistantToolCall, ...] | None = None
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    """Tool function name on a ``role: "tool"`` message.
+
+    The legacy ``role: "function"`` attribution many agent frameworks
+    (hermes-agent among them) still send on every tool result; the provider
+    serves it (probed live 2026-09-05, api.openai.com), and the field is
+    baked into caller history, so rejecting it wedges whole sessions. It
+    round-trips verbatim on OpenAI-family wires and drops with disclosure
+    elsewhere. Other roles keep the named rejection.
+    """
     refusal: None = None
     annotations: tuple[()] | None = None
     audio: None = None
@@ -269,12 +294,22 @@ class _Message(_WireModel):
     @model_validator(mode="after")
     def _require_role_fields(self) -> _Message:
         """Require tool linkage and assistant calls on their legal roles."""
-        if self.role == "assistant" and self.content is None and not self.history_tool_calls:
-            raise ValueError("assistant messages need content or tool calls")
+        if (
+            self.role == "assistant"
+            and self.content is None
+            and not self.history_tool_calls
+            and self.reasoning_content is None
+        ):
+            # A reasoning-only assistant turn is a shape the gateway itself
+            # returns (an exposed rung's length-cut thinking turn: content null,
+            # plaintext reasoning_content) and the provider accepts back.
+            raise ValueError("assistant messages need content, tool calls, or reasoning_content")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
+        if self.role != "tool" and self.name is not None:
+            raise ValueError("name is valid only for tool messages")
         if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.reasoning_content is not None:
@@ -574,15 +609,27 @@ class _ResponseFunctionCall(_WireModel):
     """Completed Responses function call included as assistant history.
 
     ``id`` and ``status`` arrive on verbatim echoes of prior output items
-    and are accepted and dropped; ``call_id`` is the linkage that matters.
+    and are retained for exact replay; ``call_id`` is the linkage that
+    matters. ``namespace`` attributes the call to the nested tool tree that
+    declared it (the ``namespace`` declarations carried by
+    ``GatewayProviderNativeTool``) and must round-trip verbatim: the
+    provider rejects a namespaced call replayed without it ("Missing
+    namespace for function_call .... Round-trip the model's function_call
+    item with its namespace field included."), which wedges every later
+    turn of the session because the item is baked into history.
     """
 
     type: Literal["function_call"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, min_length=1, max_length=256)
+    caller: JsonObject | None = None
+    """Opaque SDK 3.0 programmatic tool-calling attribution (for example
+    ``{"type": "program", "id": ...}``); an evolving provider surface, so it
+    is validated only as an object and round-trips verbatim like
+    ``namespace``."""
     arguments: str = Field(max_length=4_000_000)
-    id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
 
 
@@ -591,11 +638,26 @@ class _ResponseFunctionOutput(_WireModel):
 
     ``id`` and ``status`` arrive when a stored turn's input items are
     re-listed and echoed; accepted and dropped like the other echo markers.
+    ``name`` and ``namespace`` attribute the result to a namespaced tool
+    (Codex serializes both on outputs of namespaced calls) and round-trip
+    verbatim like the sibling ``function_call`` namespace.
+
+    ``output`` is the SDK union: plain text, or an ordered list of content
+    parts for tools that return images beside text. The decoder maps a part
+    list onto the canonical tool message's content parts (text and image
+    only, the tool-message contract); any other part kind is rejected by
+    name rather than dropped.
     """
 
     type: Literal["function_call_output"]
     call_id: str = Field(min_length=1, max_length=256)
-    output: str
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, min_length=1, max_length=256)
+    caller: JsonObject | None = None
+    """Opaque SDK 3.0 attribution of this result to the program that invoked
+    the call; validated only as an object and round-tripped verbatim like the
+    sibling ``function_call`` caller."""
+    output: str | tuple[_ContentPart, ...]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
 
@@ -624,11 +686,21 @@ class _ResponseReasoningItem(_WireModel):
     reasoning output items with an explicit ``content: null`` (captured
     live 2026-08-29); the provider accepts that null while rejecting a
     null ``summary``, so exactly ``content`` is nullable here.
+
+    ``encrypted_content`` itself is OPTIONAL, as the SDK marks it: a
+    ``store: true`` flow replays reasoning by item id alone and the
+    provider resolves it from stored state. An id-only item is carried
+    verbatim to homogeneous native Responses routes (the only wire that
+    can resolve the id) and the provider judges resolvability with its own
+    error, following the hosted-item posture. Verified live 2026-09-05
+    (api.openai.com, gpt-5.1): a stored response's reasoning item replayed
+    by id with no encrypted_content completed with 200 under BOTH
+    ``store: true`` and ``store: false``.
     """
 
     type: Literal["reasoning"]
     id: str = Field(min_length=1, max_length=256)
-    encrypted_content: str = Field(min_length=1)
+    encrypted_content: str | None = Field(default=None, min_length=1)
     summary: tuple[_ReasoningSummaryPart, ...] = ()
     content: tuple[_ReasoningTextPart, ...] | None = None
     status: _EchoedItemStatus | None = None
@@ -700,13 +772,23 @@ class _AdditionalToolsItem(_WireModel):
 
 
 class _CustomToolCall(_WireModel):
-    """One freeform (custom) tool call echoed as assistant history."""
+    """One freeform (custom) tool call echoed as assistant history.
+
+    ``namespace`` attributes the call to its declaring nested tool tree and
+    forwards verbatim with the rest of the raw item (the whole item replays
+    byte-for-byte on native Responses rungs), mirroring the typed
+    ``function_call`` namespace round trip.
+    """
 
     type: Literal["custom_tool_call"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, min_length=1, max_length=256)
+    caller: JsonObject | None = None
+    """Opaque SDK 3.0 programmatic tool-calling attribution, forwarded
+    verbatim with the rest of the raw item like ``namespace``."""
     input: str = Field(max_length=4_000_000)
 
 
@@ -720,13 +802,87 @@ class _CustomToolCallOutput(_WireModel):
     output: JsonValue
 
 
+HOSTED_TOOL_ITEM_TYPES_ASSISTANT = frozenset(
+    {
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "image_generation_call",
+        "local_shell_call",
+        "shell_call",
+        "apply_patch_call",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "tool_search_call",
+        "tool_search_output",
+        "program",
+        "program_output",
+        "compaction",
+    }
+)
+"""Provider-authored hosted-tool and opaque conversation output items."""
+
+HOSTED_TOOL_ITEM_TYPES_TOOL = frozenset(
+    {
+        "computer_call_output",
+        "local_shell_call_output",
+        "shell_call_output",
+        "apply_patch_call_output",
+        "mcp_approval_response",
+    }
+)
+"""Caller-authored results answering a hosted or locally executed call."""
+
+
+class _HostedToolItemEcho(BaseModel):
+    """One hosted-tool Responses item echoed as input history.
+
+    Hosted tools (web search, MCP, code interpreter, ...) execute at the
+    provider, whose item vocabulary exists on no other wire, so validation is
+    deliberately shallow (mirroring ``_AdditionalToolsItem``) and the raw
+    caller item forwards byte-for-byte on native Responses rungs only; every
+    other rung rejects it by name. The type set is the documented output-item
+    union beyond the typed models above (openai-python 3.x, 2026-09-04).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal[
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "computer_call_output",
+        "image_generation_call",
+        "local_shell_call",
+        "local_shell_call_output",
+        "shell_call",
+        "shell_call_output",
+        "apply_patch_call",
+        "apply_patch_call_output",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "mcp_approval_response",
+        "tool_search_call",
+        "tool_search_output",
+        "program",
+        "program_output",
+        "compaction",
+    ]
+    id: str | None = Field(default=None, min_length=1, max_length=256)
+
+
 _ResponsesOutputItem = Annotated[
     _ResponseFunctionCall
     | _ResponseFunctionOutput
     | _ResponseReasoningItem
     | _AdditionalToolsItem
     | _CustomToolCall
-    | _CustomToolCallOutput,
+    | _CustomToolCallOutput
+    | _HostedToolItemEcho,
     Field(discriminator="type"),
 ]
 _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem

@@ -88,13 +88,18 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
             | Event::EncryptedReasoning { .. } => {}
             // Server-tool activity and citations carry the fetched content
             // (queries, result payloads, cited text) that a rewrite must not
-            // leak, so they drop with the reasoning channel.
+            // leak, so they drop with the reasoning channel. Hosted Responses
+            // tool items and their annotations are the same class of content.
             Event::TextBlockStarted { .. }
             | Event::CitationDelta { .. }
             | Event::ServerToolUseStarted { .. }
             | Event::ServerToolArgumentsDelta { .. }
             | Event::ServerToolUseCompleted { .. }
-            | Event::ServerToolResult { .. } => {}
+            | Event::ServerToolResult { .. }
+            | Event::HostedToolItemStarted { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. }
+            | Event::ProviderTextAnnotation { .. } => {}
             Event::TextDelta(_) | Event::ProviderTextDelta { .. } => {
                 if inserted {
                     continue;
@@ -162,6 +167,8 @@ mod tests {
             Event::ToolCallCompleted {
                 index: 0,
                 call: CompletedToolCall {
+                    namespace: None,
+                    caller: None,
                     call_id: "call-1".to_string(),
                     name: "lookup".to_string(),
                     provider_item_id: None,
@@ -220,6 +227,8 @@ mod tests {
             Event::ToolCallCompleted {
                 index: 0,
                 call: CompletedToolCall {
+                    namespace: None,
+                    caller: None,
                     call_id: "call-1".to_string(),
                     name: "lookup".to_string(),
                     provider_item_id: None,

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from typing import cast
 
-from exp.common.models.known_models import canonical_model_id
+from exp.common.models.known_models import canonical_model_id, known_model_metadata
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.models.providers.errors import (
     ProviderParameterError,
@@ -185,6 +185,117 @@ def anthropic_adaptive_only_thinking(model_id: str) -> bool:
     """
     normalized = _normalized_model(model_id)
     return any(family in normalized for family in _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES)
+
+
+def anthropic_budgeted_enabled_only(model_id: str) -> bool:
+    """Whether an Anthropic model reasons via a token budget but rejects adaptive.
+
+    haiku-4-5 is marked ``supports_reasoning`` yet is NOT the effort/adaptive
+    generation (``supports_reasoning_effort`` is False), so it honors a
+    budgeted ``thinking: {type: enabled, budget_tokens}`` config while
+    rejecting ``thinking: {type: adaptive}`` and ``output_config.effort`` by
+    name. The effort generation (sonnet-4-6, opus-5, fable-5-1, ...) carries
+    ``supports_reasoning_effort`` and accepts the adaptive object verbatim,
+    so it is NOT one of these.
+
+    Args:
+        model_id: Exact Anthropic model identifier.
+
+    Returns:
+        ``True`` only for a reasoning model whose depth is a token budget and
+        which rejects an adaptive thinking config.
+    """
+    known = known_model_metadata("anthropic", model_id)
+    if known is None:
+        return False
+    return known.supports_reasoning is True and not known.supports_reasoning_effort
+
+
+MINIMUM_THINKING_BUDGET_TOKENS = 1024
+"""Smallest budget Anthropic accepts for an ``enabled`` thinking config."""
+
+MAXIMUM_THINKING_BUDGET_TOKENS = 16384
+"""Ceiling on a gateway-derived thinking budget when the caller supplied none."""
+
+
+def anthropic_thinking_budget_tokens(maximum_output_tokens: int | None) -> int | None:
+    """Return a legal ``budget_tokens`` for a translated enabled config, or None.
+
+    Anthropic requires ``1024 <= budget_tokens < max_tokens`` for an enabled
+    thinking config. With no effort→budget table to consult, the budget is
+    half the caller's output ceiling, clamped to a sane band. An unbounded
+    caller (no ceiling) takes the band ceiling. When the ceiling is too small
+    to admit any legal budget the translation is impossible and the caller
+    must fall through to the drop path.
+
+    Args:
+        maximum_output_tokens: The caller's output-token ceiling, if any.
+
+    Returns:
+        A legal budget, or ``None`` when no budget fits the ceiling.
+    """
+    if maximum_output_tokens is None:
+        return MAXIMUM_THINKING_BUDGET_TOKENS
+    budget = min(
+        max(maximum_output_tokens // 2, MINIMUM_THINKING_BUDGET_TOKENS),
+        MAXIMUM_THINKING_BUDGET_TOKENS,
+    )
+    if MINIMUM_THINKING_BUDGET_TOKENS <= budget < maximum_output_tokens:
+        return budget
+    return None
+
+
+THINKING_BUDGET_EFFORT_TIERS: tuple[tuple[int, ReasoningEffort], ...] = (
+    (4096, "low"),
+    (MAXIMUM_THINKING_BUDGET_TOKENS, "medium"),
+)
+"""Budget ceilings mapping an Anthropic ``budget_tokens`` to an effort tier.
+
+The bands anchor on the two budget constants Anthropic semantics already pin:
+``MINIMUM_THINKING_BUDGET_TOKENS`` (1024) opens the low band and
+``MAXIMUM_THINKING_BUDGET_TOKENS`` (16384, the gateway's derived-budget
+ceiling) closes the medium band. A budget at or below 4096 reads as shallow
+deliberate reasoning (low), one up to 16384 as the default depth (medium),
+and anything larger as an explicit request for deep reasoning (high).
+"""
+
+
+def thinking_config_reasoning_effort(config: Mapping[str, object]) -> ReasoningEffort:
+    """Map one Anthropic thinking config to the nearest canonical effort tier.
+
+    The mapping serves routes whose reasoning channel is an OpenAI-style
+    effort rather than a token budget:
+
+    ==================================  ========
+    thinking config                     effort
+    ==================================  ========
+    ``disabled``                        none
+    ``adaptive`` or budget-less         medium
+    ``budget_tokens <= 4096``           low
+    ``budget_tokens <= 16384``          medium
+    ``budget_tokens > 16384``           high
+    ==================================  ========
+
+    ``adaptive`` means the model picks its own depth, whose closest effort
+    analog is the provider default (medium, OpenAI's own default). Callers
+    must snap the returned tier to the route's supported ladder and disclose
+    the translation.
+
+    Args:
+        config: Verbatim caller ``thinking`` object.
+
+    Returns:
+        The canonical effort tier for the requested reasoning depth.
+    """
+    if config.get("type") == "disabled":
+        return "none"
+    budget = config.get("budget_tokens")
+    if not isinstance(budget, int) or isinstance(budget, bool):
+        return "medium"
+    for ceiling, effort in THINKING_BUDGET_EFFORT_TIERS:
+        if budget <= ceiling:
+            return effort
+    return "high"
 
 
 def anthropic_reasoning_effort(model_id: str, effort: str) -> str:

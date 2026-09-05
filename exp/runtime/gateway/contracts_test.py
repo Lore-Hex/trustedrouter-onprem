@@ -1009,3 +1009,114 @@ def test_tool_messages_carry_text_and_image_parts_only() -> None:
                 ImageContentPart(media_type="image/png", data="aGk="),
             ),
         )
+
+
+def test_replay_identity_binds_the_function_call_namespace() -> None:
+    """A replayed item differing only by namespace is a different request.
+
+    Namespace-free requests keep their exact pre-existing digest because the
+    field joins the replay envelope only when present.
+    """
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def request(*, namespace: str | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            name="spawn_agent",
+                            provider_output_index=0,
+                            provider_namespace=namespace,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    namespaced = request(namespace="collaboration")
+    assert canonical_request_sha256(namespaced) == canonical_request_sha256(
+        request(namespace="collaboration")
+    )
+    assert canonical_request_sha256(namespaced) != canonical_request_sha256(
+        request(namespace="agents")
+    )
+    assert canonical_request_sha256(namespaced) != canonical_request_sha256(request(namespace=None))
+
+
+def test_replay_identity_binds_tool_output_attribution() -> None:
+    """A function_call_output name/namespace pair joins replay identity."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def request(*, namespace: str | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="tool",
+                    content="spawned",
+                    tool_call_id="call-1",
+                    provider_tool_name="spawn_agent" if namespace is not None else None,
+                    provider_tool_namespace=namespace,
+                ),
+            ),
+        )
+
+    plain = request(namespace=None)
+    assert canonical_request_sha256(plain) == sha256_json(plain)
+    assert canonical_request_sha256(request(namespace="collaboration")) != canonical_request_sha256(
+        plain
+    )
+
+
+def test_replay_identity_binds_the_function_call_caller() -> None:
+    """A retained SDK 3.0 caller joins replay identity only when present."""
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def request(*, caller: JsonObject | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            name="lookup",
+                            provider_output_index=0,
+                            provider_caller=caller,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    program: JsonObject = {"type": "program", "caller_id": "call_prog"}
+    direct: JsonObject = {"type": "direct"}
+    attributed = request(caller=program)
+    assert canonical_request_sha256(attributed) == canonical_request_sha256(request(caller=program))
+    assert canonical_request_sha256(attributed) != canonical_request_sha256(request(caller=direct))
+    assert canonical_request_sha256(attributed) != canonical_request_sha256(request(caller=None))
+
+
+def test_a_tool_result_caller_is_valid_only_on_tool_messages() -> None:
+    """The output-side attribution carrier keeps the tool-role contract."""
+    import pytest as _pytest
+
+    message = GatewayMessage(
+        role="tool",
+        content="ok",
+        tool_call_id="call-1",
+        provider_tool_caller={"type": "direct"},
+    )
+    assert message.provider_tool_caller == {"type": "direct"}
+    with _pytest.raises(ValueError, match="attribution"):
+        GatewayMessage(
+            role="assistant",
+            content="ok",
+            provider_tool_caller={"type": "direct"},
+        )

@@ -20,6 +20,7 @@ from exp.runtime.gateway.compatibility import (
 )
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
+    ExposedReasoningContentBlock,
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
@@ -61,6 +62,8 @@ from exp.runtime.openai_protocol.structured_text import (
     responses_structured_text,
 )
 from exp.runtime.openai_protocol.wire_models import (
+    HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
+    HOSTED_TOOL_ITEM_TYPES_TOOL,
     _AdditionalToolsItem,
     _AssistantToolCall,
     _ChatRequest,
@@ -69,6 +72,7 @@ from exp.runtime.openai_protocol.wire_models import (
     _CustomToolCallOutput,
     _EmbeddingsRequest,
     _FunctionCall,
+    _HostedToolItemEcho,
     _Message,
     _ResponseFunctionCall,
     _ResponseMessage,
@@ -326,12 +330,20 @@ def decode_responses(
                     tool=cast("JsonObject", raw_tools[tool_index]),
                 )
             )
-    messages = list(
-        _response_input_messages(
-            request.input,
-            raw_items=cast("list[JsonObject]", raw_input) if isinstance(raw_input, list) else (),
-        )
-    )
+    replayed_items = cast("list[JsonObject]", raw_input) if isinstance(raw_input, list) else ()
+    try:
+        messages = list(_response_input_messages(request.input, raw_items=replayed_items))
+    except ValidationError as exc:
+        # History reconstruction folds echoed items into canonical messages,
+        # so a canonical-contract violation (such as duplicate call_ids in one
+        # assistant segment) first surfaces here, past the wire models. It is
+        # caller-shaped input all the same: name the rule instead of letting
+        # the exception escape as an unclassified 500.
+        detail = exc.errors(include_url=False)[0]
+        raise invalid_field(
+            "input",
+            "Invalid value for 'input': " + detail["msg"].removeprefix("Value error, ") + ".",
+        ) from exc
     if request.instructions is not None:
         messages.insert(0, GatewayMessage(role="developer", content=request.instructions))
     try:
@@ -479,6 +491,9 @@ _OUTPUT_ITEM_VARIANTS = {
     "additional_tools",
     "custom_tool_call",
     "custom_tool_call_output",
+    # Hosted-tool echo variants share the same union-branch label shape.
+    *HOSTED_TOOL_ITEM_TYPES_TOOL,
+    *HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
 }
 
 
@@ -647,21 +662,46 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
             for call_index, call in enumerate(message.history_tool_calls)
         )
-        provider_reasoning: tuple[SealedReasoningContentBlock, ...] = ()
+        provider_reasoning: tuple[
+            SealedReasoningContentBlock | ExposedReasoningContentBlock, ...
+        ] = ()
         if message.reasoning_content is not None:
-            # The scheme is fixed by the carrier's own opaque prefix; raw client
-            # text (no known prefix) matches none and is rejected here. Each
-            # provider's carrier only parses under its own scheme.
+            param = f"{prefix}.{message_index}.reasoning_content"
+            # The scheme is fixed by the carrier's own opaque prefix. A known
+            # prefix MUST parse as that provider's carrier. Text under no known
+            # prefix is the plaintext an exposure-gated rung itself returned on
+            # a non-tool turn (Tencent/DeepSeek): it decodes as caller-owned
+            # history and route admission decides which rungs may carry it.
             scheme = scheme_for_carrier(message.reasoning_content)
-            try:
-                if scheme is None:
-                    raise ValueError("reasoning_content is not a gateway-issued carrier")
-                provider_reasoning = (
-                    parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
-                )
-            except ValueError as exc:
-                param = f"{prefix}.{message_index}.reasoning_content"
-                raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
+            if scheme is None:
+                if calls:
+                    # A tool turn's reasoning is only ever issued as the sealed
+                    # carrier that binds it to its calls and issuing rung;
+                    # plaintext here was never ours and would bypass that bond.
+                    raise invalid_field(
+                        param,
+                        f"'{param}' must be a gateway-issued carrier on an assistant "
+                        "tool-call turn.",
+                    )
+                try:
+                    provider_reasoning = (
+                        ExposedReasoningContentBlock(content=message.reasoning_content),
+                    )
+                except ValidationError as exc:
+                    raise invalid_field(
+                        param,
+                        f"'{param}' must be non-empty plaintext reasoning within the size bound "
+                        "or a gateway-issued carrier.",
+                    ) from exc
+            else:
+                try:
+                    provider_reasoning = (
+                        parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
+                    )
+                except ValueError as exc:
+                    raise invalid_field(
+                        param, f"'{param}' must be a gateway-issued carrier."
+                    ) from exc
         content, content_parts = message_content(
             message.content, f"{prefix}.{message_index}.content"
         )
@@ -672,6 +712,7 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
                 content_parts=content_parts,
                 tool_call_id=message.tool_call_id,
                 tool_calls=calls,
+                provider_tool_name=message.name,
                 provider_reasoning=provider_reasoning,
             )
         )
@@ -789,10 +830,15 @@ def _response_input_messages(
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
     for index, item in enumerate(value):
-        if isinstance(item, (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput)):
+        if isinstance(
+            item,
+            (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput, _HostedToolItemEcho),
+        ):
             # The raw caller item, not the re-serialized wire model, so the
             # native rung receives the item byte-for-byte.
-            if isinstance(item, _CustomToolCall):
+            if isinstance(item, _HostedToolItemEcho):
+                native_role = "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
+            elif isinstance(item, _CustomToolCall):
                 native_role = "assistant"
             elif isinstance(item, _CustomToolCallOutput):
                 native_role = "tool"
@@ -802,6 +848,17 @@ def _response_input_messages(
                 ReplayedNativeItem(index=index, role=native_role, item=raw_items[index])
             )
         elif isinstance(item, _ResponseReasoningItem):
+            if item.encrypted_content is None:
+                # A store=true flow replays reasoning by item id alone (the
+                # SDK marks encrypted_content optional); only the issuing
+                # native Responses wire can resolve the id, so the item is
+                # carried verbatim like a hosted-tool item and the provider
+                # judges resolvability, rather than rejecting SDK-legal
+                # input the provider itself may serve.
+                replayed.append(
+                    ReplayedNativeItem(index=index, role="assistant", item=raw_items[index])
+                )
+                continue
             if item.encrypted_content.startswith(FIREWORKS_REASONING_CONTENT_PREFIX):
                 try:
                     block: EncryptedReasoningBlock | SealedReasoningContentBlock = (
@@ -848,12 +905,44 @@ def _response_input_messages(
                             "provider_item_id": item.id,
                             "provider_output_index": index,
                             "provider_status": item.status,
+                            "provider_namespace": item.namespace,
+                            "provider_caller": item.caller,
                         }
                     ),
                 )
             )
         else:
+            if isinstance(item.output, str):
+                output_text, output_parts = item.output, ()
+            else:
+                # The SDK list form: text and image parts map onto the
+                # canonical tool message (the tool-message contract carries
+                # exactly those two kinds); any other kind is a named 400
+                # because a tool result has no canonical carrier for it and
+                # dropping it would misstate what the tool returned.
+                output_text, output_parts = message_content(item.output, f"input.{index}.output")
+                unsupported = next(
+                    (part for part in output_parts if part.kind not in ("text", "image")),
+                    None,
+                )
+                if unsupported is not None:
+                    raise unsupported_field(
+                        f"input.{index}.output",
+                        message=(
+                            "function_call_output.output supports text and image parts "
+                            f"only; this list carries a {unsupported.kind!r} part."
+                        ),
+                    )
+                output_text = output_text or ""
             replayed.append(
-                ReplayedFunctionOutput(index=index, call_id=item.call_id, output=item.output)
+                ReplayedFunctionOutput(
+                    index=index,
+                    call_id=item.call_id,
+                    output=output_text,
+                    name=item.name,
+                    namespace=item.namespace,
+                    caller=item.caller,
+                    content_parts=output_parts,
+                )
             )
     return responses_input_messages(tuple(replayed))

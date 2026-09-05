@@ -448,6 +448,14 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                namespace: object
+                    .get("namespace")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                caller: object
+                    .get("caller")
+                    .filter(|value| value.is_object())
+                    .cloned(),
             },
             "tool_arguments_delta" => events::Event::ToolArgumentsDelta { index, delta: text },
             "tool_call_completed" => events::Event::ToolCallCompleted {
@@ -463,6 +471,14 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_string(),
+                    namespace: object
+                        .get("namespace")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    caller: object
+                        .get("caller")
+                        .filter(|value| value.is_object())
+                        .cloned(),
                     provider_item_id: object
                         .get("item_id")
                         .and_then(serde_json::Value::as_str)
@@ -517,6 +533,8 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_string(),
+                    namespace: None,
+                    caller: None,
                     name: object
                         .get("name")
                         .and_then(serde_json::Value::as_str)
@@ -536,6 +554,85 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 index,
                 block: object
                     .get("block")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "hosted_tool_item_started" => events::Event::HostedToolItemStarted {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item_type: object
+                    .get("item_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item: object
+                    .get("item")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "hosted_tool_item_progress" => events::Event::HostedToolItemProgress {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                event_type: object
+                    .get("event_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                payload: object
+                    .get("payload")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "hosted_tool_item_completed" => events::Event::HostedToolItemCompleted {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item_type: object
+                    .get("item_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item: object
+                    .get("item")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "provider_text_annotation" => events::Event::ProviderTextAnnotation {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                annotation: object
+                    .get("annotation")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
