@@ -186,7 +186,7 @@ all-text list keeps the plain-string wire shape, and any other part kind is a na
 reasoning input item without `encrypted_content` (a `store: true` replay by item id) carries
 verbatim to homogeneous native Responses routes and the provider judges resolvability. Off the
 native Responses wire, tool-call and tool-result attribution (`namespace`/`caller`/output
-`name`) drops with per-field disclosure — the call itself always survives — and a
+`name`) drops with per-field disclosure. The call itself always survives, and a
 Messages-surface effort the route cannot serve rejects as `output_config.effort` with
 "effort parameter … not supported" phrasing, the exact predicate Claude Code's built-in
 drop-and-retry recovery latches on.
@@ -318,7 +318,7 @@ Anthropic message object. Completed streams stop with `end_turn` (`tool_use` whe
 present) and token-limited streams with `max_tokens`. The Anthropic protocol defines no
 idempotency header, so this surface never joins the keyed replay stores.
 
-Exposure-gated reasoning rungs (Tencent Hunyuan, DeepSeek — rows the catalog stamps
+Exposure-gated reasoning rungs (Tencent Hunyuan and DeepSeek, rows the catalog stamps
 `reasoning_output_exposed`) return the model's plaintext `reasoning_content` on every non-tool
 Chat turn, and the caller may echo that text back verbatim on later assistant turns: the
 decoder carries it as an `exposed_reasoning_content` block, route narrowing forwards it only to
@@ -327,7 +327,7 @@ rungs that expose their reasoning (a route with no exposing rung rejects it by n
 on the others), and the payload builder writes it back onto the wire unchanged. The provider's
 own API accepts and does not validate that text, so it is ordinary caller-owned history, exactly
 like a prior assistant `content`. A TOOL turn's reasoning still round-trips only as the sealed,
-rung-pinned carrier (`x-experiential-hunyuan-reasoning-v1:`), which the same decoder recognizes
+rung-pinned carrier (`x-trustedrouter-onprem-hunyuan-reasoning-v1:`), which the same decoder recognizes
 by prefix. This is what lets a Terminus-style loop (commands parsed from assistant text, output
 fed back as user messages) and Harbor's interleaved-thinking replay both preserve thinking.
 

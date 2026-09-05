@@ -602,7 +602,7 @@ def route_generation_parameter_requests(
     # only on the native Responses wire; every other rung rebuilds the call
     # or result without it. The call still executes with its exact name and
     # arguments, so the omission is disclosed per field rather than
-    # rejected — but only the caller's attribution is dropped, never the
+    # rejected. Only the caller's attribution is dropped, never the
     # call itself.
     if not all(profile.dialect == "openai_responses" for profile in profiles):
         attribution_paths = (

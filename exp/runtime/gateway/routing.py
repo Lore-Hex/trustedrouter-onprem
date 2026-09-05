@@ -66,7 +66,7 @@ class RouteResolver(Protocol):
     ``CatalogRouteResolver`` is the engine's implementation; a platform wrapper
     that composes or delegates to it annotates itself against this Protocol so
     ``ty`` statically catches a missing or drifted resolution method instead of
-    surfacing it at runtime. It captures ONLY the public resolution seam — the
+    surfacing it at runtime. It captures ONLY the public resolution seam: the
     three ways an authorization becomes a frozen :class:`GatewayRoute`; the
     catalog-swap, metadata, and lifecycle methods are implementation detail and
     deliberately excluded so a wrapper need not re-expose them.

@@ -83,8 +83,8 @@ class ExposedReasoningContentBlock(ContractModel):
     returns the model's reasoning as plaintext ``reasoning_content`` on every
     non-tool turn; the provider's own wire accepts that text back verbatim on
     later assistant turns and validates nothing about it. The caller echoing
-    it is therefore ordinary conversation history — no different from prior
-    assistant ``content`` — so it is carried as this block and forwarded only
+    it is therefore ordinary conversation history, no different from prior
+    assistant ``content``. It is carried as this block and forwarded only
     to rungs that expose their reasoning. Tool turns keep the sealed carrier
     (``SealedReasoningContentBlock``), which additionally pins the issuing rung.
     """

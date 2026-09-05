@@ -84,7 +84,7 @@ def _carries_exposed_reasoning(profile: GatewayWireProfile, request: GatewayRequ
 
     Replayed plaintext ``reasoning_content`` reaches the provider only on an
     exposure-gated rung; any other rung serves the turn by dropping it (a
-    disclosed drop), so it is only a fallback behind a rung that carries it —
+    disclosed drop), so it is only a fallback behind a rung that carries it,
     the same preference rule sampling controls follow.
     """
     if profile.reasoning_output_exposed:

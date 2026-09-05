@@ -522,7 +522,7 @@ def test_adaptive_thinking_translates_to_a_budget_on_a_budgeted_route() -> None:
 
 def test_adaptive_thinking_with_a_legal_caller_budget_keeps_that_budget() -> None:
     """The model rejects ``adaptive`` by name, so a budget-carrying adaptive
-    config still translates to enabled — honoring the caller's own depth."""
+    config still translates to enabled, honoring the caller's own depth."""
     request = _messages_request(
         provider_thinking_config={"type": "adaptive", "budget_tokens": 2_048},
         maximum_output_tokens=8_000,

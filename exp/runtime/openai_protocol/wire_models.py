@@ -692,7 +692,7 @@ class _ResponseReasoningItem(_WireModel):
     provider resolves it from stored state. An id-only item is carried
     verbatim to homogeneous native Responses routes (the only wire that
     can resolve the id) and the provider judges resolvability with its own
-    error — the hosted-item posture. Verified live 2026-09-05
+    error, following the hosted-item posture. Verified live 2026-09-05
     (api.openai.com, gpt-5.1): a stored response's reasoning item replayed
     by id with no encrypted_content completed with 200 under BOTH
     ``store: true`` and ``store: false``.

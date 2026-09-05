@@ -418,7 +418,7 @@ def test_chat_decoder_accepts_plaintext_reasoning_as_exposed_history() -> None:
 
     An exposure-gated rung (Tencent/DeepSeek) returns plaintext reasoning on
     every non-tool turn; a Terminus/Harbor loop echoes it back verbatim. The
-    decoder carries it as an ``exposed_reasoning_content`` block — route
+    decoder carries it as an ``exposed_reasoning_content`` block. Route
     admission, not the decoder, decides which rungs may replay it.
     """
     decoded = decode_chat(
@@ -438,7 +438,7 @@ def test_chat_decoder_accepts_plaintext_reasoning_as_exposed_history() -> None:
     block = decoded.request.messages[1].provider_reasoning[0]
     assert block.kind == "exposed_reasoning_content"
     assert block.content == "The user wants a directory listing."
-    # A reasoning-only assistant turn (content null — an exposed rung's
+    # A reasoning-only assistant turn (content null from an exposed rung's
     # length-cut thinking turn, echoed exactly as returned) decodes too.
     reasoning_only = decode_chat(
         {

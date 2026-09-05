@@ -214,14 +214,14 @@ def anthropic_messages_stream_payload(
     # A budgeted-enabled-only model (haiku-4-5) rejects ``thinking.type:
     # adaptive`` and ``output_config.effort`` by NAME: its reasoning dial is a
     # token budget, not the effort ladder. An effort reaching this seam is the
-    # caller's depth intent, so it is realized as a derived budget — the same
+    # caller's depth intent, so it is realized as a derived budget, the same
     # wire realization the effort generation gets via the adaptive object.
     budgeted_only = supports_reasoning and anthropic_budgeted_enabled_only(model_id)
     if budgeted_only and "effort" in output_config and request.reasoning_effort is not None:
         # A recognized caller effort rides request.reasoning_effort too (decode
         # maps it) and is realized as the token budget below, so the by-name-
         # rejected output_config key comes off the wire. An UNRECOGNIZED effort
-        # never mapped, has no budget realization, and stays verbatim — the
+        # never mapped, has no budget realization, and stays verbatim. The
         # provider's own by-name rejection is the honest outcome, never a
         # silent thinking-off answer.
         output_config.pop("effort")

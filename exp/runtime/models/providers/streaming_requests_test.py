@@ -296,7 +296,7 @@ def test_haiku_thinking_off_temperature_is_honored_under_the_srn_hatch() -> None
     """With thinking off (no config), haiku's srn hatch keeps temperature.
 
     haiku has no "none" on its effort ladder, so the srn hatch opens on the
-    absence of any thinking budget instead — thinking-off traffic that sets
+    absence of any thinking budget instead. Thinking-off traffic that sets
     temperature keeps it rather than regressing to a silent drop.
     """
     profile = _budgeted_haiku_profile()
@@ -318,7 +318,7 @@ def test_haiku_thinking_off_temperature_is_honored_under_the_srn_hatch() -> None
     assert payload["temperature"] == 0.5
 
     # Contrast: with thinking ENABLED, Anthropic requires temperature 1, so the
-    # same control is a disclosed drop, not a rejection — srn is per request.
+    # same control is a disclosed drop, not a rejection. srn is per request.
     thinking_on = honored.model_copy(
         update={"provider_thinking_config": {"type": "enabled", "budget_tokens": 2_048}}
     )
@@ -332,7 +332,7 @@ def test_haiku_bare_effort_realizes_as_a_token_budget_at_the_payload_seam() -> N
 
     haiku rejects ``thinking.type: adaptive`` and ``output_config.effort`` by
     name; an effort reaching the build is the caller's depth intent (or the
-    route's pinned default), realized as the derived token budget — the same
+    route's pinned default), realized as the derived token budget, the same
     wire realization the effort generation gets via the adaptive object.
     """
     request = GatewayRequest(

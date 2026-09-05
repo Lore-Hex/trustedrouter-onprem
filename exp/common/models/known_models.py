@@ -41,9 +41,9 @@ class KnownModel:
 
     ``None`` defers to ``supports_reasoning_effort`` (the historical
     derivation, kept for backward compatibility). An explicit ``True`` marks a
-    reasoning-capable model whose depth is NOT an OpenAI-style effort ladder —
+    reasoning-capable model whose depth is NOT an OpenAI-style effort ladder,
     for example an Anthropic budgeted-enabled model whose thinking is expressed
-    through ``budget_tokens`` — so its thinking config is honored even though
+    through ``budget_tokens``. Its thinking config is honored even though
     ``supports_reasoning_effort`` is ``False``.
     """
     reasoning_effort: (
@@ -168,7 +168,7 @@ def _anthropic_chat(
     ``adaptive_reasoning`` is the xhigh-effort adaptive generation: it pins
     temperature and top_p to their thinking-on values for the whole route. A
     budgeted-enabled model instead passes ``supports_reasoning=True`` with
-    ``sampling_requires_reasoning_none=True`` and keeps ordinary sampling —
+    ``sampling_requires_reasoning_none=True`` and keeps ordinary sampling;
     its thinking is optional, so a global temperature pin would reject every
     legitimate thinking-off request; the srn hatch resolves the "temperature
     must be 1 with thinking on" conflict per request instead.

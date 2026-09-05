@@ -135,10 +135,10 @@ def _coerce_adaptive_budget(
     """Translate an adaptive thinking config for a budgeted-enabled route.
 
     A budgeted-enabled Anthropic model (haiku-4-5) rejects ``thinking.type:
-    adaptive`` by name — that is the effort-ladder generation's channel — but
+    adaptive`` by name because that is the effort-ladder generation's channel, but
     accepts a budgeted ``enabled`` config. Claude Code, configured for an
     adaptive model, pins ``adaptive`` on every model, so the serviceable
-    reading here is to translate it to ``enabled`` with a budget — the
+    reading here is to translate it to ``enabled`` with a budget: the
     caller's own when they carried a legal one, a derived one otherwise
     (the model rejects ``adaptive`` by NAME, so leaving a budget-carrying
     adaptive config verbatim would still fail at the provider). When no
@@ -309,7 +309,7 @@ def _drop_thinking_and_effort(
     thinking config, the caller effort, and the Messages ``output_config.effort``
     channel all go, and a ``clear_thinking`` context edit rides on the thinking
     config and is stripped with it. Every removal is disclosed. History thinking
-    blocks are NOT touched — Anthropic accepts replayed blocks without a live
+    blocks are NOT touched because Anthropic accepts replayed blocks without a live
     thinking config.
     """
     updates: dict[str, object] = {"provider_thinking_config": None}

@@ -502,7 +502,7 @@ def test_hunyuan_tool_turn_reasoning_round_trips_as_a_sealed_carrier(
 
     The rung is marked as an exposed-plaintext reasoning route on the wire (so
     the data plane returns ``reasoning_content`` to the caller on plain turns,
-    which replay as plaintext — see the plain-turn test), while a tool turn's
+    which replay as plaintext; see the plain-turn test), while a tool turn's
     round-trip token stays the domain-separated opaque carrier: a
     second replica unseals the exact turn and forwards the plaintext upstream,
     the Fireworks-only ``reasoning_history`` wire flag never appears, and a
@@ -612,7 +612,7 @@ def test_hunyuan_plain_turn_plaintext_reasoning_replays_verbatim(tmp_path: Path)
     as a user message, so every turn is a non-tool turn: the exposing rung
     returns plaintext ``reasoning_content`` and the caller echoes it. The
     provider's wire accepts that text verbatim and validates nothing about it,
-    so the gateway forwards it to the exposing rung — no carrier, no route
+    so the gateway forwards it to the exposing rung with no carrier, no route
     pin, no disclosure.
     """
     _manager, raw_key = _configured_gateway(
