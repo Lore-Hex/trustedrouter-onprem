@@ -3567,7 +3567,7 @@ def test_replayed_reasoning_content_degrades_instead_of_wedging_cross_model_sess
 
     A session that touched a reasoning-exposed rung (or whose AI-SDK client
     re-serializes reasoning parts) carries plaintext reasoning_content in its
-    transcript — on tool-call turns too. A non-exposed route now drops the
+    transcript, including on tool-call turns. A non-exposed route now drops the
     block with disclosure and dispatches without it; an exposed route
     forwards it verbatim beside the tool calls. Previously both repro shapes
     400d ("must be a gateway-issued carrier on an assistant tool-call turn" /
@@ -3638,7 +3638,7 @@ def test_replayed_reasoning_content_degrades_instead_of_wedging_cross_model_sess
     assert astra_messages[1]["tool_calls"]
 
     # The same history onto an exposed route forwards the plaintext verbatim
-    # beside the tool calls (the provider's own wire shape) — no demand for a
+    # beside the tool calls (the provider's own wire shape), with no demand for a
     # sealed carrier on history the gateway never issued.
     public_exposed, provider_exposed = route_generation_parameter_requests(
         (exposed,), decoded.request
@@ -3677,7 +3677,7 @@ def test_a_forged_carrier_prefix_on_a_tool_turn_never_decodes_as_plaintext() -> 
 
     Caller plaintext on tool-call turns decodes as caller-owned exposed
     history, but text carrying a gateway carrier PREFIX must parse as the
-    genuine gateway-issued carrier or reject — it never falls back to the
+    genuine gateway-issued carrier or reject. It never falls back to the
     plaintext path, so untrusted input cannot be interpreted as (or
     substituted for) gateway-issued reasoning bound to the calls.
     """

@@ -355,7 +355,7 @@ class GatewayWireProfile:
         no ``service_tier`` wire field -> False (it would strip or decline);
         BYOK -> True (the caller pays the provider directly); otherwise the
         host-funded rung must carry a pass-through card for THAT tier (else it
-        strips the tier and runs the provider default at the base rate —
+        strips the tier and runs the provider default at the base rate;
         billing-safe and disclosed).
         """
         if tier is None or self.dialect not in SERVICE_TIER_DIALECTS:

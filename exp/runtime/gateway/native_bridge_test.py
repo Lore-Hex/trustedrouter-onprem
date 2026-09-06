@@ -734,7 +734,7 @@ def test_plaintext_reasoning_degrades_on_a_route_without_exposure(tmp_path: Path
 
     The block is baked into the caller's transcript (an earlier exposed-rung
     turn or a client re-serialization), so admission serves the request and
-    discloses the drop — previously a named 400 that killed every session
+    discloses the drop. Previously, a named 400 killed every session
     the moment it switched from a reasoning-exposed model to any other."""
     _manager, raw_key = _configured_gateway(tmp_path, capabilities=ModelCapabilities())
     control = NativeControlPlane(

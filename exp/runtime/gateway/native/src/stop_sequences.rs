@@ -423,11 +423,11 @@ mod tests {
 
     #[test]
     fn multibyte_text_never_splits_a_character() {
-        let out = run(&["—end"], &["héllo —e", "nd tail"], Event::Completed);
+        let out = run(&["§end"], &["héllo §e", "nd tail"], Event::Completed);
         assert_eq!(text(&out), "héllo ");
-        assert!(stopped_at(out.last(), "—end"));
-        let out = run(&["—end"], &["héllo —", "x"], Event::Completed);
-        assert_eq!(text(&out), "héllo —x");
+        assert!(stopped_at(out.last(), "§end"));
+        let out = run(&["§end"], &["héllo §", "x"], Event::Completed);
+        assert_eq!(text(&out), "héllo §x");
     }
 
     #[test]

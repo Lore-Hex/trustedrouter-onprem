@@ -122,7 +122,7 @@ class InflightRequest:
     # Whether each route depth actually FORWARDS the requested service tier to
     # its provider (``GatewayWireProfile.forwards_tier``), captured at admission
     # where the resolved wire profiles exist. The accounting reprice gates on
-    # this so it applies the per-tier card ONLY on a depth that emits the tier —
+    # this so it applies the per-tier card ONLY on a depth that emits the tier;
     # forward and bill stay consistent even if a card sits on a lane that would
     # strip it. Empty on surfaces without a service tier (images, embeddings).
     tier_forwarded_by_depth: tuple[bool, ...] = ()

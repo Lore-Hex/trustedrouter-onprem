@@ -3807,7 +3807,7 @@ def test_service_tier_scale_strips_on_host_lane_without_rejecting() -> None:
     """`scale` (a valid tier we do not price as opt-in) strips on a host lane.
 
     A flex-carded host rung carries a card for flex only; a `scale` request is
-    not rejected and not forwarded — it is stripped with disclosure and the
+    not rejected and not forwarded. It is stripped with disclosure and the
     provider runs its default at the base rate (billing-safe).
     """
     scale_request = _tiered_request(GatewayApiSurface.CHAT_COMPLETIONS).model_copy(
@@ -4119,7 +4119,7 @@ def test_plaintext_reasoning_route_gate_discloses_or_forwards() -> None:
 
     Plaintext reasoning is baked into the transcript (an earlier exposed-rung
     turn or a client re-serialization), so a route that cannot replay it
-    degrades instead of rejecting — previously a 400 that killed every
+    degrades instead of rejecting. Previously, a 400 killed every
     session the moment it switched from an exposed model to any other.
     """
     request = _exposed_reasoning_request()

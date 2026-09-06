@@ -121,7 +121,7 @@ def admitted_route_requests(
     # a priority request instead of forwarding it and silently billing the base
     # rate while the provider charges the priority premium (underbill). Every
     # OTHER tier (auto/default carry no price; scale and any future value) is
-    # never rejected here — a non-billable candidate simply strips it at payload
+    # never rejected here. A non-billable candidate simply strips it at payload
     # build (billing-safe, disclosed), so only the opt-in priced tiers gate.
     # A prompt that cannot fit any rung's context window is refused HERE, before
     # a reservation or a provider call: the provider would only 400 it back

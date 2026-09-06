@@ -204,7 +204,7 @@ def _deployment_priced_for_service_tier(
     transparently. ``forwards_tier`` is the admission-time forwarding decision
     for this exact depth (``GatewayWireProfile.forwards_tier``); gating on it
     keeps FORWARD and BILL consistent even if a card ever sits on a lane whose
-    wire would strip the tier (non-tier dialect, tier disabled) — such a depth
+    wire would strip the tier (non-tier dialect, tier disabled). Such a depth
     runs the provider's base schedule, so it must bill the base schedule too. No
     tier, no forwarding, or no card returns the deployment unchanged. The copy
     stays Python-side and never crosses the native boundary.

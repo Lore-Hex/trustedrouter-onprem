@@ -675,7 +675,7 @@ def route_generation_parameter_requests(
         # with disclosure instead of rejecting: "remove the field" is not
         # actionable for a framework-managed history, and a session that ever
         # touched an exposed model would otherwise die the moment it switches
-        # models. Exposing rungs — when the route has any — still forward the
+        # models. Exposing rungs, when the route has any, still forward the
         # plaintext verbatim; the others omit it at encoding.
         ignore(
             "messages.reasoning_content",
