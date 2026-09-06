@@ -6,7 +6,12 @@ from typing import Literal, cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
+from exp.common.models.catalog import (
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    GatewayServiceTierPrices,
+    GatewayTokenPrices,
+)
 from exp.common.models.content import (
     AudioContentPart,
     ImageContentPart,
@@ -15,15 +20,18 @@ from exp.common.models.content import (
     VideoContentPart,
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.model import ModelCapabilities
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,
     GatewayMessage,
+    GatewayNamedToolChoice,
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_admission import (
     _prefer_cache_capable_rungs,
     admitted_route_requests,
@@ -31,6 +39,7 @@ from exp.runtime.gateway.native_admission import (
     route_rejection,
 )
 from exp.runtime.gateway.native_dispatch import NativeWireClient
+from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
@@ -416,8 +425,6 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
         tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
         parallel_tool_calls=True,
         service_tier="flex",
-        stream=True,
-        include_usage=True,
     )
 
     class _CoercionCounter:
@@ -457,6 +464,87 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
     assert public.ignored_parameters == ("service_tier",)
     assert provider.service_tier is None
     assert accounting.recorded == 1
+    # The rebuild after the capability coercion must not lose the affinity
+    # key: it is attached to the request admission finally settled on.
+    assert provider.provider_prompt_cache_key is not None
+    assert public.provider_prompt_cache_key is None
+
+
+def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:
+    """The provider request carries the derived key; the public request does not.
+
+    The key is derived from the frozen authority plus the caller's
+    ``prompt_cache_key`` (or the conversation stem), so it is stable across
+    the turns of one session, never the caller's raw value, and never
+    part of the public request or its serialized identity.
+    """
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    streaming = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    deployments = (_deployment("shim", gateway=streaming),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    wires = (
+        (
+            GatewayWireProfile(dialect="openai_compatible", url="https://shim.test"),
+            cast(NativeWireClient, object()),
+        ),
+    )
+
+    class _CoercionCounter:
+        """Count coercion recordings without a live ledger."""
+
+        recorded = 0
+
+        def record_admission_coercions(self, count: int) -> None:
+            """Accumulate one admission's coercion count."""
+            self.recorded += count
+
+    def admit(messages: tuple[GatewayMessage, ...], key: str | None) -> GatewayRequest:
+        """Admit one request and return the provider-side request it dispatches."""
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            prompt_cache_key=key,
+            stream=True,
+            include_usage=True,
+        )
+        _narrowed, _wires_out, public, provider = admitted_route_requests(
+            route,
+            wires,
+            request,
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+            authorization=route.snapshot.authorization,
+        )
+        assert public.provider_prompt_cache_key is None
+        assert public.prompt_cache_key == key
+        return provider
+
+    stem = (
+        GatewayMessage(role="system", content="You are Terminus."),
+        GatewayMessage(role="user", content="Task: list files."),
+    )
+    turn_1 = admit(stem, None)
+    turn_2 = admit(
+        (
+            *stem,
+            GatewayMessage(role="assistant", content='{"command": "ls"}'),
+            GatewayMessage(role="user", content="Output: a.txt"),
+        ),
+        None,
+    )
+    assert turn_1.provider_prompt_cache_key is not None
+    assert turn_1.provider_prompt_cache_key == turn_2.provider_prompt_cache_key
+    keyed = admit(stem, "session-7")
+    assert keyed.provider_prompt_cache_key is not None
+    assert "session-7" not in keyed.provider_prompt_cache_key
+    assert keyed.provider_prompt_cache_key != turn_1.provider_prompt_cache_key
+    # The affinity key is dispatch state only: it never enters serialization.
+    assert "provider_prompt_cache_key" not in keyed.model_dump(mode="json")
 
 
 def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_disclosure() -> None:
@@ -722,3 +810,446 @@ def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> 
     assert provider.provider_thinking_config is None
     assert provider.reasoning_effort == "medium"
     assert accounting.recorded == 1
+
+
+def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
+    """A flex/priority request rejects fail-closed before reservation when no
+    rung can honor it: a host lane without per-tier pass-through pricing and no
+    BYOK rung. auto/default never reject."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "house",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                ),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    # House rung: billing_customer_managed False and no tier pricing, so it does
+    # not forward service_tier.
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://house.test"), client),)
+    accounting = cast(NativeAttemptAccounting, object())
+
+    for tier in ("flex", "priority"):
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="go"),),
+            service_tier=tier,
+        )
+        with pytest.raises(ProviderCapabilityError) as exc:
+            admitted_route_requests(
+                route,
+                wires,
+                request,
+                accounting=accounting,
+                authorization=route.snapshot.authorization,
+            )
+        assert exc.value.capability == "service_tier"
+
+    # auto/default carry no price, and `scale` (a valid OpenAI tier we do not
+    # price as opt-in) is stripped downstream, not rejected: only flex/priority
+    # gate at admission.
+    for tier in ("auto", "default", "scale"):
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="go"),),
+            service_tier=tier,
+        )
+        admitted_route_requests(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
+        )
+
+
+def test_tier_priced_host_lane_admits_the_named_tier() -> None:
+    """A host rung whose model carries per-tier pricing forwards the tier, so a
+    flex request is admitted (not rejected)."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "house",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                    prices=GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        output_micro_usd_per_million_tokens=4_000_000,
+                        flex=GatewayServiceTierPrices(
+                            input_micro_usd_per_million_tokens=500_000,
+                            output_micro_usd_per_million_tokens=2_000_000,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://house.test",
+                service_tier_pricing_enabled=True,
+                service_tier_cards=frozenset({"flex"}),
+            ),
+            client,
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        service_tier="flex",
+    )
+    _narrowed, _wires_out, _public, provider = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, object()),
+        authorization=route.snapshot.authorization,
+    )
+    # The tier survives to the provider request on the tier-priced house lane.
+    assert provider.service_tier == "flex"
+
+
+def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
+    """The reject keys on the SPECIFIC requested tier's card, not just the lane:
+    a house model carded for flex only rejects a priority request (no card ->
+    would underbill), while a BYOK rung forwards any tier with no platform card
+    (the customer pays the provider directly)."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    accounting = cast(NativeAttemptAccounting, object())
+    client = cast(NativeWireClient, object())
+    streaming = GatewayDeploymentCapabilities(supports_streaming=True)
+
+    # House model carries a FLEX card only.
+    flex_only_route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "house",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(
+                    capabilities=streaming,
+                    prices=GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        output_micro_usd_per_million_tokens=4_000_000,
+                        flex=GatewayServiceTierPrices(
+                            input_micro_usd_per_million_tokens=500_000,
+                            output_micro_usd_per_million_tokens=2_000_000,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    house_wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://house.test",
+                service_tier_pricing_enabled=True,
+                service_tier_cards=frozenset({"flex"}),
+            ),
+            client,
+        ),
+    )
+    priority_request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        service_tier="priority",
+    )
+    with pytest.raises(ProviderCapabilityError) as exc:
+        admitted_route_requests(
+            flex_only_route,
+            house_wires,
+            priority_request,
+            accounting=accounting,
+            authorization=flex_only_route.snapshot.authorization,
+        )
+    assert exc.value.capability == "service_tier"
+
+    # A BYOK rung (billing_customer_managed) forwards ANY tier with no card.
+    byok_route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "byok",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(capabilities=streaming),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    byok_wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://byok.test",
+                billing_customer_managed=True,
+            ),
+            client,
+        ),
+    )
+    _n, _w, _p, provider = admitted_route_requests(
+        byok_route,
+        byok_wires,
+        priority_request,
+        accounting=accounting,
+        authorization=byok_route.snapshot.authorization,
+    )
+    assert provider.service_tier == "priority"
+
+
+class _CoercionCounter:
+    """Count coercion recordings without a live ledger."""
+
+    def __init__(self) -> None:
+        """Start at zero recorded coercions."""
+        self.recorded = 0
+
+    def record_admission_coercions(self, count: int) -> None:
+        """Accumulate one admission's disclosure count."""
+        self.recorded += count
+
+
+_TOOL_CAPABLE = GatewayDeploymentMetadata(
+    capabilities=GatewayDeploymentCapabilities(
+        supports_streaming=True,
+        supports_strict_tools=True,
+        supports_streaming_tool_arguments=True,
+    )
+)
+"""One rung declaration that admits every tool control these tests send."""
+
+
+def _fable_and_shim_wires(
+    *, shim_model: str = "anthropic/claude-fable-5-1"
+) -> tuple[tuple[GatewayWireProfile, NativeWireClient], ...]:
+    """Pair a native fable-5-1 rung with an OpenAI-compatible aggregator rung."""
+    client = cast(NativeWireClient, object())
+    return (
+        (
+            GatewayWireProfile(
+                dialect="anthropic_messages",
+                url="https://anthropic.test",
+                model_id="claude-fable-5-1",
+            ),
+            client,
+        ),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible", url="https://shim.test", model_id=shim_model
+            ),
+            client,
+        ),
+    )
+
+
+def _forced_choice_request(
+    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
+) -> GatewayRequest:
+    """Build one streaming request forcing the lookup tool on ``surface``."""
+    return GatewayRequest(
+        surface=surface,
+        messages=(GatewayMessage(role="user", content="weather in Paris"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        tool_choice=choice,
+        stream=True,
+        include_usage=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("surface", "choice"),
+    (
+        (GatewayApiSurface.CHAT_COMPLETIONS, "required"),
+        (GatewayApiSurface.RESPONSES, GatewayNamedToolChoice(name="lookup")),
+        (GatewayApiSurface.MESSAGES, "required"),
+    ),
+)
+def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
+    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
+) -> None:
+    """fable-5-1 declines ``any``/``tool`` by name, so a waterfall with an
+    aggregator rung serves the caller's forced choice VERBATIM on that rung
+    and discloses nothing."""
+    deployments = (
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),
+        _deployment("shim", gateway=_TOOL_CAPABLE),
+    )
+    route = _mixed_route("maximize_availability", deployments, surface)
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires(),
+        _forced_choice_request(surface, choice),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("shim",)
+    assert provider.tool_choice == choice
+    assert public.ignored_parameters == ()
+    assert accounting.recorded == 0
+
+
+@pytest.mark.parametrize(
+    ("surface", "choice"),
+    (
+        (GatewayApiSurface.CHAT_COMPLETIONS, GatewayNamedToolChoice(name="lookup")),
+        (GatewayApiSurface.RESPONSES, "required"),
+        (GatewayApiSurface.MESSAGES, GatewayNamedToolChoice(name="lookup")),
+    ),
+)
+def test_a_forced_choice_relaxes_to_auto_with_disclosure_when_no_rung_can_force(
+    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
+) -> None:
+    """An all-fable-5-1 route (production shape: ~45 requests in 6h failed
+    post-dispatch across all three surfaces) serves under ``auto`` and tells
+    the caller through ``ignored_parameters``."""
+    deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
+    route = _mixed_route("maximize_availability", deployments, surface)
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires()[:1],
+        _forced_choice_request(surface, choice),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native",)
+    assert provider.tool_choice == "auto"
+    assert public.tool_choice == "auto"
+    assert public.ignored_parameters == ("tool_choice->auto",)
+    assert accounting.recorded == 1
+
+
+_MAX_ITEMS_SCHEMA: JsonObject = {
+    "type": "object",
+    "properties": {"cities": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
+    "required": ["cities"],
+    "additionalProperties": False,
+}
+
+
+def _strict_tool_request(parameters: JsonObject) -> GatewayRequest:
+    """Build one streaming Chat request carrying a single strict tool."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="list cities"),),
+        tools=(GatewayToolDefinition(name="list", parameters=parameters, strict=True),),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_a_strict_schema_the_anthropic_validator_rejects_prefers_a_strict_capable_rung() -> None:
+    """``maxItems`` under ``strict`` is a known Anthropic 400 (18 requests in
+    6h in production), so the waterfall narrows to the OpenAI-compatible rung
+    that honors strict verbatim and nothing is disclosed."""
+    deployments = (
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),
+        _deployment("shim", gateway=_TOOL_CAPABLE),
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires(),
+        _strict_tool_request(_MAX_ITEMS_SCHEMA),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("shim",)
+    assert provider.tools[0].strict is True
+    assert provider.tools[0].parameters == _MAX_ITEMS_SCHEMA
+    assert public.ignored_parameters == ()
+    assert accounting.recorded == 0
+
+
+def test_a_strict_schema_no_rung_can_honor_drops_strict_and_keeps_the_schema() -> None:
+    """On an all-Anthropic route the disclosed degrade drops only ``strict``;
+    the schema, ``maxItems`` included, still reaches the model as guidance."""
+    deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires()[:1],
+        _strict_tool_request(_MAX_ITEMS_SCHEMA),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native",)
+    assert provider.tools[0].strict is False
+    assert provider.tools[0].parameters == _MAX_ITEMS_SCHEMA
+    assert public.ignored_parameters == ("tools.strict->false",)
+    assert accounting.recorded == 1
+
+
+def test_an_open_strict_schema_is_closed_for_the_anthropic_rung_with_disclosure() -> None:
+    """A strict tool whose objects leave ``additionalProperties`` open is a
+    400 by name on Anthropic ("must be explicitly set to false"); admission
+    closes the objects, keeps ``strict``, and discloses the tightening."""
+    deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    accounting = _CoercionCounter()
+    open_schema: JsonObject = {"type": "object", "properties": {"city": {"type": "string"}}}
+    _narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires()[:1],
+        _strict_tool_request(open_schema),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.tools[0].strict is True
+    assert provider.tools[0].parameters == {**open_schema, "additionalProperties": False}
+    assert public.ignored_parameters == ("tools.parameters.additionalProperties->false",)
+    assert accounting.recorded == 1
+
+
+def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> None:
+    """The context-window refusal runs first: no rung shaping, no accounting, exact numbers."""
+    deployments = (
+        _deployment("shim").model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=100)}
+        ),
+        _deployment("native").model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=200)}
+        ),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="x" * (201 * MAXIMUM_BYTES_PER_TOKEN)),),
+    )
+
+    with pytest.raises(ProviderParameterError) as caught:
+        admitted_route_requests(
+            route,
+            _wires(),
+            request,
+            # Never reached: the refusal precedes every coercion or reservation.
+            accounting=cast(NativeAttemptAccounting, object()),
+            authorization=route.snapshot.authorization,
+        )
+
+    assert caught.value.code == "context_length_exceeded"
+    assert caught.value.param == "messages"
+    assert "at least 201 tokens" in str(caught.value)
+    assert "200 tokens" in str(caught.value)

@@ -306,6 +306,10 @@ pub enum Event {
     Usage(Usage),
     Completed,
     Incomplete,
+    /// The gateway cut the stream at one of the caller's stop sequences on a
+    /// wire that has no stop field (OpenAI Responses). Settles as completed;
+    /// the Messages encoder reports `stop_sequence` with this exact value.
+    StoppedAtSequence(String),
     /// Anthropic `pause_turn` terminal: the provider paused a long-running
     /// server-tool turn and expects the caller to resend the conversation to
     /// continue it. Settlement treats it like a completed turn; the Messages
@@ -318,7 +322,11 @@ impl Event {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Event::Completed | Event::Incomplete | Event::PausedTurn | Event::Failed(_)
+            Event::Completed
+                | Event::Incomplete
+                | Event::StoppedAtSequence(_)
+                | Event::PausedTurn
+                | Event::Failed(_)
         )
     }
 
@@ -609,7 +617,9 @@ pub fn simplified_event(event: &Event) -> Value {
             }
             payload
         }
-        Event::Completed => serde_json::json!({"kind": "completed"}),
+        // A stop-sequence cut is a completed turn to every python consumer
+        // (guardrails, retention); only the public encoders name the sequence.
+        Event::Completed | Event::StoppedAtSequence(_) => serde_json::json!({"kind": "completed"}),
         Event::Incomplete => serde_json::json!({"kind": "incomplete"}),
         Event::PausedTurn => serde_json::json!({"kind": "paused_turn"}),
         Event::Failed(failure) => serde_json::json!({
@@ -682,6 +692,9 @@ pub struct ToolAccumulator {
     pub server: bool,
 }
 
+/// Opaque tool IDs share the Python model bound, including signature carriers.
+const MAXIMUM_TOOL_CALL_ID_CHARACTERS: usize = 65_536;
+
 impl ToolAccumulator {
     pub fn new(call_id: String, name: String) -> Self {
         Self {
@@ -708,7 +721,7 @@ impl ToolAccumulator {
         // exactly the same provider tool-call streams (a call the python
         // engine rejects must not become client-visible history here).
         if self.call_id.is_empty()
-            || self.call_id.chars().count() > 256
+            || self.call_id.chars().count() > MAXIMUM_TOOL_CALL_ID_CHARACTERS
             || self.name.is_empty()
             || self.name.chars().count() > 256
             || self

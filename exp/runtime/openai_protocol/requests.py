@@ -108,17 +108,38 @@ class DecodedEmbeddingsRequest(ContractModel):
     request: EmbeddingsRequest
 
 
-def _without_chat_reasoning_content(payload: JsonObject) -> JsonObject:
-    """Hide the authenticated Chat extension from official OpenAI validation."""
+_CHAT_MESSAGE_EXTENSION_KEYS = frozenset(
+    {
+        "reasoning_content",
+        "provider_specific_fields",
+        "thinking_blocks",
+        "reasoning_items",
+        "images",
+    }
+)
+"""Message keys the strict wire model owns; hidden from official validation.
+
+``reasoning_content`` is the authenticated Chat extension; the other four are
+LiteLLM's message-dump keys, which ``_Message`` admits only in their empty (or,
+for ``provider_specific_fields``, dropped-and-disclosed) forms.
+"""
+
+
+def _without_chat_message_extensions(payload: JsonObject) -> JsonObject:
+    """Hide the wire-model-owned message keys from official OpenAI validation."""
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list):
         return payload
     changed = False
     messages: list[JsonValue] = []
     for raw_message in raw_messages:
-        if isinstance(raw_message, dict) and "reasoning_content" in raw_message:
+        if isinstance(raw_message, dict) and _CHAT_MESSAGE_EXTENSION_KEYS & raw_message.keys():
             messages.append(
-                {key: value for key, value in raw_message.items() if key != "reasoning_content"}
+                {
+                    key: value
+                    for key, value in raw_message.items()
+                    if key not in _CHAT_MESSAGE_EXTENSION_KEYS
+                }
             )
             changed = True
         else:
@@ -156,7 +177,7 @@ def decode_chat(
     # ("ultra"), so the strict wire model owns reasoning validation.
     _validate_official(
         _CHAT_OFFICIAL,
-        _without_chat_reasoning_content(payload),
+        _without_chat_message_extensions(payload),
         extension_fields={"top_k", "reasoning_effort"},
     )
     request = _validate_wire(_ChatRequest, payload)
@@ -561,6 +582,18 @@ def _shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     expected: list[str] = []
     got: str | None = None
     for detail in details:
+        if detail["type"] == "string_too_long":
+            # The bound and the arriving LENGTH are both display-safe facts
+            # (the value itself is never echoed); stating them saves the
+            # caller from bisecting the ceiling out of a bare rejection.
+            context = detail.get("ctx") or {}
+            maximum = context.get("max_length")
+            value = detail.get("input")
+            if isinstance(maximum, int) and isinstance(value, str):
+                return (
+                    f"Invalid value for '{param}': expected at most "
+                    f"{maximum:,} characters, but got {len(value):,}."
+                )
         phrase = _EXPECTED_BY_ERROR_TYPE.get(detail["type"])
         if detail["type"] in {"literal_error", "enum"}:
             context = detail.get("ctx") or {}
@@ -674,15 +707,15 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             # history and route admission decides which rungs may carry it.
             scheme = scheme_for_carrier(message.reasoning_content)
             if scheme is None:
-                if calls:
-                    # A tool turn's reasoning is only ever issued as the sealed
-                    # carrier that binds it to its calls and issuing rung;
-                    # plaintext here was never ours and would bypass that bond.
-                    raise invalid_field(
-                        param,
-                        f"'{param}' must be a gateway-issued carrier on an assistant "
-                        "tool-call turn.",
-                    )
+                # Plaintext reasoning is caller-owned history on ANY assistant
+                # turn, tool-call turns included: AI-SDK clients re-serialize a
+                # reasoning part onto the same assistant message as its tool
+                # calls, and exposure-gated providers themselves emit
+                # reasoning_content on tool turns. The field is baked into the
+                # transcript, so rejecting it wedges every session that ever
+                # touched a reasoning-exposed model (the sealed-carrier bond
+                # applies only to text presented AS a gateway-issued carrier,
+                # which keeps its strict path below).
                 try:
                     provider_reasoning = (
                         ExposedReasoningContentBlock(content=message.reasoning_content),
@@ -714,6 +747,9 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
                 tool_calls=calls,
                 provider_tool_name=message.name,
                 provider_reasoning=provider_reasoning,
+                # An empty object is the common LiteLLM stamp and carries
+                # nothing to disclose; only a populated one is a dropped field.
+                provider_specific_fields=message.provider_specific_fields or None,
             )
         )
     return tuple(converted)

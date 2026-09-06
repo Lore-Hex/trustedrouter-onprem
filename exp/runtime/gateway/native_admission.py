@@ -26,12 +26,18 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_responses import ContinuationContext
+from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
+from exp.runtime.gateway.prompt_size import require_prompt_fits_context_window
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
-from exp.runtime.models.providers import preflight_gateway_request
+from exp.runtime.models.providers import (
+    emulated_gateway_capabilities,
+    preflight_gateway_request,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import (
     coerce_generation_parameters,
     coerce_route_rejections,
+    coerce_strict_tool_schemas,
     coerce_structured_text_schema,
 )
 from exp.runtime.models.providers.errors import (
@@ -51,6 +57,29 @@ from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespa
 _logger = logging.getLogger(__name__)
 
 _ResolvedWires = tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
+
+
+def _with_cache_affinity(
+    provider_request: GatewayRequest, authorization: AuthorizationSnapshot
+) -> GatewayRequest:
+    """Attach the tenant's cache-affinity key to the final dispatch request.
+
+    Cache affinity is per tenant and per session, so it is derived once, from
+    the request admission settled on and the frozen authority, and read by
+    every rung's payload builder that forwards it. It is applied last so no
+    admission-time rebuild (route narrowing, capability or schema coercion)
+    can drop it; the public request keeps the caller's own ``prompt_cache_key``
+    untouched.
+    """
+    return provider_request.model_copy(
+        update={
+            "provider_prompt_cache_key": provider_prompt_cache_key(
+                provider_request,
+                organization_id=str(authorization.organization_id),
+                identity_id=str(authorization.identity_id),
+            ),
+        }
+    )
 
 
 def admitted_route_requests(
@@ -84,6 +113,32 @@ def admitted_route_requests(
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
     """
+    # flex/priority are the tiers we price as an OPT-IN pass-through, so they
+    # fail CLOSED before any reservation when no rung can BILL the requested one:
+    # a BYOK rung forwards any tier (customer pays the provider directly, no
+    # platform card needed), while a house rung must carry a per-tier card for
+    # THIS tier (`forwards_tier`). A model carded for flex only therefore rejects
+    # a priority request instead of forwarding it and silently billing the base
+    # rate while the provider charges the priority premium (underbill). Every
+    # OTHER tier (auto/default carry no price; scale and any future value) is
+    # never rejected here. A non-billable candidate simply strips it at payload
+    # build (billing-safe, disclosed), so only the opt-in priced tiers gate.
+    # A prompt that cannot fit any rung's context window is refused HERE, before
+    # a reservation or a provider call: the provider would only 400 it back
+    # (charging nothing but costing a round trip and an opaque message).
+    require_prompt_fits_context_window(route, request)
+
+    if request.service_tier in ("flex", "priority"):
+        tier = request.service_tier
+        if not any(profile.forwards_tier(tier) for profile, _client in resolved_wires):
+            raise ProviderCapabilityError(
+                capability="service_tier",
+                detail=(
+                    "This model does not offer a flex or priority processing tier. "
+                    "Remove service_tier, or choose a model with tiered pricing enabled."
+                ),
+            )
+
     admitted_request = request
     coercion_disclosures: tuple[str, ...] = ()
     full_route = route
@@ -167,18 +222,18 @@ def admitted_route_requests(
         provider_request = provider_request.model_copy(
             update={"stream": True, "include_usage": True}
         )
-    # The surviving rungs decide whether the structured-output schema needs
-    # its objects closed; a route that lost every Anthropic rung above is
-    # dispatched with the caller's schema verbatim.
-    coercion = coerce_structured_text_schema(
-        tuple(profile for profile, _client in resolved_wires),
-        admitted_request,
-    )
-    if coercion is not None:
+    # The surviving rungs decide whether the structured-output schema and the
+    # strict tool schemas need their objects closed; a route that lost every
+    # Anthropic rung above is dispatched with the caller's schemas verbatim.
+    surviving_profiles = tuple(profile for profile, _client in resolved_wires)
+    for coerce_schema in (coerce_structured_text_schema, coerce_strict_tool_schemas):
+        coercion = coerce_schema(surviving_profiles, admitted_request)
+        if coercion is None:
+            continue
         admitted_request = coercion.request
         coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
         public_request, provider_request = route_generation_parameter_requests(
-            tuple(profile for profile, _client in resolved_wires),
+            surviving_profiles,
             admitted_request,
         )
         provider_request = provider_request.model_copy(
@@ -193,6 +248,7 @@ def admitted_route_requests(
                 )
             }
         )
+    provider_request = _with_cache_affinity(provider_request, authorization)
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
     return route, resolved_wires, public_request, provider_request
 
@@ -366,6 +422,7 @@ def protocol_compatible_indexes(
                 model_capabilities=deployment.capabilities,
                 public_stream=public_stream,
                 route_provider=deployment.provider,
+                emulated_capabilities=emulated_gateway_capabilities(profile.dialect),
             )
             dialect_stream_payload(profile, provider_request)
         except (ProviderParameterError, ProviderCapabilityError) as exc:

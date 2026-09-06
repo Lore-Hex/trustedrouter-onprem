@@ -12,7 +12,7 @@ boundary encoding; this module owns the frozen semantics.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -119,6 +119,13 @@ class InflightRequest:
     signers: tuple[GatewayDispatchSigner | None, ...] = ()
     dispatch_bindings: tuple[FrozenDispatchBinding | None, ...] = ()
     reasoning_carrier_authorities: tuple[ReasoningCarrierAuthority | None, ...] = ()
+    # Whether each route depth actually FORWARDS the requested service tier to
+    # its provider (``GatewayWireProfile.forwards_tier``), captured at admission
+    # where the resolved wire profiles exist. The accounting reprice gates on
+    # this so it applies the per-tier card ONLY on a depth that emits the tier;
+    # forward and bill stay consistent even if a card sits on a lane that would
+    # strip it. Empty on surfaces without a service tier (images, embeddings).
+    tier_forwarded_by_depth: tuple[bool, ...] = ()
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
@@ -538,6 +545,7 @@ def deployment_wire_entry(
     upstream_payload: JsonObject,
     upstream_body: str | None = None,
     headers: dict[str, str] | None = None,
+    stop_sequences: Sequence[str] = (),
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -555,6 +563,9 @@ def deployment_wire_entry(
         headers: Optional per-request headers overriding the profile's
             static wire headers (a beta token joining exactly the requests
             that carry its gated field).
+        stop_sequences: Caller stop sequences the data plane must enforce on
+            this rung's stream because the provider wire has no stop field
+            (OpenAI Responses). Empty when the provider honours them itself.
 
     Returns:
         The JSON-compatible wire entry consumed by the data plane.
@@ -573,6 +584,10 @@ def deployment_wire_entry(
         "fireworks_reasoning_route_sha256": profile.fireworks_reasoning_route_sha256,
         "hunyuan_reasoning_route_sha256": profile.hunyuan_reasoning_route_sha256,
         "reasoning_output_exposed": profile.reasoning_output_exposed,
+        # Gateway-emulated stop sequences: the stream is cut at the first
+        # match and terminates with a stop-sequence reason. Empty for rungs
+        # whose payload already carries the caller's stop field.
+        "stop_sequences": list(stop_sequences),
         "idempotency_key": deployment_operation_key(route, deployment),
         # First-byte allowance overrides; the data plane falls back to its
         # serving defaults when a deployment declares nothing.

@@ -35,6 +35,14 @@ It serves:
 this same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
+Tool-call identifiers on Chat Completions and Responses are opaque strings of 1 to
+65,536 characters. Replay the complete returned identifier in both the assistant call
+and its tool result, including any signature suffix. The gateway preserves the identifier
+verbatim on OpenAI-compatible Chat routes; it does not decode or strip provider signatures.
+Output guardrail byte limits count the complete serialized completion, including
+tool IDs, tool names, arguments, and JSON framing.
+Provider-specific wire restrictions still apply when routing to a different API dialect.
+
 ## The data plane
 
 The gateway has exactly one data plane: a native Rust HTTP server compiled as
@@ -307,6 +315,25 @@ carriers, server tools replay only on the Anthropic wire, so a route with any ot
 them by name instead of dropping a requested capability. The terminal `message_delta` usage
 report supersedes the `message_start` input legs when present, because server-tool turns re-read
 fetched results as input and the start-frame count severely undercounts the billed total.
+
+OpenAI-family prefix caches are keyed per cache node behind the provider's load balancer, so
+an identical prompt hits but the same stem with a new tail (every turn of an agent loop) is
+routed by the whole prompt and usually misses (Tencent TokenHub, measured 2026-09-05: 2 of 8
+shared-stem turns hit with no hint, 10 of 10 with one). The gateway therefore dispatches a
+`prompt_cache_key` on rungs whose wire profile says the provider routes by it (OpenAI, Tencent
+TokenHub; other OpenAI-compatible servers may reject unknown fields, so they never receive it,
+BYOK or not): never the caller's raw value, which shares a house account across tenants, but a
+digest namespaced by organization and identity (`exp/runtime/gateway/prompt_cache_affinity.py`).
+A caller `prompt_cache_key` is the material when present; otherwise the conversation stem (the
+leading system/developer messages, which every turn of a session and every request sharing that
+system prompt repeat verbatim; the first user turn when there is no system prompt) stands in, so
+a Terminus-style loop is pinned to the node holding its cached stem for its whole session with
+no client change (measured through the gateway on a hot stem: 9/10 hits keyed vs 4/10 unkeyed). The derived key is dispatch state on the provider request only;
+the public request, its digests, and replay identity never carry it. LiteLLM message dumps
+(`provider_specific_fields`, null `thinking_blocks` / `reasoning_items` / `images`) decode when
+echoed back verbatim: the object is dropped with a `messages.provider_specific_fields`
+disclosure and the empty forms are accepted like the SDK's own empty keys, while populated
+carriers stay rejected by name.
 Thinking carriers replay only on the Anthropic wire, so route admission requires every waterfall
 rung to speak the `anthropic_messages` dialect; on the Responses surface over Anthropic routes,
 thinking text is projected onto the reasoning-summary channel (signatures deliberately dropped)
@@ -315,8 +342,28 @@ representation and drops it like summary deltas. Streaming emits the Anthropic
 lifecycle (`message_start`, `ping`, content blocks, `message_delta` with the mapped stop reason
 and usage, `message_stop`, or one terminal `error` event); the non-streaming body is the
 Anthropic message object. Completed streams stop with `end_turn` (`tool_use` when tool calls are
-present) and token-limited streams with `max_tokens`. The Anthropic protocol defines no
+present), token-limited streams with `max_tokens`, and a caller stop sequence that the gateway
+matched with `stop_sequence` plus the exact matched string. The Anthropic protocol defines no
 idempotency header, so this surface never joins the keyed replay stores.
+
+**Gateway-emulated stop sequences.** The OpenAI Responses API has no stop field, so a rung on
+that dialect admits `stop` / `stop_sequences` regardless of its catalog flag and the admitted
+route entry carries the caller's exact sequences instead of the payload. The native data plane
+cuts visible text at the first match (withholding only the shortest tail that could still start
+a sequence, so a match may span delta boundaries), discards what the model says afterwards,
+keeps draining lifecycle and usage events so settlement stays exact, and terminates the stream
+with a stop-sequence outcome: `finish_reason: stop` on Chat, `status: completed` on Responses,
+and `stop_reason: stop_sequence` on Messages. Reasoning, tool arguments, and refusals are never
+inspected. Rungs whose provider honours `stop` natively (Chat-compatible, Anthropic, Gemini,
+Bedrock) keep forwarding it on the wire.
+
+**Pre-dispatch context-window refusal.** Before any reservation or provider call, admission
+lower-bounds the prompt's token count from its UTF-8 text bytes (at six bytes per token, below
+what real tokenizers produce on prose, code, or CJK text; inline media is not counted) and
+refuses with `code: context_length_exceeded` and the exact numbers when even that lower bound
+exceeds the largest declared context window on the route. Anything under the bound dispatches
+and is left to the provider's precise count; output budgets are never refused here, a too-small
+ceiling is an `incomplete` answer.
 
 Exposure-gated reasoning rungs (Tencent Hunyuan and DeepSeek, rows the catalog stamps
 `reasoning_output_exposed`) return the model's plaintext `reasoning_content` on every non-tool
@@ -343,8 +390,27 @@ on the canonical ladder (ties prefer the lower level), ANY effort on a route wit
 support at all drops (first-party clients pin effort globally, so a named rejection made whole
 sessions unusable against non-reasoning models the provider itself serves fine without the
 parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
-dropped value reaches the provider through no channel), and `strict: true` tools degrade to
-best-effort schemas. On a reasoning route that accepts sampling only at `reasoning_effort=none`
+dropped value reaches the provider through no channel), `strict: true` tools degrade to
+best-effort schemas, and a forced `tool_choice` (`required`/`any`, or a named tool) relaxes to
+`auto` as `tool_choice->auto`. Two Anthropic wire facts feed those last two
+(`exp/runtime/models/providers/anthropic_tool_compat.py`, verified live 2026-09-05): Claude Fable
+5.1 and Mythos 5.1 answer a forced choice with a 400 by name on every request, and every model
+rejects a forced choice beside a budgeted `thinking: enabled` config, so the Anthropic builder
+declines those requests as `forced_tool_choice` before dispatch (narrowing prefers a rung that can
+force a tool, such as an aggregator rung of the same alias, and keeps the caller's selector
+verbatim there); and the strict validator compiles tool schemas into a grammar and 400s by name on
+keywords it cannot express (`maxItems`, `oneOf`, `minimum`, an unsupported `format`, a recursive
+`$ref`, ...), so a strict tool using one is declined as `strict_tools` on Anthropic rungs, which
+narrows to a strict-capable rung when the route has one and otherwise drops only `strict`, never
+a schema keyword. The same validator requires `additionalProperties: false` on every object, so
+strict tool schemas reaching an Anthropic rung have their objects closed with the
+`tools.parameters.additionalProperties->false` disclosure, exactly like structured-output schemas.
+The `capability_parity` row reports the per-release forced-choice fact as
+`supports_forced_tool_choice`. On the OpenAI-compatible Chat Completions wire a canonical
+`developer` message is emitted as `system` without disclosure: OpenAI defines the two roles
+identically (developer-provided instructions the model follows regardless of user messages),
+while the third-party servers behind that dialect enumerate only the classic roles and reject
+`developer` by name; the native Responses wire keeps the role it defines. The Anthropic wire also rejects an empty text block anywhere and a turn whose text is all whitespace, while it accepts an empty assistant content array in any position (verified live 2026-09-05): an assistant turn with no readable text dispatches as an empty array, a system prompt with none is omitted, empty blocks inside richer turns drop with their cache breakpoints migrated, and an empty or whitespace-only user turn (which no array form can carry) is refused by name before dispatch. On a reasoning route that accepts sampling only at `reasoning_effort=none`
 (`sampling_requires_reasoning_none`, e.g. gpt-5.6-sol/luna), a `temperature`/`top_p` sent with
 reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_effort_none)` rather
 than rejected. The model accepts sampling, just not at that effort, so the request serves and the

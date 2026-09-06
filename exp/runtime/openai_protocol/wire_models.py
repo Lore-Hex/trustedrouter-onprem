@@ -20,7 +20,7 @@ from exp.common.models.content import (
     MAXIMUM_IMAGE_BASE64_BYTES,
     MAXIMUM_VIDEO_BASE64_BYTES,
 )
-from exp.common.models.model import ReasoningEffort
+from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
 
@@ -87,6 +87,17 @@ class _ChatImagePart(_WireModel):
 
 _MAXIMUM_FILE_ID_CHARACTERS = 512
 """Longest OpenAI Files handle accepted on the wire."""
+
+
+_MAXIMUM_DESCRIPTION_CHARACTERS = 65_536
+"""Tool, function, and structured-format description bound, both surfaces.
+
+Matches the Messages surface and the canonical GatewayToolDefinition bound.
+The provider itself accepts far larger values (probed live 2026-09-05,
+api.openai.com: 8,292, 30,000, and 66,000-character descriptions all
+serve), and real agent toolsets exceeded the earlier 8,192 bound (prod
+report: an 8,292-character tool description 400d every agentic turn). The
+request-body size cap remains the effective total limit."""
 
 
 class _ResponsesImagePart(_WireModel):
@@ -242,7 +253,7 @@ class _AssistantToolCall(_WireModel):
     carried for the one wire that can honor it.
     """
 
-    id: str = Field(min_length=1, max_length=256)
+    id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     type: Literal["function"] = "function"
     function: _FunctionCall
     cache_control: EphemeralCacheControl | None = None
@@ -256,12 +267,23 @@ class _Message(_WireModel):
     keys even when they are empty. Callers echo those messages back verbatim
     on tool-call continuations, so the empty forms are accepted here; only a
     populated value is rejected as unsupported.
+
+    LiteLLM's ``Message.model_dump()`` adds ``provider_specific_fields``,
+    ``thinking_blocks``, ``reasoning_items``, and ``images`` to every
+    assistant message, and agent loops built on it (a Terminus-2 port that
+    keeps the LiteLLM message object) echo the whole dump back each turn.
+    ``provider_specific_fields`` is accepted with any object value and never
+    forwarded (a populated one is disclosed as dropped: it is LiteLLM's own
+    bookkeeping, not model input); the other three are accepted only empty,
+    exactly like the SDK keys above.
     """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | tuple[_ContentPart, ...] | None = None
     tool_calls: tuple[_AssistantToolCall, ...] | None = None
-    tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    tool_call_id: str | None = Field(
+        default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
+    )
     name: str | None = Field(default=None, min_length=1, max_length=256)
     """Tool function name on a ``role: "tool"`` message.
 
@@ -276,6 +298,10 @@ class _Message(_WireModel):
     annotations: tuple[()] | None = None
     audio: None = None
     function_call: None = None
+    provider_specific_fields: JsonObject | None = None
+    thinking_blocks: tuple[()] | None = None
+    reasoning_items: tuple[()] | None = None
+    images: tuple[()] | None = None
     reasoning_content: str | None = Field(
         default=None,
         max_length=MAXIMUM_REASONING_CARRIER_BYTES,
@@ -353,7 +379,7 @@ class _FunctionDefinition(_WireModel):
     """One function schema offered through Chat Completions."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool = False
 
@@ -369,7 +395,7 @@ class _StructuredSchema(_WireModel):
     """Named strict JSON Schema in a Chat response format."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     schema_: JsonObject = Field(alias="schema")
     strict: bool = True
 
@@ -575,7 +601,7 @@ class _ResponseTool(_WireModel):
 
     type: Literal["function"] = "function"
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool | None = None
 
@@ -621,7 +647,7 @@ class _ResponseFunctionCall(_WireModel):
 
     type: Literal["function_call"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
-    call_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     name: str = Field(min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
     caller: JsonObject | None = None
@@ -650,7 +676,7 @@ class _ResponseFunctionOutput(_WireModel):
     """
 
     type: Literal["function_call_output"]
-    call_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     name: str | None = Field(default=None, min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
     caller: JsonObject | None = None
@@ -711,7 +737,7 @@ class _ResponseFormat(_WireModel):
 
     type: Literal["text", "json_schema"]
     name: str | None = Field(default=None, min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     schema_: JsonObject | None = Field(default=None, alias="schema")
     strict: bool = True
 
@@ -783,7 +809,7 @@ class _CustomToolCall(_WireModel):
     type: Literal["custom_tool_call"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
-    call_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     name: str = Field(min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
     caller: JsonObject | None = None
@@ -798,7 +824,7 @@ class _CustomToolCallOutput(_WireModel):
     type: Literal["custom_tool_call_output"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
-    call_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     output: JsonValue
 
 

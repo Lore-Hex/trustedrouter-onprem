@@ -70,6 +70,11 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_adaptive_only_thinking,
     anthropic_budgeted_enabled_only,
 )
+from exp.runtime.models.providers.server_tools import (
+    anthropic_server_tool_names,
+    anthropic_server_tools_message,
+    anthropic_server_tools_present,
+)
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -380,15 +385,9 @@ def route_generation_parameter_requests(
                     supported_efforts=profile_efforts,
                     param=effort_path,
                 )
-    if request.stop and any(profile.dialect == "openai_responses" for profile in profiles):
-        raise ProviderParameterError(
-            message=(
-                "The parameter 'stop' is not supported by every deployment in this model "
-                "route. Remove the field or choose a Chat-compatible model."
-            ),
-            param="stop",
-            code="unsupported_parameter",
-        )
+    # Stop sequences on a native Responses rung: the Responses API has no stop
+    # field, so the data plane emulates them (the wire entry carries the exact
+    # sequences and the stream is cut at the first match). Nothing to reject.
     if request.reasoning_summary is not None and not all(
         serves_reasoning_summary(profile) for profile in profiles
     ):
@@ -502,18 +501,20 @@ def route_generation_parameter_requests(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         ignore("inference_geo")
-    # A provider tier forwards only where the caller pays that provider
-    # directly (BYOK) on a tier-preserving wire; a route with no such rung
-    # strips the tier up front with the same 'service_tier' disclosure the
-    # capability_policy drop path uses, so every rung serves and waterfalls
-    # stay deterministic. Host-funded rungs never emit it (they bill catalog
-    # rates while the tier changes provider pricing: flex discounted,
-    # priority premium) but stay in the route as untiered fallbacks; the
-    # dialect decline in dialect_stream_payload still guards mixed routes
-    # where an eligible rung keeps the tier alive.
+    # A provider tier forwards where the caller pays that provider directly
+    # (BYOK) OR on a host-funded rung that carries a per-tier pass-through card
+    # for THIS SPECIFIC tier (profile.forwards_tier), on a tier-preserving wire.
+    # Forwarding is per-tier, not lane-level: the shared request keeps the tier
+    # as long as ANY candidate can bill it, and each non-billable candidate
+    # strips it at its own payload build (openai_payloads gated on
+    # forwards_tier), so forward and bill agree on whichever candidate is
+    # selected. A route where NO candidate can bill the tier strips it up front
+    # with the same 'service_tier' disclosure the capability_policy drop path
+    # uses. Host-funded rungs without a card for this tier never emit it (they
+    # bill catalog rates while the tier changes provider pricing: flex
+    # discounted, priority premium) but stay in the route as untiered fallbacks.
     if request.service_tier is not None and not any(
-        profile.dialect in SERVICE_TIER_DIALECTS and profile.billing_customer_managed
-        for profile in profiles
+        profile.forwards_tier(request.service_tier) for profile in profiles
     ):
         ignore("service_tier")
         provider_updates["service_tier"] = None
@@ -572,6 +573,14 @@ def route_generation_parameter_requests(
     ) and not any(profile.dialect == "anthropic_messages" for profile in profiles):
         if "messages.content.cache_control" not in ignored:
             ignored.append("messages.content.cache_control")
+
+    # LiteLLM stamps ``provider_specific_fields`` on every assistant message it
+    # returns, and naive agent loops echo the dump back verbatim. No wire takes
+    # the object, so it is dropped on every route with disclosure, never a
+    # rejection (the 400 wedged whole Terminus-2 sessions, 2026-09-05).
+    if any(message.provider_specific_fields for message in request.messages):
+        if "messages.provider_specific_fields" not in ignored:
+            ignored.append("messages.provider_specific_fields")
 
     # Anthropic-native tool-definition annotations exist only on that wire;
     # every other rung drops each one with a per-field disclosure, never a
@@ -657,22 +666,21 @@ def route_generation_parameter_requests(
         for message in request.messages
         for block in message.provider_reasoning
     )
-    if exposed_reasoning_present:
-        if not any(profile.reasoning_output_exposed for profile in profiles):
-            raise ProviderParameterError(
-                message=(
-                    "The parameter 'messages.reasoning_content' carries plaintext reasoning, "
-                    "which only a model that exposes its reasoning can replay. Remove the "
-                    "field or choose a reasoning-exposed model alias."
-                ),
-                param="messages.reasoning_content",
-                code="unsupported_parameter",
-            )
-        if not all(profile.reasoning_output_exposed for profile in profiles):
-            ignore(
-                "messages.reasoning_content",
-                "messages.reasoning_content->dropped(unsupported_by_provider)",
-            )
+    if exposed_reasoning_present and not all(
+        profile.reasoning_output_exposed for profile in profiles
+    ):
+        # Plaintext reasoning is baked into the caller's transcript (an
+        # earlier turn on a reasoning-exposed rung, or a client-side AI-SDK
+        # re-serialization), so a route that cannot replay it drops the block
+        # with disclosure instead of rejecting: "remove the field" is not
+        # actionable for a framework-managed history, and a session that ever
+        # touched an exposed model would otherwise die the moment it switches
+        # models. Exposing rungs, when the route has any, still forward the
+        # plaintext verbatim; the others omit it at encoding.
+        ignore(
+            "messages.reasoning_content",
+            "messages.reasoning_content->dropped(unsupported_by_provider)",
+        )
     history_thinking_present = any(
         block.kind in {"thinking", "redacted_thinking"}
         for message in request.messages
@@ -755,22 +763,17 @@ def route_generation_parameter_requests(
                 param="thinking.type",
                 code="unsupported_parameter",
             )
-    server_tools_present = bool(request.provider_server_tools) or any(
-        message.provider_anthropic_block is not None for message in request.messages
-    )
-    if server_tools_present and not all(
+    if anthropic_server_tools_present(request) and not all(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
-        # Server tools execute at the provider; silently dropping a search
-        # capability the caller asked for would be a behavior lie, so a
-        # route that cannot serve them rejects by name instead.
+        server_tool_names = anthropic_server_tool_names(request)
+        # Server tools execute inside Anthropic's API; silently dropping a
+        # search capability the caller asked for would be a behavior lie, so
+        # a route that cannot serve them rejects and NAMES the tool (Claude
+        # Code's WebSearch is the common case) so the caller knows which
+        # feature needs a Claude model.
         raise ProviderParameterError(
-            message=(
-                "The request carries Anthropic server tools (web_search-style "
-                "entries or their echoed result blocks) that only a native "
-                "Anthropic route can serve. Remove the server tools or choose "
-                "a different model alias."
-            ),
+            message=anthropic_server_tools_message(server_tool_names),
             param="tools",
             code="unsupported_parameter",
         )
@@ -827,7 +830,7 @@ def route_generation_parameter_requests(
 
     if any(profile.dialect == "anthropic_messages" for profile in profiles) and any(
         message.role == "user"
-        and not message.content
+        and not (message.content or "").strip()
         and not message.content_parts
         and message.provider_anthropic_block is None
         and message.provider_native_item is None
@@ -835,15 +838,18 @@ def route_generation_parameter_requests(
     ):
         # The Anthropic wire rejects empty text content blocks post-dispatch
         # ("text content blocks must be non-empty"; 2026-09-05, six orgs on
-        # claude-fable routes). Empty blocks inside a richer turn drop
-        # loss-free at conversion, but a user turn that is entirely empty
-        # has nothing to send and dropping the whole message would change
-        # conversation structure, so it is refused by name pre-dispatch.
+        # claude-fable routes) and a user turn whose text is all whitespace
+        # ("text content blocks must contain non-whitespace text"; a user
+        # message must have non-empty content, so unlike an assistant turn
+        # it cannot dispatch as an empty array). Empty blocks inside a richer
+        # turn drop loss-free at conversion, but a user turn with no readable
+        # text has nothing to send and dropping the whole message would
+        # change conversation structure, so it is refused by name pre-dispatch.
         raise ProviderParameterError(
             message=(
-                "A user message with empty content cannot be served by this "
-                "model route: the provider rejects empty text content blocks. "
-                "Add content to the message or remove it."
+                "A user message with empty or whitespace-only content cannot be "
+                "served by this model route: the provider rejects empty text "
+                "content blocks. Add content to the message or remove it."
             ),
             param="messages",
             code="invalid_parameter",

@@ -1512,18 +1512,28 @@ def test_payload_builder_rejects_conditional_sampling_without_admission() -> Non
         )
 
 
-def test_route_rejects_stop_before_native_responses_dispatch() -> None:
-    """Chat stop sequences never reach a Responses deployment that lacks the field."""
-    request = _chat_request().model_copy(update={"stop": ("DONE",)})
+def test_route_admits_stop_on_native_responses_and_keeps_it_off_the_wire() -> None:
+    """The Responses API has no stop field: the route admits stop for data-plane emulation.
 
-    with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests(
-            (GatewayWireProfile(dialect="openai_responses", url="https://provider.test"),),
-            request,
-        )
+    The canonical request keeps the caller's sequences (the wire entry hands
+    them to the native relay) while the provider payload never carries them.
+    """
+    request = _chat_request().model_copy(update={"stop": ("DONE", "</severity>")})
 
-    assert raised.value.code == "unsupported_parameter"
-    assert raised.value.param == "stop"
+    public_request, provider_request = route_generation_parameter_requests(
+        (GatewayWireProfile(dialect="openai_responses", url="https://provider.test"),),
+        request,
+    )
+
+    assert provider_request.stop == ("DONE", "</severity>")
+    assert "stop" not in public_request.ignored_parameters
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        provider_request,
+        supports_temperature=True,
+    )
+    assert "stop" not in payload
+    assert "stop_sequences" not in payload
 
 
 def test_responses_logprob_request_is_rejected_instead_of_ignored() -> None:
@@ -2935,7 +2945,12 @@ def test_server_tools_reject_mixed_routes_by_name() -> None:
             route_generation_parameter_requests(profiles, request)
         assert raised.value.code == "unsupported_parameter"
         assert raised.value.param == "tools"
-        assert "Anthropic" in str(raised.value)
+        # The rejection names the exact tool, its Claude Code label, and the
+        # Anthropic-only rule, so a Claude Code user knows what to change.
+        message = str(raised.value)
+        assert "'web_search' (Claude Code's WebSearch)" in message
+        assert "Anthropic only allows them on Anthropic (Claude) models" in message
+        assert "Switch to a Claude model alias" in message
 
 
 def test_server_tools_keep_tool_choice_on_an_anthropic_route() -> None:
@@ -3099,6 +3114,82 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
     assert mixed_provider.messages[0].provider_text_blocks
     foreign_public, _foreign_provider = route_generation_parameter_requests((fallback,), request)
     assert "messages.content.cache_control" in foreign_public.ignored_parameters
+
+
+def test_litellm_provider_specific_fields_are_dropped_with_disclosure_on_every_route() -> None:
+    """A populated LiteLLM stamp never reaches a provider and is always disclosed.
+
+    No wire has a field for it, so unlike cache markers the disclosure does
+    not depend on the route's dialects; an empty stamp decodes to nothing and
+    discloses nothing.
+    """
+    stamped = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="Reply with a command."),
+            GatewayMessage(
+                role="assistant",
+                content='{"command": "ls"}',
+                provider_specific_fields={"refusal": None},
+            ),
+            GatewayMessage(role="user", content="Output: a.txt"),
+        ),
+    )
+    compatible = GatewayWireProfile(dialect="openai_compatible", url="https://hy4.test")
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    for profiles in ((compatible,), (anthropic,), (compatible, anthropic)):
+        public, provider = route_generation_parameter_requests(profiles, stamped)
+        assert "messages.provider_specific_fields" in public.ignored_parameters
+        payload = openai_compatible_stream_payload("hy4-preview", provider)
+        messages = cast(list[JsonObject], payload["messages"])
+        assert all("provider_specific_fields" not in message for message in messages)
+    plain = stamped.model_copy(
+        update={
+            "messages": tuple(
+                message.model_copy(update={"provider_specific_fields": None})
+                for message in stamped.messages
+            )
+        }
+    )
+    public, _provider = route_generation_parameter_requests((compatible,), plain)
+    assert "messages.provider_specific_fields" not in public.ignored_parameters
+
+
+def test_prompt_cache_affinity_key_is_forwarded_only_where_the_rung_routes_by_it() -> None:
+    """The derived key rides ``prompt_cache_key`` on flagged rungs and nowhere else.
+
+    The caller's own ``prompt_cache_key`` is never the dispatched value: only
+    the admission-derived ``provider_prompt_cache_key`` is, and only when the
+    builder is told the rung's provider routes by it.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        prompt_cache_key="caller-session",
+        provider_prompt_cache_key="xpl-derived",
+        stream=True,
+        include_usage=True,
+    )
+    forwarded = openai_compatible_stream_payload(
+        "hy4-preview", request, forwards_prompt_cache_key=True
+    )
+    assert forwarded["prompt_cache_key"] == "xpl-derived"
+    withheld = openai_compatible_stream_payload("hy4-preview", request)
+    assert "prompt_cache_key" not in withheld
+    responses = openai_responses_stream_payload(
+        "gpt-5.5", request, supports_temperature=True, forwards_prompt_cache_key=True
+    )
+    assert responses["prompt_cache_key"] == "xpl-derived"
+    responses_withheld = openai_responses_stream_payload(
+        "gpt-5.5", request, supports_temperature=True
+    )
+    assert "prompt_cache_key" not in responses_withheld
+    # No derived key (admission found neither a caller key nor a stem): nothing
+    # is dispatched even on a flagged rung.
+    unkeyed = request.model_copy(update={"provider_prompt_cache_key": None})
+    assert "prompt_cache_key" not in openai_compatible_stream_payload(
+        "hy4-preview", unkeyed, forwards_prompt_cache_key=True
+    )
 
 
 def test_block_cache_markers_survive_a_multimodal_user_turn() -> None:
@@ -3676,6 +3767,65 @@ def test_service_tier_route_shaping_forwards_on_byok_and_discloses_elsewhere() -
     assert foreign_provider.service_tier is None
 
 
+def test_service_tier_forwarding_is_per_card_not_lane_level() -> None:
+    """A mixed route emits the tier only on the candidate that can BILL it.
+
+    Regression for the underbill window: the route admits because ONE host rung
+    carries a flex card, but a fallback host rung carded only for `priority`
+    must NOT forward the flex tier (its `service_tier_pricing_enabled` is True).
+    If it did and were selected, the provider would run flex (discounted) while
+    the gateway billed the base rate. Route shaping keeps the tier alive for the
+    flex-carded rung; the priority-only rung strips it at its own payload build,
+    so forward and bill agree on whichever candidate is selected.
+    """
+    request = _tiered_request(GatewayApiSurface.CHAT_COMPLETIONS)
+    flex_carded = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://flex.test",
+        model_id="model-x",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"flex"}),
+    )
+    priority_only = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://priority.test",
+        model_id="model-x",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"priority"}),
+    )
+    public, provider = route_generation_parameter_requests((flex_carded, priority_only), request)
+    # The tier survives route shaping (the flex-carded rung can bill it).
+    assert "service_tier" not in public.ignored_parameters
+    assert provider.service_tier == "flex"
+    # The selected candidate decides emission: flex-carded emits, priority-only
+    # strips (no flex card -> no underbill if it is the one that serves).
+    assert dialect_stream_payload(flex_carded, provider)["service_tier"] == "flex"
+    assert "service_tier" not in dialect_stream_payload(priority_only, provider)
+
+
+def test_service_tier_scale_strips_on_host_lane_without_rejecting() -> None:
+    """`scale` (a valid tier we do not price as opt-in) strips on a host lane.
+
+    A flex-carded host rung carries a card for flex only; a `scale` request is
+    not rejected and not forwarded. It is stripped with disclosure and the
+    provider runs its default at the base rate (billing-safe).
+    """
+    scale_request = _tiered_request(GatewayApiSurface.CHAT_COMPLETIONS).model_copy(
+        update={"service_tier": "scale"}
+    )
+    flex_carded = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://flex.test",
+        model_id="model-x",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"flex"}),
+    )
+    public, provider = route_generation_parameter_requests((flex_carded,), scale_request)
+    assert "service_tier" in public.ignored_parameters
+    assert provider.service_tier is None
+    assert "service_tier" not in dialect_stream_payload(flex_carded, provider)
+
+
 def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> None:
     """When no rung serves, the caller sees the first rung's own field-scoped reason.
 
@@ -3964,12 +4114,24 @@ def test_plaintext_reasoning_replays_only_on_an_exposing_rung() -> None:
     assert anthropic_messages[1]["content"] == [{"type": "text", "text": '{"command": "ls"}'}]
 
 
-def test_plaintext_reasoning_route_gate_rejects_discloses_or_forwards() -> None:
-    """No exposing rung -> named 400; mixed -> disclosed drop; all exposing -> silent."""
+def test_plaintext_reasoning_route_gate_discloses_or_forwards() -> None:
+    """No exposing rung -> disclosed drop; mixed -> disclosed drop; all exposing -> silent.
+
+    Plaintext reasoning is baked into the transcript (an earlier exposed-rung
+    turn or a client re-serialization), so a route that cannot replay it
+    degrades instead of rejecting. Previously, a 400 killed every
+    session the moment it switched from an exposed model to any other.
+    """
     request = _exposed_reasoning_request()
-    with pytest.raises(ProviderParameterError) as rejected:
-        route_generation_parameter_requests((_exposed_profile(exposed=False),), request)
-    assert rejected.value.param == "messages.reasoning_content"
+    public, provider = route_generation_parameter_requests(
+        (_exposed_profile(exposed=False),), request
+    )
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_provider)" in public.ignored_parameters
+    )
+    payload = openai_compatible_stream_payload("hy4-preview", provider)
+    payload_messages = cast("list[JsonObject]", payload["messages"])
+    assert all("reasoning_content" not in message for message in payload_messages)
 
     public, _provider = route_generation_parameter_requests(
         (
@@ -4223,7 +4385,17 @@ def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() ->
     with pytest.raises(ProviderParameterError) as rejected:
         route_generation_parameter_requests((anthropic,), request)
     assert rejected.value.param == "messages"
-    assert "empty content" in str(rejected.value)
+    assert "empty or whitespace-only content" in str(rejected.value)
+
+    # A whitespace-only user turn is the same refusal: the wire rejects it
+    # ("text content blocks must contain non-whitespace text", live
+    # 2026-09-05) and a user message cannot dispatch as an empty array.
+    whitespace = request.model_copy(
+        update={"messages": (*request.messages[:2], GatewayMessage(role="user", content="\n "))}
+    )
+    with pytest.raises(ProviderParameterError) as rejected_whitespace:
+        route_generation_parameter_requests((anthropic,), whitespace)
+    assert rejected_whitespace.value.param == "messages"
 
     # An all-empty cache-marked block run is the same empty turn (the blocks
     # must flatten to the content, so all-empty blocks imply empty content)

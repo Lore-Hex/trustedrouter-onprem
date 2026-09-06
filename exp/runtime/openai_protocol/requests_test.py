@@ -347,6 +347,56 @@ def test_chat_decoder_accepts_echoed_assistant_message_with_empty_sdk_fields() -
     assert decoded.request.messages[3].tool_calls == ()
 
 
+def test_chat_decoder_accepts_a_verbatim_litellm_message_dump() -> None:
+    """A LiteLLM ``Message.model_dump()`` echoed back on the next turn decodes.
+
+    LiteLLM stamps ``provider_specific_fields`` (an object), plus null
+    ``thinking_blocks``, ``reasoning_items`` and ``images``, on every assistant
+    message; a Terminus-2 port that keeps the message object resends all of
+    them (Akhara, 2026-09-05). The object is carried for disclosure and never
+    forwarded; the empty forms decode like the SDK's own empty keys.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "Reply with a command."},
+                {
+                    "content": '{"command": "ls"}',
+                    "role": "assistant",
+                    "tool_calls": None,
+                    "function_call": None,
+                    "provider_specific_fields": {"refusal": None},
+                    "reasoning_content": "The user wants a listing.",
+                    "thinking_blocks": None,
+                    "reasoning_items": None,
+                    "annotations": None,
+                    "audio": None,
+                    "images": None,
+                },
+                {"role": "user", "content": "Output: a.txt"},
+            ],
+        }
+    )
+    echoed = decoded.request.messages[1]
+    assert echoed.content == '{"command": "ls"}'
+    assert echoed.provider_specific_fields == {"refusal": None}
+    assert "provider_specific_fields" not in echoed.model_dump(mode="json")
+
+    # An empty object is the common stamp and carries nothing to disclose.
+    empty = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "provider_specific_fields": {}},
+                {"role": "user", "content": "next"},
+            ],
+        }
+    )
+    assert empty.request.messages[1].provider_specific_fields is None
+
+
 def test_chat_decoder_preserves_only_a_gateway_issued_reasoning_carrier() -> None:
     """A Fireworks continuation stays encrypted until authorized admission."""
     deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
@@ -454,31 +504,36 @@ def test_chat_decoder_accepts_plaintext_reasoning_as_exposed_history() -> None:
     assert (
         reasoning_only.request.messages[1].provider_reasoning[0].kind == "exposed_reasoning_content"
     )
-    # A tool-call turn's reasoning is only ever issued as the sealed carrier,
-    # so plaintext there was never ours and is rejected by name.
-    with pytest.raises(OpenAIProtocolError) as tool_turn:
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [
-                    {"role": "user", "content": "look it up"},
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "reasoning_content": "plaintext on a tool turn",
-                        "tool_calls": [
-                            {
-                                "id": "call-one",
-                                "type": "function",
-                                "function": {"name": "lookup", "arguments": "{}"},
-                            }
-                        ],
-                    },
-                    {"role": "tool", "tool_call_id": "call-one", "content": "done"},
-                ],
-            }
-        )
-    assert tool_turn.value.detail.param == "messages.1.reasoning_content"
+    # Plaintext on a tool-call turn is caller-owned history too: AI-SDK
+    # clients re-serialize a reasoning part onto the same assistant message
+    # as its tool calls, and exposure-gated providers emit reasoning_content
+    # on tool turns. It decodes like any other plaintext (previously a 400
+    # that wedged every cross-model session); the sealed-carrier bond keeps
+    # its strict path for text presented AS a carrier.
+    tool_turn = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "look it up"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "plaintext on a tool turn",
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    tool_turn_message = tool_turn.request.messages[1]
+    assert tool_turn_message.provider_reasoning[0].kind == "exposed_reasoning_content"
+    assert tool_turn_message.tool_calls[0].name == "lookup"
     # An empty string is not reasoning; it names its field.
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_chat(
@@ -518,8 +573,15 @@ def test_chat_decoder_rejects_unbound_or_malformed_reasoning_content(
 
 
 def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> None:
-    """A populated refusal or annotation in request history stays rejected."""
-    for extra in ({"refusal": "no"}, {"annotations": [{"type": "url_citation"}]}):
+    """A populated refusal, annotation, or LiteLLM carrier in history stays rejected."""
+    for extra in (
+        {"refusal": "no"},
+        {"annotations": [{"type": "url_citation"}]},
+        {"thinking_blocks": [{"type": "thinking", "thinking": "x", "signature": "y"}]},
+        {"reasoning_items": [{"type": "reasoning"}]},
+        {"images": [{"image_url": {"url": "https://example.test/a.png"}}]},
+        {"provider_specific_fields": "not-an-object"},
+    ):
         with pytest.raises(OpenAIProtocolError) as captured:
             decode_chat(
                 {
@@ -3498,3 +3560,352 @@ def test_a_name_on_a_non_tool_message_stays_a_named_400() -> None:
     assert error.value.status_code == 400
     assert error.value.detail.param == "messages.0"
     assert "name is valid only for tool messages" in str(error.value.detail.message)
+
+
+def test_replayed_reasoning_content_degrades_instead_of_wedging_cross_model_sessions() -> None:
+    """The prod OpenCode + gpt-6-astra wedge: rc in history serves everywhere.
+
+    A session that touched a reasoning-exposed rung (or whose AI-SDK client
+    re-serializes reasoning parts) carries plaintext reasoning_content in its
+    transcript, including on tool-call turns. A non-exposed route now drops the
+    block with disclosure and dispatches without it; an exposed route
+    forwards it verbatim beside the tool calls. Previously both repro shapes
+    400d ("must be a gateway-issued carrier on an assistant tool-call turn" /
+    "carries plaintext reasoning"), killing the session the moment it
+    switched models.
+    """
+    from exp.runtime.models.providers.base import GatewayWireProfile
+    from exp.runtime.models.providers.streaming_requests import (
+        dialect_stream_payload,
+        route_generation_parameter_requests,
+    )
+
+    astra = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://astra.test/v1",
+        model_id="gpt-6-astra",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+    )
+    exposed = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        model_id="hy4-preview",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_output_exposed=True,
+    )
+
+    # Repro A (the exact prod screenshot shape): rc beside tool_calls.
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "what time is it"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "The user wants the time; call get_time.",
+                    "tool_calls": [
+                        {
+                            "id": "call_rc1",
+                            "type": "function",
+                            "function": {"name": "get_time", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_rc1", "content": "12:00"},
+                {"role": "user", "content": "thanks, and the date?"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_time",
+                        "description": "d",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+    public, provider = route_generation_parameter_requests((astra,), decoded.request)
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_provider)" in public.ignored_parameters
+    )
+    payload = dialect_stream_payload(astra, provider.model_copy(update={"stream": True}))
+    astra_messages = cast(list[JsonObject], payload["messages"])
+    assert all("reasoning_content" not in message for message in astra_messages)
+    assert astra_messages[1]["tool_calls"]
+
+    # The same history onto an exposed route forwards the plaintext verbatim
+    # beside the tool calls (the provider's own wire shape), with no demand for a
+    # sealed carrier on history the gateway never issued.
+    public_exposed, provider_exposed = route_generation_parameter_requests(
+        (exposed,), decoded.request
+    )
+    assert not any("reasoning_content" in path for path in public_exposed.ignored_parameters)
+    exposed_payload = dialect_stream_payload(
+        exposed, provider_exposed.model_copy(update={"stream": True})
+    )
+    exposed_messages = cast(list[JsonObject], exposed_payload["messages"])
+    assert exposed_messages[1]["reasoning_content"] == "The user wants the time; call get_time."
+    assert exposed_messages[1]["tool_calls"]
+
+    # Repro B: rc on a plain assistant turn, non-exposed route.
+    decoded_b = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "A", "reasoning_content": "thinking..."},
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+    public_b, provider_b = route_generation_parameter_requests((astra,), decoded_b.request)
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_provider)"
+        in public_b.ignored_parameters
+    )
+    payload_b = dialect_stream_payload(astra, provider_b.model_copy(update={"stream": True}))
+    plain_messages = cast(list[JsonObject], payload_b["messages"])
+    assert all("reasoning_content" not in message for message in plain_messages)
+
+
+def test_a_forged_carrier_prefix_on_a_tool_turn_never_decodes_as_plaintext() -> None:
+    """The sealed-carrier boundary holds: a spoofed carrier is a named 400.
+
+    Caller plaintext on tool-call turns decodes as caller-owned exposed
+    history, but text carrying a gateway carrier PREFIX must parse as the
+    genuine gateway-issued carrier or reject. It never falls back to the
+    plaintext path, so untrusted input cannot be interpreted as (or
+    substituted for) gateway-issued reasoning bound to the calls.
+    """
+    with pytest.raises(OpenAIProtocolError) as forged:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": "look it up"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": (
+                            f"{FIREWORKS_REASONING_CONTENT_PREFIX}not-a-real-carrier"
+                        ),
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+                ],
+            }
+        )
+    assert forged.value.detail.param == "messages.1.reasoning_content"
+    assert "gateway-issued carrier" in str(forged.value.detail.message)
+
+
+def test_forced_tool_choice_decodes_canonically_on_both_openai_surfaces() -> None:
+    """Chat ``required``/named-function and Responses ``required``/named-function
+    both reach the canonical forced forms admission narrows and coerces on."""
+    tools_chat = [
+        {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    ]
+    chat_required = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": tools_chat,
+            "tool_choice": "required",
+        }
+    )
+    assert chat_required.request.tool_choice == "required"
+    chat_named = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": tools_chat,
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        }
+    )
+    assert chat_named.request.tool_choice == GatewayNamedToolChoice(name="lookup")
+
+    tools_responses = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    responses_required = decode_responses(
+        {"model": "coding", "input": "go", "tools": tools_responses, "tool_choice": "required"}
+    )
+    assert responses_required.request.tool_choice == "required"
+    responses_named = decode_responses(
+        {
+            "model": "coding",
+            "input": "go",
+            "tools": tools_responses,
+            "tool_choice": {"type": "function", "name": "lookup"},
+        }
+    )
+    assert responses_named.request.tool_choice == GatewayNamedToolChoice(name="lookup")
+
+
+def test_tool_description_bounds_are_uniform_and_named_on_both_surfaces() -> None:
+    """65,536-char descriptions serve; 65,537 is a self-explanatory named 400.
+
+    Prod report: an 8,292-char tool description 400d every agentic turn at
+    the old 8,192 bound while the provider itself serves 66,000+ (probed
+    live 2026-09-05). The bound now matches the Messages surface and the
+    canonical GatewayToolDefinition, and the over-limit rejection states the
+    limit and the arriving length instead of forcing the caller to bisect.
+    """
+    reporter_sized = "x" * 8_292
+    at_bound = "x" * 65_536
+    over_bound = "x" * 65_537
+
+    for description in (reporter_sized, at_bound):
+        decoded = decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "t",
+                            "description": description,
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            }
+        )
+        assert decoded.request.tools[0].description == description
+
+    with pytest.raises(OpenAIProtocolError) as chat_over:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "t",
+                            "description": over_bound,
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            }
+        )
+    assert chat_over.value.detail.param == "tools.0.function.description"
+    assert "at most 65,536 characters" in str(chat_over.value.detail.message)
+    assert "65,537" in str(chat_over.value.detail.message)
+
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "t",
+                    "description": at_bound,
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+    )
+    assert decoded.request.tools[0].description == at_bound
+    with pytest.raises(OpenAIProtocolError) as responses_over:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": "hi",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "t",
+                        "description": over_bound,
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            }
+        )
+    assert responses_over.value.detail.param == "tools.0.description"
+    assert "at most 65,536 characters" in str(responses_over.value.detail.message)
+
+
+def test_structured_format_description_bounds_are_uniform_and_named() -> None:
+    """The response_format and text.format description bounds match the tools'."""
+    at_bound = "x" * 65_536
+    over_bound = "x" * 65_537
+
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "shape",
+                    "description": at_bound,
+                    "schema": {"type": "object"},
+                },
+            },
+        }
+    )
+    assert decoded.request.structured_text is not None
+    assert decoded.request.structured_text.description == at_bound
+    with pytest.raises(OpenAIProtocolError) as chat_over:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "shape",
+                        "description": over_bound,
+                        "schema": {"type": "object"},
+                    },
+                },
+            }
+        )
+    assert chat_over.value.detail.param == "response_format.json_schema.description"
+    assert "at most 65,536 characters" in str(chat_over.value.detail.message)
+
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "shape",
+                    "description": at_bound,
+                    "schema": {"type": "object"},
+                }
+            },
+        }
+    )
+    assert decoded.request.structured_text is not None
+    assert decoded.request.structured_text.description == at_bound
+    with pytest.raises(OpenAIProtocolError) as responses_over:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": "hi",
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "shape",
+                        "description": over_bound,
+                        "schema": {"type": "object"},
+                    }
+                },
+            }
+        )
+    assert responses_over.value.detail.param == "text.format.description"
+    assert "at most 65,536 characters" in str(responses_over.value.detail.message)

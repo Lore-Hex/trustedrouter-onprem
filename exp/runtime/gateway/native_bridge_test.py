@@ -71,6 +71,7 @@ _PublicErrorType = Literal[
     (
         ("developer_messages", "messages", "instructions", "system"),
         ("function_tools", "tools", "tools", "tools"),
+        ("forced_tool_choice", "tool_choice", "tool_choice", "tool_choice"),
         (
             "parallel_tool_calls",
             "parallel_tool_calls",
@@ -728,8 +729,13 @@ def test_hunyuan_mixed_carrier_and_plaintext_history_round_trips(tmp_path: Path)
     assert messages[3]["reasoning_content"] == plain
 
 
-def test_plaintext_reasoning_is_rejected_on_a_route_without_exposure(tmp_path: Path) -> None:
-    """A rung that never issued plaintext reasoning rejects it by name."""
+def test_plaintext_reasoning_degrades_on_a_route_without_exposure(tmp_path: Path) -> None:
+    """A rung that cannot replay plaintext reasoning drops it with disclosure.
+
+    The block is baked into the caller's transcript (an earlier exposed-rung
+    turn or a client re-serialization), so admission serves the request and
+    discloses the drop. Previously, a named 400 killed every session
+    the moment it switched from a reasoning-exposed model to any other."""
     _manager, raw_key = _configured_gateway(tmp_path, capabilities=ModelCapabilities())
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
@@ -744,9 +750,13 @@ def test_plaintext_reasoning_is_rejected_on_a_route_without_exposure(tmp_path: P
             ],
         }
     )
-    with pytest.raises(NativeBridgeError) as rejected:
-        _admit(control, raw_key, body)
-    assert json.loads(rejected.value.public_error_json)["param"] == "messages.reasoning_content"
+    admitted = _admit(control, raw_key, body)
+    ignored = cast("list[str]", admitted["ignored_parameters"])
+    assert "messages.reasoning_content->dropped(unsupported_by_provider)" in ignored
+    route = cast("list[JsonObject]", admitted["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    sent_messages = cast("list[JsonObject]", payload["messages"])
+    assert all("reasoning_content" not in message for message in sent_messages)
 
 
 def test_hunyuan_endpoint_without_exposure_capability_strips_reasoning(
@@ -925,6 +935,9 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
 
     decoded = decode_chat(json.loads(_chat_body()))
     provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
+    # A generic OpenAI-compatible shim never receives the cache-affinity key
+    # (only OpenAI and Tencent endpoints route by it), so the payload is the
+    # plain build.
     assert admission["upstream_payload"] == openai_compatible_stream_payload(
         "provider-model-exact", provider_request
     )
@@ -4608,9 +4621,24 @@ def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
     assert json.loads(repeated.value.public_error_json)["code"] != "idempotency_conflict"
 
 
-def test_capability_rejection_names_the_public_request_field(tmp_path: Path) -> None:
-    """A pre-dispatch capability rejection names the exact public field."""
+def test_capability_rejection_names_the_public_request_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-dispatch capability rejection names the exact public field.
+
+    Both the caller's 400 and the ledger row name it: an alert that only
+    read "cannot preserve a requested capability" could not be triaged
+    without opening the request.
+    """
     control, raw_key = _control_plane(tmp_path)
+    recorded: list[GatewayFailure] = []
+    original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
+
+    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+        recorded.append(failure)
+        return original_finish(authorization, failure)
+
+    monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture_finish)  # noqa: SLF001
     body = json.dumps(
         {
             "model": "coding",
@@ -4634,6 +4662,12 @@ def test_capability_rejection_names_the_public_request_field(tmp_path: Path) -> 
     assert "'input.0.role'" in payload["message"]
     assert "developer_messages" not in payload["message"]
     assert "canary" not in json.dumps(payload)
+    assert recorded, "the rejection records a durable failure"
+    ledger = recorded[-1]
+    assert ledger.failure_class == GatewayFailureClass.UNSUPPORTED_CAPABILITY
+    assert ledger.safe_message.endswith("(field: input.0.role)")
+    assert "developer_messages" not in ledger.safe_message
+    assert "canary" not in ledger.safe_message
 
 
 def test_reasoning_context_reflects_in_the_envelope_only_when_sent() -> None:

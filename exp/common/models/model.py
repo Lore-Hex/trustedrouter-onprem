@@ -33,6 +33,9 @@ _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]
 ChatMaxTokensField = Literal["max_tokens", "max_completion_tokens"]
 
+MAXIMUM_TOOL_CALL_ID_CHARACTERS: Final = 65_536
+"""Bound opaque tool identifiers, including provider-carried reasoning signatures."""
+
 DEFAULT_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
 """Reasoning effort pinned by default for models known to accept the parameter.
 
@@ -198,7 +201,7 @@ class ToolCall(ContractModel):
     immutable artifacts but join gateway idempotency identity explicitly.
     """
 
-    call_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     name: str = Field(min_length=1, max_length=256)
     arguments: JsonObject = Field(default_factory=dict)
     raw_arguments: str | None = Field(
@@ -483,6 +486,18 @@ class ModelCapabilities(ContractModel):
     output_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
     cached_input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
     cache_write_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+    service_tier_pricing_enabled: bool = False
+    """Whether this model carries per-provider-tier PASS-THROUGH pricing.
+
+    When set, a HOST-funded rung forwards ``service_tier`` to the provider for a
+    tier it carries a card for (see ``GatewayWireProfile.forwards_tier``) and
+    settlement bills the REQUESTED tier at that card's per-tier rates (v1 prices
+    the requested tier; billing the served tier the provider reports back is a
+    follow-up). A flex/priority request to a model with no card for that tier
+    fails closed at admission. BYOK rungs forward regardless. Additive and
+    excluded from the capability identity digest: tier pricing propagates
+    through the catalog publish, not the digest.
+    """
 
     @field_validator(
         "input_cost_per_million_tokens_usd",
@@ -562,6 +577,10 @@ class ModelCapabilities(ContractModel):
             "output_cost_per_million_tokens_usd",
             "cached_input_cost_per_million_tokens_usd",
             "cache_write_cost_per_million_tokens_usd",
+            # Pricing/policy, not a protocol-boundary capability: kept out of the
+            # identity like the cost fields so enabling per-tier pass-through
+            # pricing propagates through the catalog publish, not a re-digest.
+            "service_tier_pricing_enabled",
         }
         excluded.add("supports_completions")
         # Image generation is admitted fail-closed on its own surface, so the

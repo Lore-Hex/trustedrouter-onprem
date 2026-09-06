@@ -23,7 +23,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelPoolId,
     FailoverMode,
 )
-from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
 from exp.runtime.gateway.reasoning_blocks import (
     EncryptedReasoningBlock as EncryptedReasoningBlock,
 )
@@ -158,7 +158,7 @@ class StructuredTextFormat(ContractModel):
     """A strict structured-text output schema requested by the caller."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=65_536)
     json_schema: JsonObject
     strict: bool = True
 
@@ -190,7 +190,9 @@ class GatewayMessage(ContractModel):
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | None = None
-    tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    tool_call_id: str | None = Field(
+        default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
+    )
     tool_calls: tuple[ToolCall, ...] = ()
     tool_is_error: bool = Field(default=False, exclude=True)
     """Whether this tool result reports a failed tool invocation.
@@ -202,6 +204,14 @@ class GatewayMessage(ContractModel):
     ``ToolCall.raw_arguments``, the field is deliberately excluded from model
     serialization so request digests, replay identity, and immutable
     artifacts are unaffected by it.
+    """
+    provider_specific_fields: JsonObject | None = Field(default=None, exclude=True)
+    """LiteLLM's per-message ``provider_specific_fields`` bookkeeping, when echoed.
+
+    Accepted so a client that replays LiteLLM message dumps verbatim keeps
+    working; no provider wire takes the object, so admission always drops it
+    with a ``messages.provider_specific_fields`` disclosure. Excluded from
+    serialization like the other carried-but-never-forwarded message fields.
     """
     provider_reasoning: tuple[ProviderReasoningBlock, ...] = Field(default=(), exclude=True)
     """Ordered opaque provider-reasoning blocks carried on assistant turns.
@@ -636,12 +646,24 @@ class GatewayRequest(ContractModel):
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     metadata: JsonObject = Field(default_factory=dict)
     # End-user attribution / cache hints from the OpenAI request. Captured for
-    # gateway-side attribution and never forwarded to the model. `safety_identifier`
+    # gateway-side attribution and never forwarded verbatim. `safety_identifier`
     # is the current stable end-user identifier; `user` its deprecated predecessor;
-    # `prompt_cache_key` a same-prefix cache-routing hint (never an identity).
+    # `prompt_cache_key` a same-prefix cache-routing hint (never an identity) that
+    # reaches the provider only as the namespaced `provider_prompt_cache_key`.
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    provider_prompt_cache_key: str | None = Field(default=None, max_length=128, exclude=True)
+    """Tenant-namespaced cache-affinity key dispatched to rungs that route by it.
+
+    Derived at admission (``prompt_cache_affinity.provider_prompt_cache_key``)
+    from the caller's ``prompt_cache_key`` or, absent one, from the
+    conversation stem (the leading system/developer messages, else the first
+    user turn), so every request sharing a cacheable prefix lands on the
+    provider cache node that holds it while the caller's raw key never leaves
+    the gateway. Excluded from serialization: it is routing state, never
+    request identity.
+    """
     service_tier: str | None = Field(default=None, max_length=64, exclude=True)
     """Caller provider processing tier, forwarded only on BYOK OpenAI-family
     rungs (routing and billing rules live at streaming_requests and
