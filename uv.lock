@@ -2693,7 +2693,7 @@ wheels = [
 
 [[package]]
 name = "trustedrouter-onprem"
-version = "0.7.50"
+version = "0.7.51"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
