@@ -307,6 +307,29 @@ def test_maximize_cache_returns_a_throttle_without_failing_over() -> None:
     )
 
 
+def test_maximize_cache_affinity_fails_over_on_a_throttle() -> None:
+    """The affinity policy keeps availability-style failover on a throttle.
+
+    Its cache story is the deterministic rendezvous ALTERNATE: spilling builds
+    warm cache at the same alternate every time, so waiting out a backoff
+    window (the maximize_cache move) would only add latency.
+    """
+    health = DeploymentHealthRegistry()
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            failover_mode="maximize_cache_affinity",
+        )
+        == 1
+    )
+
+
 def test_maximize_cache_does_not_redial_a_stalled_timeout_lane() -> None:
     """A stalled-lane timeout fails over even under maximize_cache.
 
@@ -622,3 +645,24 @@ def test_wire_entry_carries_emulated_stop_sequences_for_the_data_plane() -> None
 
     default = deployment_wire_entry(route, route.deployment, profile, {"model": "gpt-5.6-luna"})
     assert default["stop_sequences"] == []
+
+
+def test_wire_entry_names_customer_managed_billing_for_the_data_plane() -> None:
+    """A BYOK rung's entry says so, so the data plane re-owns credential failures."""
+    route = _route()
+    byok = GatewayWireProfile(
+        dialect="openai_responses", url="https://provider.test", billing_customer_managed=True
+    )
+    house = GatewayWireProfile(dialect="openai_responses", url="https://provider.test")
+    assert deployment_wire_entry(route, route.deployment, byok, {})["billing_customer_managed"]
+    assert not deployment_wire_entry(route, route.deployment, house, {})["billing_customer_managed"]
+
+
+def test_wire_entry_carries_the_tool_call_serialization_flag() -> None:
+    """A rung emulating parallel_tool_calls=false tells the data plane to serialize."""
+    route = _route()
+    profile = GatewayWireProfile(dialect="gemini_generate_content", url="https://provider.test")
+    assert deployment_wire_entry(route, route.deployment, profile, {}, serialize_tool_calls=True)[
+        "serialize_tool_calls"
+    ]
+    assert not deployment_wire_entry(route, route.deployment, profile, {})["serialize_tool_calls"]

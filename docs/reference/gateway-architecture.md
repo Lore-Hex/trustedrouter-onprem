@@ -215,6 +215,73 @@ If no route can fit the shared team, identity, or total pool allocation, the neu
 returns HTTP 429 with OpenAI `insufficient_quota` semantics before provider work. Any required
 unknown price makes that route ineligible while a hard limit applies.
 
+A rung may author a `GatewayRungDispatchPolicy` on its gateway metadata (all fields inert by
+default). Its `concurrency_bound` is a per-worker in-flight cap enforced by pure in-process
+counters at the same pre-dispatch point: a rung at its bound is bypassed sideways to the next
+claimable rung (spill in seconds) instead of queueing at the deployment until the request
+deadline. `requests_per_minute` and `tokens_per_minute` (each usable without the bound) cap the
+rung's sliding 60-second dispatch window the same way, shedding a reservation the window cannot
+absorb sideways as `rate_limit` BEFORE the provider answers 429; token accounting counts each
+dispatch's conservative worst-case reserved input plus output tokens at reservation, with a
+burst allowance admitting a single over-cap reservation into an EMPTY window (a prompt whose
+worst case exceeds the whole per-worker cap must stay admissible, then blocks the window until
+it slides out). The working
+request ceiling is additionally calibrated passively per worker: a provider throttle settlement
+clamps a learned ceiling to ninety percent of the rate observed in the window at that moment,
+every unthrottled recovery minute creeps it back up by five percent (at least one request, capped
+at the authored rate when one exists; each creep step is the probe that rediscovers headroom, so
+no synthetic traffic is ever sent), and a ceiling unthrottled for six hours is forgotten. The
+learned ceiling is a float and may sit below one request per minute: per-worker ceilings
+multiply across the fleet, and some provider accounts allow less than one request per worker
+per minute. With
+`fair_share: true` (which requires the bound), a contended rung additionally
+limits each organization to its weighted max-min share of the bound; weights arrive per request
+on `AuthorizationSnapshot.fair_share_weight` (default 1) from the hosted store, capacity below
+the bound is always borrowable (a lone organization uses the whole rung), freed slots are
+reserved for recently active under-share organizations, and running dispatches are never
+preempted. With `cache_priority_alpha` authored on a fair-share rung, each organization's
+effective weight becomes `weight * (1 + alpha * congestion * cached_fraction)`, where congestion
+is the rung's in-flight total over its bound and the cached fraction is the worker's time-decayed
+EWMA (half-life roughly ten minutes) of the organization's settled cached-token share on that
+rung, so at the contended margin traffic that reuses warm provider cache is admitted ahead of
+equal-weight cold traffic. A ladder whose every remaining rung was bypassed only by these
+policies force-admits past the bound rather than manufacturing a failure unbounded admission
+would not have had.
+Every policy-routed dispatch is disclosed on its attempt row: `dispatch_reason` (`affinity`,
+`affinity_sticky`, `fair_share_shed`, `queue_bound`, `rate_limit`, `fresh_session_spill`,
+`rung_dead`, `saturated_overflow`), the bypassed
+`preferred_deployment_id` with its frozen base token rates, and at settle a
+`counterfactual_cost_micro_usd` pricing the same observed usage at those preferred rates, so
+cost optimality is measurable from the ledger alone. Settlement also persists the provider's own
+rate-limit response headers per attempt when the data plane harvests them (`retry-after` plus the
+OpenAI `x-ratelimit-*` and Anthropic `anthropic-ratelimit-*` families, normalized to integers),
+and a throttled settlement carrying a parseable `Retry-After` (seconds or HTTP-date) sizes that
+deployment's throttle window from it, clamped to [5s, 6h], instead of the fixed default, so a
+daily-quota reset actually suppresses the rung for the wait the provider asked for. Pools and
+rungs that author none of this keep byte-identical behavior and null disclosure columns.
+
+Under `maximize_cache_affinity`, two further per-rung fields keep provider prompt caches warm
+across spills. `sticky_spill_seconds` gives each dispatch a worker-local
+fingerprint-to-deployment binding with that lifetime (refreshed per hit, but capped at four
+lifetimes of total age from creation so continuous hits cannot pin a long-running session to a
+pricier spill rung forever): the binding is honored
+ahead of rendezvous order on later requests, so a spilled conversation keeps serving off the rung
+holding its warm cache instead of bouncing back the moment the preferred rung stops shedding, and
+a binding whose rung is throttled or circuit-open is cleared rather than followed. The binding is
+deliberately worker-local (the serving edge's keep-alives pin a client to one worker; the
+cross-worker miss costs one cold dispatch). The binding keys on the affinity fingerprint (the
+session identity rendezvous already uses), never on a derived provider cache key: on
+OpenAI-compatible shim lanes (including hosted vLLM boxes) no `prompt_cache_key` is
+forwarded and the box's prefix cache is content-addressed, so gateway-side session-to-rung
+consistency is the entire cache-preservation mechanism there. `fresh_session_spill_fraction`
+reserves the top slice
+of a bounded rung for warm sessions: a request whose fingerprint holds no live binding on the
+rung sheds sideways once in-flight dispatches reach `bound * fraction` (`fresh_session_spill`),
+while warm sessions ride to the hard bound (it requires `sticky_spill_seconds`, because warm
+standing IS a live binding). A hosted composition may also exclude individual attempts from the
+cache-priority EWMA through the accounting's `cache_sample_gate` (promotion-funded replay must
+not buy fair-share weight with prefixes the promotion already made costless).
+
 A deployment's price schedule may declare a long-context tier: a whole-request premium applied
 once provider-reported input tokens reach its threshold, matching both published tier schedules
 (Gemini reprices `prompts > 200k` entirely; Anthropic's Claude 4.6+ models serve the 1M window at
@@ -357,6 +424,65 @@ and `stop_reason: stop_sequence` on Messages. Reasoning, tool arguments, and ref
 inspected. Rungs whose provider honours `stop` natively (Chat-compatible, Anthropic, Gemini,
 Bedrock) keep forwarding it on the wire.
 
+**Provider-declared stream errors are classified by what the provider said.** A provider that
+opens the stream and then declares its own error inside a frame (OpenAI `error` /
+`response.failed`, Anthropic `error`, Gemini's error envelope, an OpenAI-compatible `error`
+object) no longer collapses to one `provider_internal` 502. The raw code and message classify
+it: content verdicts (content filtering, safety, data inspection) are `refusal`; caller-input
+phrasing ("exceeds the context window", "does not support max tokens", "invalid params") or a
+4xx code is `invalid_request`, a 400 that relays the provider's sentence and never redials or
+fails over; rate limits and overloads are `throttled` with `Retry-After`; provider quota,
+credential, and model-not-found codes take their HTTP-status classes; only a genuine provider
+fault stays `provider stream failed`. An aggregator's 502 wrapping an upstream 400 is read by its
+sentence. The bounded ledger detail exempts the request's own model id from the identifier screen,
+so a provider sentence naming the model is kept rather than dropped.
+
+**A refusal names its bounded category to the caller.** A `refusal` answer stays a 400 with code
+`refusal` and type `invalid_request_error`, but it now carries a machine-readable `refusal_reason`
+field in the error body (present on every surface that renders the public error: `/v1/chat/completions`,
+`/v1/responses`, and `/v1/messages`, whose Anthropic envelope carries the same field). The category
+is a closed vocabulary derived from the provider's own code and sentence, never its prose:
+`cyber_policy`, `cbrn`, `content_policy`, `recitation`, `data_inspection`, and `unspecified` for a
+refusal the provider filed under no reason. The caller-facing message is the fixed sentence plus the
+category's fixed phrase ("provider refused the request: cybersecurity policy"), while the raw provider
+token keeps riding `provider_detail` into the ledger only. The reason also rides the settlement
+argument next to `provider_detail`, so the control plane counts refusals by reason without parsing the
+free-form detail.
+
+**Customer-managed credentials fail as the customer's error.** On a BYOK rung, a provider 401/403
+or 402, at stream open or declared mid-stream, is the customer's configuration, not operator
+deadness. The failure keeps its ladder class so any other customer-managed rung with its own
+credential may still serve, but a terminal answer is the customer's 400
+(`provider_credential_rejected` / `provider_account_quota`) naming their provider and what to
+fix, and settlement files it as `invalid_request`. House rungs keep the operator-actionable classes.
+
+**Tool calls cut off at the output budget are incomplete, not malformed.** On wires that reveal the
+stop reason only after the tool block closes (Anthropic `message_delta`, Bedrock `messageStop`), a
+tool call whose arguments fail to parse at its block stop is held rather than failed; a
+provider-declared `max_tokens` truncation then drops the unfinished call and ends the stream
+`incomplete` (the caller's remedy is a larger budget), while any other ending surfaces the parse
+failure as the malformed stream it is, exactly as the Chat-compatible `finish_reason: length` path
+already did.
+
+**Pre-stream 4xx bodies keep the provider's code.** When a client-error body's sentence must be
+dropped by the identifier screen, the provider's documented code or type token (`invalid_value`,
+`INVALID_ARGUMENT`) is relayed instead of nothing, and a content-filter code under a 4xx (Azure,
+Gemini) is filed and answered as a `refusal` rather than a request-shape error.
+
+**Sampling controls a route cannot carry are dropped with disclosure, not refused.** A
+`temperature` or `top_p` sent to a route where some rung's provider rejects the field outright (a
+reasoning model such as GPT-6 Astra) is dropped and disclosed (`temperature->dropped(unsupported_by_provider)`)
+so the model still answers with its own default; the 400 remains only for a value outside a
+supporting route's declared range, which is a genuine caller error.
+
+**`parallel_tool_calls` is honoured on every route.** A rung whose wire carries the control forwards it.
+On a rung without it (Gemini, Bedrock, an OpenAI-compatible server that ignores the field), `true` is
+dropped as the provider's own default (`parallel_tool_calls->dropped(provider_default)`) and `false` is
+emulated by the data plane, which serializes that rung's stream to its first tool call per turn and
+drops later calls in the same turn, start to completion, including their Responses item lifecycle
+(`parallel_tool_calls->emulated(serialized_by_gateway)`). The model receives one result on the next
+turn and re-issues the remaining calls then, which is the sequential behaviour the caller asked for.
+
 **Pre-dispatch context-window refusal.** Before any reservation or provider call, admission
 lower-bounds the prompt's token count from its UTF-8 text bytes (at six bytes per token, below
 what real tokenizers produce on prose, code, or CJK text; inline media is not counted) and
@@ -365,18 +491,17 @@ exceeds the largest declared context window on the route. Anything under the bou
 and is left to the provider's precise count; output budgets are never refused here, a too-small
 ceiling is an `incomplete` answer.
 
-Exposure-gated reasoning rungs (Tencent Hunyuan and DeepSeek, rows the catalog stamps
-`reasoning_output_exposed`) return the model's plaintext `reasoning_content` on every non-tool
-Chat turn, and the caller may echo that text back verbatim on later assistant turns: the
-decoder carries it as an `exposed_reasoning_content` block, route narrowing forwards it only to
-rungs that expose their reasoning (a route with no exposing rung rejects it by name as
-`messages.reasoning_content`; a mixed waterfall prefers the exposing rung and discloses the drop
-on the others), and the payload builder writes it back onto the wire unchanged. The provider's
-own API accepts and does not validate that text, so it is ordinary caller-owned history, exactly
-like a prior assistant `content`. A TOOL turn's reasoning still round-trips only as the sealed,
-rung-pinned carrier (`x-trustedrouter-onprem-hunyuan-reasoning-v1:`), which the same decoder recognizes
-by prefix. This is what lets a Terminus-style loop (commands parsed from assistant text, output
-fed back as user messages) and Harbor's interleaved-thinking replay both preserve thinking.
+Exposure-gated reasoning rungs (Tencent Hunyuan and DeepSeek, rows stamped
+`reasoning_output_exposed`) accept caller-owned plaintext `reasoning_content` on assistant
+history, including tool-call turns. The decoder preserves the text verbatim, including an
+explicitly empty string: a provider can require the field even when the turn performed no
+reasoning. Missing or null values remain absent. Plaintext is bounded to 8,388,608 characters;
+values exceeding that limit receive a named error with the limit and a retry instruction.
+Route narrowing prefers exposing rungs and discloses
+`messages.reasoning_content->dropped(unsupported_by_provider)` when a rung cannot replay it,
+including routes with no exposing rung. Gateway-issued carriers are recognized by their
+`x-trustedrouter-onprem-hunyuan-reasoning-v1:` scheme prefix and retain strict parsing,
+authentication, and route binding; malformed carriers never become plaintext history.
 
 Route admission preserves caller capabilities in three verbatim-preference layers before any
 coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`), generation
@@ -441,7 +566,17 @@ bills catalog rates) and a route with no eligible rung drops it with disclosure.
 marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
 group, so a shim rung can no longer silently bill every turn's full context uncached while the
 native rung stands ready; routes narrowing to only marker-dropping wires keep disclosing the
-dropped markers. Every coercion is disclosed in `path->effective` form
+dropped markers. On `maximize_cache_affinity` pools the certified initial order is replaced per
+request by a weighted rendezvous hash of the request's stable conversation identity (the caller's
+`prompt_cache_key`, else a Responses continuation's original episode key, else the session-scoped
+`X-Client-Request-Id`, else the idempotency key, else the request id) over the pool's rungs, with
+weights from each rung's authored `GatewayRungDispatchPolicy.affinity_weight`. Every worker
+computes the identical permutation from catalog data alone (no per-worker memory, no shared
+state), so one conversation lands on the same rung fleet-wide and, when that rung sheds or dies,
+on the same deterministic alternate, building warm cache there instead of scattering; a rung's
+death or restoration moves only its own fingerprints. Failover semantics under this mode are
+availability-style (a throttle fails over to the deterministic alternate), and the cache-marker
+partition above still applies first on marked requests, rendezvous-ordered within each group. Every coercion is disclosed in `path->effective` form
 through `ignored_parameters`, logged, and counted in the `admission_parameter_coercions`
 metric; every serving surface carries that list to the caller as a body-level
 `x-trustedrouter-onprem-ignored-parameters` key (Chat chunk and completion, Responses envelope, and the

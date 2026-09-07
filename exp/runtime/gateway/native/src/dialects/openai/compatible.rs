@@ -5,8 +5,7 @@
 use serde_json::Value;
 
 use super::super::{
-    finish_open_tools, finish_open_tools_truncated, malformed, parse_object,
-    provider_stream_failed_with_detail, refusal_failure, Normalizer,
+    finish_open_tools, finish_open_tools_truncated, malformed, parse_object, Normalizer,
 };
 use crate::errors::Failure;
 use crate::events::{openai_compatible_usage, require_string, require_u64, Event, ToolAccumulator};
@@ -35,7 +34,15 @@ impl Normalizer {
                 events.push(Event::Usage(usage));
             }
             if self.refusal_seen || matches!(finish, Some("content_filter" | "safety")) {
-                events.push(Event::Failed(refusal_failure()));
+                // A `content_filter`/`safety` finish reason names the category;
+                // a bare visible-refusal delta names none (Unspecified).
+                let reason = match finish {
+                    Some(code @ ("content_filter" | "safety")) => {
+                        crate::stream_errors::refusal_reason(Some(code), None)
+                    }
+                    _ => crate::errors::RefusalReason::Unspecified,
+                };
+                events.push(Event::Failed(Failure::refusal(reason)));
             } else if finish == Some("length") {
                 events.push(Event::Incomplete);
             } else {
@@ -56,14 +63,19 @@ impl Normalizer {
                             .map(str::to_string)
                             .or_else(|| value.as_i64().map(|numeric| numeric.to_string()))
                     }),
-                    error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
+                    error.get("message").and_then(Value::as_str).map(|message| {
+                        // An aggregator's generic sentence yields to the
+                        // upstream provider's own (OpenRouter metadata.raw).
+                        crate::param_attribution::upstream_relayed_message(
+                            &Value::Object(error.clone()),
+                            message,
+                        )
+                        .unwrap_or_else(|| message.to_string())
+                    }),
                 ),
                 None => (None, None),
             };
-            return Ok(vec![Event::Failed(provider_stream_failed_with_detail(
+            return Ok(vec![Event::Failed(self.provider_stream_failure(
                 "openai_compatible",
                 code.as_deref(),
                 message.as_deref(),

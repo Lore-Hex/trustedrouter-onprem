@@ -9,6 +9,7 @@
 
 mod anthropic;
 mod bedrock;
+mod deferred_tools;
 mod gemini;
 mod openai;
 
@@ -124,11 +125,6 @@ fn refusal_failure() -> Failure {
     Failure::new(FailureClass::Refusal, "provider refused the request")
 }
 
-fn provider_stream_failed() -> Failure {
-    // A provider-declared stream failure mirrors the 5xx classification.
-    Failure::new(FailureClass::ProviderInternal, "provider stream failed").with_retry(true, true)
-}
-
 /// Longest provider-declared error detail retained for the ledger, matching
 /// the python `GatewayFailure.provider_detail` bound.
 const MAXIMUM_STREAM_ERROR_DETAIL_CHARS: usize = 240;
@@ -147,7 +143,14 @@ const MAXIMUM_STREAM_ERROR_DETAIL_CHARS: usize = 240;
 /// failure classes that never relay `provider_detail` to callers (the
 /// stream-failure family), so it reaches the ledger and alert samples
 /// without widening the caller-facing sanitization boundary.
-fn provider_error_detail(code: Option<&str>, message: Option<&str>) -> Option<String> {
+/// `request_words` are label-shaped values the dispatched payload itself
+/// carried (its model id): a provider sentence naming the model unquoted is
+/// caller-known, not infrastructure, and must not drop the whole line.
+fn provider_error_detail(
+    code: Option<&str>,
+    message: Option<&str>,
+    request_words: &[&str],
+) -> Option<String> {
     let code = code
         .filter(|value| !value.is_empty())
         .map(bounded_wire_token);
@@ -157,11 +160,9 @@ fn provider_error_detail(code: Option<&str>, message: Option<&str>) -> Option<St
             .take_while(|character| !character.is_control())
             .collect();
         let collapsed = cut.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!collapsed.is_empty()
-            && !collapsed
-                .split(' ')
-                .any(|word| crate::param_attribution::carries_provider_identifier(word, &[])))
-        .then_some(collapsed)
+        // Provider-side handles are masked, never dropped with the sentence.
+        (!collapsed.is_empty())
+            .then(|| crate::param_attribution::bounded_masked_line(&collapsed, request_words))
     });
     let detail = match (code, line) {
         (None, None) => return None,
@@ -187,18 +188,36 @@ fn log_provider_declared_failure(dialect: &str, detail: &str) {
     eprintln!("exp-gateway-native: {line}");
 }
 
-/// Build the provider-declared stream failure carrying its bounded detail,
-/// and emit the structured operator line naming it.
-fn provider_stream_failed_with_detail(
-    dialect: &str,
-    code: Option<&str>,
-    message: Option<&str>,
-) -> Failure {
-    let detail = provider_error_detail(code, message);
-    if let Some(detail) = &detail {
-        log_provider_declared_failure(dialect, detail);
+impl Normalizer {
+    /// Label-shaped words the dispatched payload itself carried (its model
+    /// id), so a provider sentence naming them is not dropped as infrastructure.
+    pub fn set_request_words<I, S>(&mut self, words: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.request_words = words.into_iter().map(Into::into).collect();
     }
-    provider_stream_failed().with_provider_detail(detail)
+
+    /// Build the provider-declared stream failure: classified by what the
+    /// provider said (a caller's over-long prompt is a 400 that relays the
+    /// sentence; a rate limit is a throttle; only a provider fault stays
+    /// `provider stream failed`), carrying its bounded detail, and emitting
+    /// the structured operator line naming it.
+    fn provider_stream_failure(
+        &self,
+        dialect: &str,
+        code: Option<&str>,
+        message: Option<&str>,
+    ) -> Failure {
+        let words: Vec<&str> = self.request_words.iter().map(String::as_str).collect();
+        let detail = provider_error_detail(code, message, &words);
+        if let Some(detail) = &detail {
+            log_provider_declared_failure(dialect, detail);
+        }
+        let kind = crate::stream_errors::classify_stream_error(code, message);
+        crate::stream_errors::stream_failure(kind, detail)
+    }
 }
 
 fn parse_object(data: &str) -> Result<Map<String, Value>, Failure> {
@@ -376,6 +395,14 @@ pub struct Normalizer {
     gemini_tool_index: u32,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
+    // Caller-known label words (the dispatched model id) exempt from the
+    // provider-identifier screen on stream-error detail.
+    request_words: Vec<String>,
+    // A tool call whose arguments failed to parse at its block stop, held
+    // until the stop reason arrives (Anthropic `message_delta`, Bedrock
+    // `messageStop` both follow the block): a budget truncation drops the
+    // call and ends Incomplete; any other ending surfaces this failure.
+    deferred_tool_failure: Option<Failure>,
 }
 
 impl Normalizer {
@@ -408,6 +435,8 @@ impl Normalizer {
             finish_reason: None,
             gemini_tool_index: 0,
             reasoning_content_route_sha256,
+            request_words: Vec::new(),
+            deferred_tool_failure: None,
         }
     }
 
@@ -792,55 +821,68 @@ mod stream_error_detail_tests {
     }
 
     #[test]
-    fn secret_shaped_words_drop_the_whole_detail_line() {
+    fn secret_shaped_words_are_masked_out_of_the_detail_line() {
         // The identifier screen treats any letter+digit label as a handle,
-        // which covers key and token shapes: a sentence carrying one drops
-        // entirely (never partially redacted), for every dialect that feeds
-        // the shared detail path, Bedrock exception messages included.
-        for message in [
-            "Invalid key sk-abc123def provided.",
-            "The access key AKIA9X7EXAMPLE is not authorized for this model.",
-            "Bearer eyJhbGciOi9 was rejected.",
+        // which covers key and token shapes: the word is masked and the
+        // sentence around it survives, for every dialect that feeds the
+        // shared detail path, Bedrock exception messages included.
+        for (message, masked) in [
+            (
+                "Invalid key sk-abc123def provided.",
+                "Invalid key [redacted] provided.",
+            ),
+            (
+                "The access key AKIA9X7EXAMPLE is not authorized for this model.",
+                "The access key [redacted] is not authorized for this model.",
+            ),
+            (
+                "Bearer eyJhbGciOi9 was rejected.",
+                "Bearer [redacted] was rejected.",
+            ),
         ] {
             assert_eq!(
-                provider_error_detail(None, Some(message)),
-                None,
-                "a credential-shaped word must drop the sentence: {message}"
+                provider_error_detail(None, Some(message), &[]).as_deref(),
+                Some(masked),
+                "a credential-shaped word must be masked: {message}"
             );
             assert_eq!(
-                provider_error_detail(Some("validation_error"), Some(message)).as_deref(),
-                Some("validation_error"),
-                "the safe code token alone survives: {message}"
+                provider_error_detail(Some("validation_error"), Some(message), &[]).as_deref(),
+                Some(format!("validation_error: {masked}").as_str()),
+                "the code rides with the masked sentence: {message}"
             );
         }
     }
 
     #[test]
     fn provider_error_detail_is_one_bounded_line() {
-        assert_eq!(provider_error_detail(None, None), None);
+        assert_eq!(provider_error_detail(None, None, &[]), None);
         assert_eq!(
-            provider_error_detail(Some("server_error"), None).as_deref(),
+            provider_error_detail(Some("server_error"), None, &[]).as_deref(),
             Some("server_error")
         );
         assert_eq!(
-            provider_error_detail(Some("server_error"), Some("The model failed  to respond."))
-                .as_deref(),
+            provider_error_detail(
+                Some("server_error"),
+                Some("The model failed  to respond."),
+                &[]
+            )
+            .as_deref(),
             Some("server_error: The model failed to respond.")
         );
         // The line cuts at the first control character: a payload dump never
         // rides past its first row.
         assert_eq!(
-            provider_error_detail(None, Some("first line\nsecond line")).as_deref(),
+            provider_error_detail(None, Some("first line\nsecond line"), &[]).as_deref(),
             Some("first line")
         );
         // A hostile code reduces to the shared identifier token.
         assert_eq!(
-            provider_error_detail(Some("weird code!{}"), None).as_deref(),
+            provider_error_detail(Some("weird code!{}"), None, &[]).as_deref(),
             Some("non-identifier")
         );
         // The composed detail never exceeds the python provider_detail bound.
         let long = "x".repeat(400);
-        let bounded = provider_error_detail(Some("code"), Some(&long)).expect("bounded");
+        let bounded = provider_error_detail(Some("code"), Some(&long), &[]).expect("bounded");
         assert_eq!(bounded.chars().count(), 240);
     }
 
@@ -880,11 +922,11 @@ mod stream_error_detail_tests {
             })))
             .expect("error frame normalizes");
         // The model id trips the identifier screen (letters+digits label), so
-        // the sentence drops while the code token survives: the mechanism
-        // stays named without relaying a label-shaped word to the ledger.
+        // it is masked while the code and the sentence around it survive: the
+        // mechanism stays named without relaying a label-shaped word.
         assert_eq!(
             failed_detail(&events).as_deref(),
-            Some("rate_limit_exceeded")
+            Some("rate_limit_exceeded: Rate limit reached for [redacted].")
         );
     }
 

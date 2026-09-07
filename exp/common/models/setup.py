@@ -51,6 +51,9 @@ class ProviderConnection(ContractModel):
     region: str | None = Field(default=None, max_length=64)
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    # Opt-in: route a native provider through a trusted custom base_url in its
+    # own dialect (mirrors ConnectionConfig.trusted_custom_origin).
+    trusted_custom_origin: bool = False
 
     @model_validator(mode="after")
     def _require_supported_connection_shape(self) -> ProviderConnection:
@@ -108,10 +111,15 @@ class ProviderConnection(ContractModel):
         else:
             if self.api_key_env is None:
                 raise ValueError(f"{self.provider} requires api_key_env")
-            if self.base_url is not None and self.provider != "openai-compatible":
+            if (
+                self.base_url is not None
+                and self.provider != "openai-compatible"
+                and not self.trusted_custom_origin
+            ):
                 raise ValueError(
                     "base_url is only accepted for provider='openai-compatible' or "
-                    "provider='azure'; other native providers use their official endpoint"
+                    "provider='azure'; set trusted_custom_origin to route a native provider "
+                    "through a trusted custom endpoint"
                 )
             if self.api_version is not None:
                 raise ValueError("api_version is only accepted for provider='azure'")
@@ -126,6 +134,7 @@ class ProviderConnection(ContractModel):
             region=self.region,
             aws_access_key_id_env=self.aws_access_key_id_env,
             bedrock_auth_mode=self.bedrock_auth_mode,
+            trusted_custom_origin=self.trusted_custom_origin,
         )
         return self
 
@@ -140,6 +149,7 @@ class ProviderConnection(ContractModel):
             region=self.region,
             aws_access_key_id_env=self.aws_access_key_id_env,
             bedrock_auth_mode=self.bedrock_auth_mode,
+            trusted_custom_origin=self.trusted_custom_origin,
         )
 
     @model_serializer(mode="wrap")
@@ -153,6 +163,8 @@ class ProviderConnection(ContractModel):
             serialized.pop("aws_access_key_id_env", None)
         if self.bedrock_auth_mode is None:
             serialized.pop("bedrock_auth_mode", None)
+        if not self.trusted_custom_origin:
+            serialized.pop("trusted_custom_origin", None)
         return serialized
 
 

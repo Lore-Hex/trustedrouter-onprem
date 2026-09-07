@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 19
 
 
 class GatewaySchemaError(RuntimeError):
@@ -668,6 +668,49 @@ _MIGRATION_15 = (
 # ledger's content-free posture.
 _MIGRATION_16 = ("ALTER TABLE gateway_attempts ADD COLUMN failure_message TEXT",)
 
+# v17: cost-optimality disclosure for policy-routed dispatches. When a rung
+# dispatch policy or an affinity pool bypasses the route's preferred rung,
+# dispatch_reason names why the chosen rung serves (affinity, fair_share_shed,
+# queue_bound, rung_dead, saturated_overflow) and the preferred_* columns
+# freeze the bypassed rung's identity and base token rates at reservation, so
+# settle can price the SAME observed usage counterfactually
+# (counterfactual_cost_micro_usd) without any content or re-derivation.
+_MIGRATION_17 = (
+    "ALTER TABLE gateway_attempts ADD COLUMN dispatch_reason TEXT",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_deployment_id TEXT",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_input_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_cached_input_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_output_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_reasoning_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN counterfactual_cost_micro_usd INTEGER",
+)
+
+# v18: a native provider (anthropic/openai/gemini/openrouter) may carry a
+# custom base_url when trusted_custom_origin is set, so the flag rides the
+# revision alongside base_url or a reconstructed connection defaults it to 0
+# and the fixed-origin validator rejects the reload.
+_MIGRATION_18 = (
+    """
+    ALTER TABLE provider_connection_revisions
+    ADD COLUMN trusted_custom_origin INTEGER NOT NULL DEFAULT 0
+    CHECK (trusted_custom_origin IN (0, 1))
+    """,
+)
+
+# v19: per-attempt provider rate-limit observability. The data plane harvests
+# the allowlisted rate-limit response headers (retry-after, x-ratelimit-*,
+# anthropic-ratelimit-*) on successes and failures alike; these columns
+# persist the normalized integers so throttle calibration can be audited
+# against what the provider actually said, per attempt. Header names and
+# numbers only: no content, no credentials.
+_MIGRATION_19 = (
+    "ALTER TABLE gateway_attempts ADD COLUMN retry_after_seconds INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_limit_requests INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_remaining_requests INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_limit_tokens INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_remaining_tokens INTEGER",
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -685,6 +728,9 @@ _MIGRATIONS = {
     14: _MIGRATION_14,
     15: _MIGRATION_15,
     16: _MIGRATION_16,
+    17: _MIGRATION_17,
+    18: _MIGRATION_18,
+    19: _MIGRATION_19,
 }
 
 

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.models.providers.anthropic_tool_compat import anthropic_rejects_assistant_prefill
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.reasoning_compat import supported_reasoning_efforts
@@ -106,6 +108,80 @@ def anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
     thinking_on = config is not None and config.get("type") in {"enabled", "adaptive"}
     effort_on = request.reasoning_effort is not None and request.reasoning_effort != "none"
     return not thinking_on and not effort_on
+
+
+def require_assistant_prefill_supported(
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest
+) -> None:
+    """Refuse a trailing assistant turn before dispatch on rungs whose model rejects it.
+
+    Anthropic's 4.6+ and 5-generation releases answer assistant prefill with a
+    400 after the request was dispatched and billed for admission. The rungs
+    that carry such a model narrow out here with the same fact stated for the
+    caller; a route with no other rung surfaces it as the request's 400. The
+    check keys on the MODEL, not the wire: relays (OpenRouter's
+    ``anthropic/claude-opus-5``, Azure Foundry's Claude deployments) forward
+    the same rejection (live 2026-09-07: "Azure: This model does not support
+    assistant message prefill" through OpenRouter), and the release matcher
+    only ever matches a Claude release id.
+
+    Raises:
+        ProviderParameterError: The final message is an assistant turn and a
+            profile's model refuses prefill.
+    """
+    if not request.messages or request.messages[-1].role != "assistant":
+        return
+    if request.messages[-1].provider_native_item is not None:
+        return
+    for profile in profiles:
+        if not anthropic_rejects_assistant_prefill(profile.model_id):
+            continue
+        raise ProviderParameterError(
+            message=(
+                f"{profile.model_id} does not accept an assistant message as the final "
+                "turn (assistant prefill). End the conversation with a user message, or "
+                "choose a model alias that supports prefill."
+            ),
+            param="messages",
+            code="unsupported_parameter",
+        )
+
+
+_ANTHROPIC_TOOL_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+_ANTHROPIC_TOOL_NAME_DIALECTS = frozenset({"anthropic_messages", "bedrock_converse_stream"})
+
+
+def require_tool_names_supported(
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest
+) -> None:
+    """Refuse a tool name the Anthropic wire will 400 by name, before dispatch.
+
+    Anthropic (and Bedrock, which relays the same rule) accepts tool names
+    matching ``^[a-zA-Z0-9_-]{1,128}$``; a client sending dots, spaces, or
+    a longer name learned that only from the provider's 400 after dispatch
+    ("tools.0.custom.name: String should match pattern"). The rung narrows
+    out with the index named; the name itself is caller content and stays
+    out of the message.
+
+    Raises:
+        ProviderParameterError: A profile speaks an Anthropic wire and a tool
+            name does not match.
+    """
+    if not request.tools or not any(
+        profile.dialect in _ANTHROPIC_TOOL_NAME_DIALECTS for profile in profiles
+    ):
+        return
+    for index, tool in enumerate(request.tools):
+        if _ANTHROPIC_TOOL_NAME.fullmatch(tool.name) is None:
+            raise ProviderParameterError(
+                message=(
+                    f"tools[{index}].name is not accepted by this model route: tool names "
+                    "must match ^[a-zA-Z0-9_-]{1,128} (letters, digits, underscore, "
+                    "hyphen). Rename the tool or choose a different model alias."
+                ),
+                param=f"tools[{index}].name",
+                code="invalid_parameter",
+            )
 
 
 def mid_conversation_system_present(request: GatewayRequest) -> bool:

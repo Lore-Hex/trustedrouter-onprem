@@ -1,13 +1,18 @@
 //! Upstream provider HTTP transport over one shared pooled client.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
-use crate::param_attribution::{rejected_detail, rejected_model_not_found, rejected_parameter};
+use crate::param_attribution::{
+    generic_error_code, rejected_by_lane_limitation, rejected_by_routing_gate,
+    rejected_caller_reference_not_found, rejected_code, rejected_detail, rejected_model_not_found,
+    rejected_parameter,
+};
+use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
 
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
@@ -153,6 +158,7 @@ pub async fn open_stream(
         Some(body) => request.body(body.to_string()).send(),
         None => request.json(payload).send(),
     };
+    let phase_started = Instant::now();
     let response = match tokio::time::timeout(phase_timeout, send).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
@@ -165,20 +171,81 @@ pub async fn open_stream(
     };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        let failure = transport_failure(Some(status));
+        // Rate-limit facts are read off the headers before anything consumes
+        // the response: a 429's `retry-after` and remaining-quota counts ride
+        // the failure into settlement (never to the caller), where the
+        // control plane sizes throttle windows and persists them per attempt.
+        let rate_limit = harvest_rate_limit_headers(response.headers());
+        let retry_after = retry_after_seconds(response.headers());
+        let failure =
+            transport_failure(Some(status)).with_rate_limit_facts(rate_limit.clone(), retry_after);
         // Only the generic client-error class may carry attribution: the body
         // is read bounded, and the relayable facts are a validated parameter
         // path plus the provider's own bounded explanation of what the caller
-        // got wrong; every other class stays content-free.
-        if failure.failure_class != FailureClass::InvalidRequest {
+        // got wrong; every other class stays content-free. A 403 is read too,
+        // only to tell an aggregator routing gate from a credential verdict,
+        // and a 404 to tell a caller's dangling reference from a missing model.
+        if failure.failure_class != FailureClass::InvalidRequest && status != 403 && status != 404 {
             return Err(failure);
         }
-        let body = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, bounded_error_body(response))
-            .await
-        {
+        // The attribution read never outlives the rung's own header-phase
+        // budget: a provider that answers its status and then stalls the body
+        // costs at most what was left of that window, never a further two
+        // seconds past the caller's deadline.
+        let body_budget =
+            ERROR_BODY_READ_TIMEOUT.min(phase_timeout.saturating_sub(phase_started.elapsed()));
+        let body = match tokio::time::timeout(body_budget, bounded_error_body(response)).await {
             Ok(Some(body)) => Some(body),
             _ => None,
         };
+        if status == 404 {
+            // OpenAI answers 404 for an `item_reference`, `conversation`, or
+            // similar handle the caller sent but the provider does not hold
+            // (store=false items are never persisted). The catalog is fine and
+            // every rung would answer the same, so it is the caller's 400 with
+            // the provider's sentence, never a lane 404 that walks the ladder.
+            if body
+                .as_deref()
+                .is_some_and(|body| rejected_caller_reference_not_found(dialect, body))
+            {
+                let request_words: Vec<&str> = payload
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .into_iter()
+                    .collect();
+                let detail = body
+                    .as_deref()
+                    .and_then(|body| rejected_detail(dialect, body, &request_words));
+                let parameter = body
+                    .as_deref()
+                    .and_then(|body| rejected_parameter(dialect, body));
+                return Err(Failure::new(
+                    FailureClass::InvalidRequest,
+                    "the request references a provider-side item, response, or conversation \
+                     the provider does not hold; resend that content inline",
+                )
+                .with_retry(false, false)
+                .with_rejected_parameter(parameter)
+                .with_provider_detail(detail)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
+            }
+            return Err(failure);
+        }
+        if status == 403 {
+            if body
+                .as_deref()
+                .is_some_and(|body| rejected_by_routing_gate(dialect, body))
+            {
+                return Err(Failure::new(
+                    FailureClass::ProviderNotFound,
+                    "provider does not route this model for the gateway's account; ask \
+                     the gateway operator to change or disable the lane",
+                )
+                .with_retry(false, true)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
+            }
+            return Err(failure);
+        }
         // A client-error status whose body names a missing model is the
         // catalog's fault, not the caller's: it takes the 404 policy so the
         // ladder advances instead of surfacing one dead rung as a 400.
@@ -186,7 +253,9 @@ pub async fn open_stream(
             .as_deref()
             .is_some_and(|body| rejected_model_not_found(dialect, body))
         {
-            return Err(transport_failure(Some(404)));
+            return Err(
+                transport_failure(Some(404)).with_rate_limit_facts(rate_limit.clone(), retry_after)
+            );
         }
         let parameter = body
             .as_deref()
@@ -199,10 +268,38 @@ pub async fn open_stream(
             .and_then(Value::as_str)
             .into_iter()
             .collect();
+        let code = body
+            .as_deref()
+            .and_then(|body| rejected_code(dialect, body));
         let detail = body
             .as_deref()
-            .and_then(|body| rejected_detail(dialect, body, &request_words));
+            .and_then(|body| rejected_detail(dialect, body, &request_words))
+            // A sentence the identifier screen dropped still leaves the
+            // provider's own code token: "invalid_value" beats "verify the
+            // request fields" for the caller and the ledger alike. A generic
+            // family type or bare status adds nothing and is not relayed.
+            .or_else(|| code.clone().filter(|token| !generic_error_code(token)));
+        // A content-filter CODE under a 4xx is the model's verdict on the
+        // content (Azure and Gemini answer 400 for it), not a request-shape
+        // error: file and answer it as a refusal naming its bounded category,
+        // detail kept ledger-only. Only the authoritative code decides here; a
+        // sentence saying "blocked by" could be about a firewall or a limit.
+        if crate::stream_errors::is_refusal_code(code.as_deref()) {
+            let reason = crate::stream_errors::refusal_reason(code.as_deref(), None);
+            return Err(Failure::refusal(reason)
+                .with_provider_detail(detail)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
+        }
+        // A sentence naming a limitation of THIS lane's serving stack (a chat
+        // template that rejects a mid-conversation system turn the OpenAI
+        // contract allows) keeps the caller's class and detail but fails over:
+        // another rung serves the same request, and only a route with no other
+        // rung surfaces the 400.
+        let lane_limitation = body
+            .as_deref()
+            .is_some_and(|body| rejected_by_lane_limitation(dialect, body));
         return Err(failure
+            .with_retry(false, lane_limitation)
             .with_rejected_parameter(parameter)
             .with_provider_detail(detail));
     }
@@ -316,6 +413,232 @@ mod tests {
             !failure.safe_message.contains("request fields"),
             "the caller must never be told to fix their fields for a provider billing state"
         );
+    }
+
+    async fn open_against_body(status_line: &str, body: &'static str, model: &str) -> Failure {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let status_line = status_line.to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0u8; 8192];
+            let _ = socket.read(&mut buffer).await;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+        let client = build_client(Duration::from_secs(2)).expect("client");
+        open_stream(
+            &client,
+            &format!("http://{addr}/v1/chat/completions"),
+            &HashMap::new(),
+            "idem-4xx",
+            &serde_json::json!({"model": model, "messages": []}),
+            None,
+            Duration::from_secs(5),
+            Dialect::OpenAiCompatible,
+        )
+        .await
+        .expect_err("a 4xx must classify as a failure")
+    }
+
+    #[tokio::test]
+    async fn a_dropped_provider_sentence_still_relays_the_provider_code() {
+        // The sentence names an account handle: the handle is masked and the
+        // sentence around it still reaches the caller.
+        let failure = open_against_body(
+            "400 Bad Request",
+            "{\"error\":{\"code\":\"invalid_value\",\"type\":\"invalid_request_error\",\
+             \"message\":\"Invalid value for organization org_a1b2c3d4e5f6: not allowed\"}}",
+            "m",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("Invalid value for organization [redacted]: not allowed")
+        );
+        assert_eq!(
+            failure.public_error().message,
+            "provider rejected the request: Invalid value for organization [redacted]: not allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_404_for_a_callers_dangling_item_reference_is_the_callers_400() {
+        let failure = open_against_body(
+            "404 Not Found",
+            "{\"error\":{\"message\":\"Item with id 'rs_0000' not found. Items are not \
+             persisted when `store` is set to false.\",\"type\":\"invalid_request_error\",\
+             \"param\":\"input\",\"code\":null}}",
+            "gpt-6-astra",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+        assert!(
+            !failure.failover_eligible,
+            "every rung would answer the same"
+        );
+        assert_eq!(failure.public_error().status_code, 400);
+        assert!(failure
+            .provider_detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("Item with id 'rs_0000' not found")));
+    }
+
+    #[tokio::test]
+    async fn a_404_naming_a_missing_model_keeps_the_lane_policy() {
+        let failure = open_against_body(
+            "404 Not Found",
+            "{\"error\":{\"message\":\"The model `x` does not exist or you do not have \
+             access to it.\",\"type\":\"invalid_request_error\",\"param\":\"model\",\
+             \"code\":\"model_not_found\"}}",
+            "x",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderNotFound);
+        assert!(failure.failover_eligible);
+    }
+
+    #[tokio::test]
+    async fn a_bodiless_404_keeps_the_lane_policy() {
+        let failure = open_against_body("404 Not Found", "", "m").await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderNotFound);
+        assert!(failure.failover_eligible);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_by_sentence_without_a_refusal_code_stays_a_request_error() {
+        let failure = open_against_body(
+            "400 Bad Request",
+            "{\"error\":{\"code\":\"invalid_value\",\"message\":\"Request blocked by the \
+             organization policy for this parameter.\"}}",
+            "m",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn a_content_filter_4xx_is_a_refusal_not_a_request_shape_error() {
+        let failure = open_against_body(
+            "400 Bad Request",
+            "{\"error\":{\"code\":\"content_filter\",\"message\":\"The response was \
+             filtered due to the prompt triggering the content management policy.\"}}",
+            "m",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::Refusal);
+        assert_eq!(failure.public_error().status_code, 400);
+        assert_eq!(failure.public_error().code, "refusal");
+        // The content_filter code names the content-policy category.
+        assert_eq!(
+            failure.refusal_reason,
+            Some(crate::errors::RefusalReason::ContentPolicy)
+        );
+        // The sanitized sentence (or the code token when it must drop) rides
+        // to the ledger; a refusal never relays it to the caller.
+        assert!(failure.provider_detail.is_some());
+        assert_eq!(
+            failure.public_error().message,
+            "provider refused the request: content policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aggregator_routing_gate_403_is_not_a_credential_failure() {
+        let failure = open_against_body(
+            "403 Forbidden",
+            "{\"error\":{\"message\":\"thinkingmachines/inkling:free is only available \
+             on agentic harnesses.\",\"code\":403,\"metadata\":{\"routing_funnel\":\
+             [{\"step\":\"Initial Endpoints\",\"endpoint_count\":1}],\
+             \"failed_routing_step\":\"Gate Free Endpoints by Agentic Harness\"}}}",
+            "thinkingmachines/inkling:free",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderNotFound);
+        assert!(failure.failover_eligible);
+        assert!(!failure.retryable_same_deployment);
+        assert!(failure.provider_detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_plain_403_stays_a_credential_failure() {
+        let failure = open_against_body(
+            "403 Forbidden",
+            "{\"error\":{\"message\":\"Forbidden\",\"code\":403}}",
+            "m",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderAuthentication);
+        assert!(failure.failover_eligible);
+    }
+
+    #[tokio::test]
+    async fn a_lane_limitation_400_keeps_the_class_but_fails_over() {
+        let failure = open_against_body(
+            "400 Bad Request",
+            "{\"error\":{\"message\":\"System message must be at the beginning.\",\
+             \"type\":\"invalid_request_error\"}}",
+            "qwen3.8-27b",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+        assert!(
+            failure.failover_eligible,
+            "another rung can carry the request"
+        );
+        assert!(!failure.retryable_same_deployment);
+        assert!(failure
+            .provider_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("System message must be at the beginning")));
+    }
+
+    #[tokio::test]
+    async fn a_lane_limitation_phrase_echoed_outside_the_message_does_not_fail_over() {
+        let failure = open_against_body(
+            "400 Bad Request",
+            "{\"error\":{\"message\":\"Invalid value for temperature.\",\
+             \"type\":\"invalid_request_error\",\"param\":\"temperature\",\
+             \"echo\":\"System message must be at the beginning\"}}",
+            "m",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+        assert!(!failure.failover_eligible);
+    }
+
+    #[tokio::test]
+    async fn a_403_naming_a_step_without_a_walked_funnel_stays_a_credential_failure() {
+        let failure = open_against_body(
+            "403 Forbidden",
+            "{\"error\":{\"message\":\"Forbidden\",\"code\":403,\
+             \"metadata\":{\"failed_routing_step\":\"Authenticate\"}}}",
+            "m",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderAuthentication);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_400_does_not_fail_over() {
+        let failure = open_against_body(
+            "400 Bad Request",
+            "{\"error\":{\"message\":\"Invalid value for temperature.\",\
+             \"type\":\"invalid_request_error\"}}",
+            "m",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+        assert!(!failure.failover_eligible);
     }
 
     #[test]

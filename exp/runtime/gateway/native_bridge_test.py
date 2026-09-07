@@ -227,6 +227,28 @@ def test_audio_capability_error_explains_the_refusal(
     assert "audio_input" not in error.detail.message
 
 
+def test_forced_tool_choice_refusal_tells_the_caller_what_to_send_instead() -> None:
+    """The forced-choice refusal names the field AND the way out ('auto'), on
+    every surface: the generic "remove the unsupported field" wording left 64
+    callers in two hours (2026-09-06) with nothing actionable."""
+    for surface in (
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        GatewayApiSurface.RESPONSES,
+        GatewayApiSurface.MESSAGES,
+    ):
+        error = _public_capability_error(
+            ProviderCapabilityError(capability="forced_tool_choice"),
+            surface,
+            public_stream=True,
+            public_tools=True,
+        )
+        assert error.status_code == 400
+        assert error.detail.param == "tool_choice"
+        assert error.detail.code == "unsupported_capability"
+        assert "tool_choice 'auto'" in error.detail.message
+        assert "forced_tool_choice" not in error.detail.message
+
+
 def test_public_capability_error_never_exposes_internal_labels() -> None:
     """Internal route requirements fail against model without leaking their names."""
     error = _public_capability_error(
@@ -606,7 +628,11 @@ def test_hunyuan_tool_turn_reasoning_round_trips_as_a_sealed_carrier(
     assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
 
 
-def test_hunyuan_plain_turn_plaintext_reasoning_replays_verbatim(tmp_path: Path) -> None:
+@pytest.mark.parametrize("thinking", ["", "The user wants a directory listing; ls is the command."])
+def test_hunyuan_plain_turn_plaintext_reasoning_replays_verbatim(
+    tmp_path: Path,
+    thinking: str,
+) -> None:
     """A Terminus-shaped loop round-trips the plaintext the rung itself returned.
 
     Terminus-2 parses commands out of assistant TEXT and feeds the output back
@@ -624,7 +650,6 @@ def test_hunyuan_plain_turn_plaintext_reasoning_replays_verbatim(tmp_path: Path)
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
     )
-    thinking = "The user wants a directory listing; ls is the command."
     body = json.dumps(
         {
             "model": "coding",
@@ -729,7 +754,11 @@ def test_hunyuan_mixed_carrier_and_plaintext_history_round_trips(tmp_path: Path)
     assert messages[3]["reasoning_content"] == plain
 
 
-def test_plaintext_reasoning_degrades_on_a_route_without_exposure(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reasoning", ["", "private"])
+def test_plaintext_reasoning_degrades_on_a_route_without_exposure(
+    tmp_path: Path,
+    reasoning: str,
+) -> None:
     """A rung that cannot replay plaintext reasoning drops it with disclosure.
 
     The block is baked into the caller's transcript (an earlier exposed-rung
@@ -745,7 +774,7 @@ def test_plaintext_reasoning_degrades_on_a_route_without_exposure(tmp_path: Path
             "model": "coding",
             "messages": [
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "x", "reasoning_content": "private"},
+                {"role": "assistant", "content": "x", "reasoning_content": reasoning},
                 {"role": "user", "content": "again"},
             ],
         }
@@ -2852,6 +2881,7 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
+        client_ip: str | None = None,
     ) -> AuthorizationSnapshot:
         """Mint the authorization, then stall until the activation swap lands."""
         authorization = original(
@@ -2861,6 +2891,7 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
             deadline_monotonic=deadline_monotonic,
             app_referer=app_referer,
             app_title=app_title,
+            client_ip=client_ip,
         )
         minted.set()
         assert swapped.wait(timeout=10)
@@ -5141,3 +5172,92 @@ def test_internal_admission_failures_log_the_real_exception(
     assert str(fields["request_id"]).startswith("request-")
     assert fields["exception_type"] == "KeyError"
     assert fields["operation"] == "native_admit"
+
+
+def _affinity_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str, Path]:
+    """Load the control plane over a pool opted into cache-affinity routing.
+
+    Seeds the standard certified two-deployment pool, then authors the opt-in
+    the way the hosted platform does: the pool's ``failover_mode`` flips to
+    ``maximize_cache_affinity`` and each rung carries an affinity weight in
+    its dispatch policy, all as catalog data behind a fresh alias revision.
+    """
+    from exp.common.models.catalog import (
+        GatewayRungDispatchPolicy,
+        load_model_catalog,
+        write_model_catalog,
+    )
+    from exp.runtime.gateway.catalog_authority import snapshot_current_catalog
+
+    manager, raw_key = _configured_pool_gateway(root)
+    catalog_path = root / "models.toml"
+    catalog = load_model_catalog(catalog_path)
+    weighted_models = dict(catalog.models)
+    for alias, weight in (("alpha", 1.0), ("beta", 6.0)):
+        record = weighted_models[alias]
+        assert record.gateway is not None
+        weighted_models[alias] = record.model_copy(
+            update={
+                "gateway": record.gateway.model_copy(
+                    update={"dispatch": GatewayRungDispatchPolicy(affinity_weight=weight)}
+                )
+            }
+        )
+    pool = catalog.gateway_pools["coding"].model_copy(
+        update={"failover_mode": "maximize_cache_affinity"}
+    )
+    write_model_catalog(
+        catalog_path,
+        catalog.model_copy(update={"models": weighted_models, "gateway_pools": {"coding": pool}}),
+    )
+    _catalog, normalized, snapshot = snapshot_current_catalog(root)
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-pool-affinity",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    return NativeControlPlane(components), raw_key, manager.database_path
+
+
+def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> None:
+    """One session always admits the same rendezvous ladder, disclosed as such.
+
+    Three admissions of one session id produce byte-identical route orders,
+    distinct sessions reach distinct first rungs (the whole point of spreading
+    by fingerprint), the 6x-weighted rung carries the clear majority, and the
+    reserved first dispatch lands durable ``dispatch_reason='affinity'``.
+    """
+    import sqlite3
+
+    control, raw_key, database_path = _affinity_pool_control_plane(tmp_path)
+    body = json.dumps({"model": "coding", "messages": [{"role": "user", "content": "hi"}]})
+
+    def admitted_order(session: str) -> tuple[str, ...]:
+        """Admit one request under a session id and name its rung order."""
+        admission = _admit(control, raw_key, body, client_request_id=session)
+        route = admission["route"]
+        assert isinstance(route, list)
+        return tuple(str(cast("JsonObject", entry)["deployment_id"]) for entry in route)
+
+    assert len({admitted_order("session-pinned") for _ in range(3)}) == 1
+    first_rungs = [admitted_order(f"session-{index}")[0] for index in range(24)]
+    assert set(first_rungs) == {"alpha", "beta"}
+    assert first_rungs.count("beta") > first_rungs.count("alpha")
+
+    admission = _admit(control, raw_key, body, client_request_id="session-disclosed")
+    started = _start_first(control, admission)
+    assert started["route_depth"] == 0
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT dispatch_reason, preferred_deployment_id FROM gateway_attempts"
+            " WHERE attempt_id = ?",
+            (str(started["attempt_id"]),),
+        ).fetchone()
+    assert row == ("affinity", None)

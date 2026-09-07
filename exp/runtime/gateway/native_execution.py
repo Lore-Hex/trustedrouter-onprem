@@ -40,6 +40,7 @@ from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -126,6 +127,19 @@ class InflightRequest:
     # forward and bill stay consistent even if a card sits on a lane that would
     # strip it. Empty on surfaces without a service tier (images, embeddings).
     tier_forwarded_by_depth: tuple[bool, ...] = ()
+    # The request's tenant-isolated affinity fingerprint on a
+    # ``maximize_cache_affinity`` pool (None elsewhere), captured at admission
+    # so dispatch reservation can read and refresh the worker-local sticky
+    # binding and apply the fresh-session spill threshold.
+    affinity_fingerprint: bytes | None = None
+    # Attempts whose settled usage already fed the cache-priority EWMA: a
+    # settlement can land through the direct path AND the retained-settlement
+    # sweep (both idempotent at the ledger), so the fold is guarded to exactly
+    # once per attempt.
+    cache_recorded_attempts: set[str] = field(default_factory=set)
+    # Whether the route's depth 0 was chosen by a live sticky binding rather
+    # than rendezvous order, for the ``affinity_sticky`` disclosure.
+    sticky_preferred: bool = False
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
@@ -143,6 +157,96 @@ def deployment_health_key(
         deployment.deployment_id,
         deployment.connection_sha256,
     )
+
+
+def rung_load_key(deployment: ExactModelDeployment) -> RungLoadKey:
+    """Return one deployment's physical-lane load key (never revision-scoped)."""
+    return (deployment.deployment_id, deployment.connection_sha256)
+
+
+def deployment_priced_for_service_tier(
+    deployment: ExactModelDeployment,
+    service_tier: str | None,
+    *,
+    forwards_tier: bool,
+) -> ExactModelDeployment:
+    """Reprice one deployment for a requested flex/priority processing tier.
+
+    v1 bills the REQUESTED tier: when the SELECTED candidate actually FORWARDS
+    the tier to its provider and carries a pass-through card for it, the card's
+    rates replace the base schedule on a copy used only for THIS reservation, so
+    the ceiling, the stored per-token rates, and settlement all bill the tier
+    transparently. ``forwards_tier`` is the admission-time forwarding decision
+    for this exact depth (``GatewayWireProfile.forwards_tier``); gating on it
+    keeps FORWARD and BILL consistent even if a card ever sits on a lane whose
+    wire would strip the tier (non-tier dialect, tier disabled): such a depth
+    runs the provider's base schedule, so it must bill the base schedule too. No
+    tier, no forwarding, or no card returns the deployment unchanged. The copy
+    stays Python-side and never crosses the native boundary.
+    """
+    if not forwards_tier:
+        return deployment
+    effective = deployment.gateway.prices.for_service_tier(service_tier)
+    if effective is deployment.gateway.prices:
+        return deployment
+    return deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"prices": effective})}
+    )
+
+
+def dispatch_disclosure(
+    route: GatewayRoute,
+    candidate: int,
+    *,
+    policy_sheds: list[tuple[int, str]],
+    forced_overflow: bool,
+    sticky_preferred: bool = False,
+) -> tuple[str | None, ExactModelDeployment | None]:
+    """Name why the chosen rung serves and the bypassed preferred rung, if any.
+
+    Emission is gated so an alias the platform never opted in keeps byte-null
+    disclosure columns. On a ``maximize_cache_affinity`` pool every attempt
+    discloses against the preferred depth-0 rung: ``affinity`` on the happy
+    path (``affinity_sticky`` when a live sticky binding, not rendezvous,
+    chose depth 0), the shed reason when depth 0 was policy-shed in this
+    reservation, ``rung_dead`` when it was bypassed by health or an earlier
+    failure, ``saturated_overflow`` when the ladder force-admitted past a
+    bound. On any other pool a disclosure appears only when a dispatch policy
+    actually shed a rung in this reservation, and the preferred rung is the
+    shed rung itself (the counterfactual the shed is measured against).
+
+    Args:
+        route: Frozen ordered route for this request.
+        candidate: The route depth about to dispatch.
+        policy_sheds: ``(depth, reason)`` for every policy shed this
+            reservation, in ladder order.
+        forced_overflow: Whether this dispatch was forced past a bound.
+        sticky_preferred: Whether the route's depth 0 was chosen by a sticky
+            spill binding rather than rendezvous order.
+
+    Returns:
+        ``(dispatch_reason, preferred_deployment)``; the deployment is
+        ``None`` whenever the chosen rung IS the disclosure's preferred rung.
+    """
+    if route.snapshot.failover_mode == "maximize_cache_affinity":
+        target_depth = 0
+        if forced_overflow:
+            reason = "saturated_overflow"
+        elif candidate == 0:
+            reason = "affinity_sticky" if sticky_preferred else "affinity"
+        else:
+            lead_shed = next((shed for depth, shed in policy_sheds if depth == 0), None)
+            reason = lead_shed or "rung_dead"
+    elif forced_overflow:
+        target_depth = policy_sheds[0][0]
+        reason = "saturated_overflow"
+    elif policy_sheds:
+        target_depth, reason = policy_sheds[0]
+    else:
+        return None, None
+    if target_depth == candidate:
+        return reason, None
+    return reason, route.deployments[target_depth]
 
 
 def claim_route_from(
@@ -202,12 +306,15 @@ def next_route_candidate(
     Under ``maximize_cache`` a throttle (429) surfaces to the caller instead of
     failing over: the warm rung's prompt cache is kept for a caller retry after
     the provider's backoff, rather than restarting cold on another provider.
-    Timeouts are unchanged from the default: a retryable 408 still redials the
-    warm rung via its own ``retryable_same_deployment`` flag in both modes, while
+    ``maximize_cache_affinity`` deliberately does NOT share that short-circuit:
+    its cache story is the deterministic rendezvous alternate, so a throttle
+    fails over exactly like ``maximize_availability``. Timeouts are identical
+    in every mode: a retryable 408 redials the
+    warm rung via its own ``retryable_same_deployment`` flag, while
     a first-byte/header-phase stall is a dead lane the classifier marks
     non-redialable and so still fails over. Operational deadness (auth, not-found,
-    provider 5xx, transport) and client errors are unchanged too: deadness still
-    fails over in both modes, client errors never do.
+    provider 5xx, transport) and client errors are identical in every mode too:
+    deadness always fails over, client errors never do.
 
     Args:
         health: Revision-isolated circuit and throttle registry.
@@ -546,6 +653,7 @@ def deployment_wire_entry(
     upstream_body: str | None = None,
     headers: dict[str, str] | None = None,
     stop_sequences: Sequence[str] = (),
+    serialize_tool_calls: bool = False,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -566,6 +674,9 @@ def deployment_wire_entry(
         stop_sequences: Caller stop sequences the data plane must enforce on
             this rung's stream because the provider wire has no stop field
             (OpenAI Responses). Empty when the provider honours them itself.
+        serialize_tool_calls: The caller sent ``parallel_tool_calls: false``
+            and this rung's wire has no such control, so the data plane keeps
+            one tool call per turn on its stream.
 
     Returns:
         The JSON-compatible wire entry consumed by the data plane.
@@ -578,6 +689,10 @@ def deployment_wire_entry(
         "url": profile.url,
         "headers": dict(profile.headers) if headers is None else dict(headers),
         "model_id": profile.model_id,
+        # A customer-managed (BYOK) rung: a rejected credential or exhausted
+        # provider account there is the customer's own configuration, so the
+        # data plane surfaces it as their 400 instead of operator deadness.
+        "billing_customer_managed": profile.billing_customer_managed,
         "timeout_seconds": profile.timeout_seconds,
         "upstream_payload": None if upstream_body is not None else upstream_payload,
         "upstream_body": upstream_body,
@@ -588,6 +703,7 @@ def deployment_wire_entry(
         # match and terminates with a stop-sequence reason. Empty for rungs
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
+        "serialize_tool_calls": serialize_tool_calls,
         "idempotency_key": deployment_operation_key(route, deployment),
         # First-byte allowance overrides; the data plane falls back to its
         # serving defaults when a deployment declares nothing.

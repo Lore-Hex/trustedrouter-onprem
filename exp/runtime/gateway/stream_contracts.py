@@ -185,6 +185,24 @@ class GatewayFailureClass(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class GatewayRefusalReason(StrEnum):
+    """The bounded category of a provider refusal, mirroring the native
+    ``RefusalReason``.
+
+    A refusal answer names WHICH policy declined the content as a closed
+    vocabulary, so a client can branch on it and the control plane can count
+    refusals by reason without parsing the free-form provider detail. The
+    caller never sees the provider's own prose, only the fixed category.
+    """
+
+    CYBER_POLICY = "cyber_policy"
+    CBRN = "cbrn"
+    CONTENT_POLICY = "content_policy"
+    RECITATION = "recitation"
+    DATA_INSPECTION = "data_inspection"
+    UNSPECIFIED = "unspecified"
+
+
 class GatewayFailure(ContractModel):
     """Sanitized failure with retry and failover eligibility already classified."""
 
@@ -198,9 +216,20 @@ class GatewayFailure(ContractModel):
     provider_detail: str | None = Field(default=None, min_length=1, max_length=240)
     """Provider explanation of a client error, relayed only for that class."""
     retry_after_seconds: int | None = Field(default=None, ge=1)
+    """The failure is the caller's own provider configuration: a rejected
+    credential or exhausted account on their customer-managed (BYOK) rung. The
+    class keeps its ladder semantics; the ledger files it as the caller's
+    invalid request and the terminal answer is their 400."""
+    customer_owned: bool = False
     """Known wait before a retry can dispatch (a throttle window's remainder).
 
     When present on a throttled failure, the public mapping advertises this
     value as ``Retry-After`` instead of its fixed default, so the header and
     the message never tell the caller two different waits.
     """
+    refusal_reason: GatewayRefusalReason | None = None
+    """The bounded refusal category, present only on a ``REFUSAL`` failure.
+
+    Set from the provider's own code and sentence and carried on the public
+    error and the settlement argument, so the caller reads the category and
+    the control plane counts refusals by reason without parsing detail."""

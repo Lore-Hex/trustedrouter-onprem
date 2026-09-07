@@ -9,6 +9,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import (
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
+    GatewayRungDispatchPolicy,
     GatewayServiceTierPrices,
     GatewayTokenPrices,
 )
@@ -19,28 +20,35 @@ from exp.common.models.content import (
     TextContentPart,
     VideoContentPart,
 )
-from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.common.models.model import ModelCapabilities
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,
+    GatewayFailure,
+    GatewayFailureClass,
     GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_admission import (
+    _affinity_ordered_rungs,
     _prefer_cache_capable_rungs,
     admitted_route_requests,
     protocol_compatible_indexes,
     route_rejection,
+    shape_parallel_tool_calls,
 )
 from exp.runtime.gateway.native_dispatch import NativeWireClient
+from exp.runtime.gateway.native_execution import deployment_health_key
 from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 
@@ -91,7 +99,7 @@ def _mixed_route(
             exact_model_id="exact-one",
             pool_id="pool-one",
             deployment_ids=tuple(item.deployment_id for item in deployments),
-            failover_mode=cast(Literal["maximize_availability", "maximize_cache"], failover_mode),
+            failover_mode=cast(FailoverMode, failover_mode),
         ),
         deployment=deployments[0],
         fallback_deployments=deployments[1:],
@@ -452,7 +460,7 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
         ),
         (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
     )
-    narrowed, _wires_out, public, provider = admitted_route_requests(
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         wires,
         request,
@@ -513,7 +521,7 @@ def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:
             stream=True,
             include_usage=True,
         )
-        _narrowed, _wires_out, public, provider = admitted_route_requests(
+        _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
             route,
             wires,
             request,
@@ -603,7 +611,7 @@ def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_discl
             client,
         ),
     )
-    narrowed, _wires_out, public, provider = admitted_route_requests(
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         wires,
         request,
@@ -698,7 +706,7 @@ def test_tool_result_image_passes_through_on_a_vision_anthropic_route(stream: bo
     )
     accounting = _AdmissionCoercionCounter()
 
-    _narrowed, _wires_out, public, provider = admitted_route_requests(
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         wires,
         _tool_screenshot_route_request(stream=stream),
@@ -743,7 +751,7 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
     )
     accounting = _AdmissionCoercionCounter()
 
-    _narrowed, _wires_out, public, provider = admitted_route_requests(
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         wires,
         _tool_screenshot_route_request(stream=stream),
@@ -797,7 +805,7 @@ def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> 
             client,
         ),
     )
-    narrowed, _wires_out, public, provider = admitted_route_requests(
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         wires,
         request,
@@ -914,7 +922,7 @@ def test_tier_priced_host_lane_admits_the_named_tier() -> None:
         messages=(GatewayMessage(role="user", content="go"),),
         service_tier="flex",
     )
-    _narrowed, _wires_out, _public, provider = admitted_route_requests(
+    _narrowed, _wires_out, _public, provider, _placement = admitted_route_requests(
         route,
         wires,
         request,
@@ -1006,7 +1014,7 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
             client,
         ),
     )
-    _n, _w, _p, provider = admitted_route_requests(
+    _n, _w, _p, provider, _placement = admitted_route_requests(
         byok_route,
         byok_wires,
         priority_request,
@@ -1095,7 +1103,7 @@ def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
     )
     route = _mixed_route("maximize_availability", deployments, surface)
     accounting = _CoercionCounter()
-    narrowed, _wires_out, public, provider = admitted_route_requests(
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         _fable_and_shim_wires(),
         _forced_choice_request(surface, choice),
@@ -1125,7 +1133,7 @@ def test_a_forced_choice_relaxes_to_auto_with_disclosure_when_no_rung_can_force(
     deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
     route = _mixed_route("maximize_availability", deployments, surface)
     accounting = _CoercionCounter()
-    narrowed, _wires_out, public, provider = admitted_route_requests(
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         _fable_and_shim_wires()[:1],
         _forced_choice_request(surface, choice),
@@ -1168,7 +1176,7 @@ def test_a_strict_schema_the_anthropic_validator_rejects_prefers_a_strict_capabl
     )
     route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
     accounting = _CoercionCounter()
-    narrowed, _wires_out, public, provider = admitted_route_requests(
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         _fable_and_shim_wires(),
         _strict_tool_request(_MAX_ITEMS_SCHEMA),
@@ -1188,7 +1196,7 @@ def test_a_strict_schema_no_rung_can_honor_drops_strict_and_keeps_the_schema() -
     deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
     route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
     accounting = _CoercionCounter()
-    narrowed, _wires_out, public, provider = admitted_route_requests(
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         _fable_and_shim_wires()[:1],
         _strict_tool_request(_MAX_ITEMS_SCHEMA),
@@ -1210,7 +1218,7 @@ def test_an_open_strict_schema_is_closed_for_the_anthropic_rung_with_disclosure(
     route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
     accounting = _CoercionCounter()
     open_schema: JsonObject = {"type": "object", "properties": {"city": {"type": "string"}}}
-    _narrowed, _wires_out, public, provider = admitted_route_requests(
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
         _fable_and_shim_wires()[:1],
         _strict_tool_request(open_schema),
@@ -1253,3 +1261,300 @@ def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> N
     assert caught.value.param == "messages"
     assert "at least 201 tokens" in str(caught.value)
     assert "200 tokens" in str(caught.value)
+
+
+def test_parallel_tool_calls_shape_per_rung_capability() -> None:
+    """A rung with the control forwards it; one without drops `true` or serializes `false`."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        parallel_tool_calls=False,
+    )
+    carried = GatewayDeploymentCapabilities(supports_parallel_tool_calls=True)
+    missing = GatewayDeploymentCapabilities(supports_parallel_tool_calls=False)
+
+    shaped, disclosure = shape_parallel_tool_calls(request, carried)
+    assert shaped is request and disclosure is None
+
+    shaped, disclosure = shape_parallel_tool_calls(request, missing)
+    assert shaped.parallel_tool_calls is None and shaped.serialize_tool_calls is True
+    assert disclosure == "parallel_tool_calls->emulated(serialized_by_gateway)"
+
+    shaped, disclosure = shape_parallel_tool_calls(
+        request.model_copy(update={"parallel_tool_calls": True}), missing
+    )
+    assert shaped.parallel_tool_calls is None and shaped.serialize_tool_calls is False
+    assert disclosure == "parallel_tool_calls->dropped(provider_default)"
+
+    untouched, disclosure = shape_parallel_tool_calls(
+        request.model_copy(update={"parallel_tool_calls": None}), missing
+    )
+    assert untouched.parallel_tool_calls is None and disclosure is None
+
+
+def _weighted_deployment(deployment_id: str, weight: float | None) -> ExactModelDeployment:
+    """Build one rung carrying an authored affinity weight (or none)."""
+    dispatch = None if weight is None else GatewayRungDispatchPolicy(affinity_weight=weight)
+    return _deployment(deployment_id, gateway=GatewayDeploymentMetadata(dispatch=dispatch))
+
+
+def _affinity_fixture(
+    failover_mode: str = "maximize_cache_affinity",
+) -> tuple[GatewayRoute, tuple[tuple[GatewayWireProfile, NativeWireClient], ...]]:
+    """Build a three-rung affinity route over uniform openai-compatible wires."""
+    deployments = (
+        _weighted_deployment("dep-house", 10.0),
+        _weighted_deployment("dep-fireworks", 3.0),
+        _weighted_deployment("dep-openrouter", None),
+    )
+    route = _mixed_route(failover_mode, deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = tuple(
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible", url=f"https://{item.deployment_id}.test"
+            ),
+            client,
+        )
+        for item in deployments
+    )
+    return route, wires
+
+
+def _session_request(client_request_id: str) -> GatewayRequest:
+    """Build one chat request carrying a session-scoped correlation id."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        client_request_id=client_request_id,
+    )
+
+
+def _order(route: GatewayRoute) -> tuple[str, ...]:
+    """Name the route's dispatch order for readable assertions."""
+    return tuple(item.deployment_id for item in route.deployments)
+
+
+class _AffinityAccounting:
+    """Just the sticky and health registries affinity ordering reads."""
+
+    def __init__(self) -> None:
+        """Compose fresh empty registries."""
+        self.sticky = StickySpillRegistry()
+        self.health = DeploymentHealthRegistry()
+
+
+def _affinity_accounting() -> NativeAttemptAccounting:
+    """Build one registry-only accounting fake for affinity ordering."""
+    return cast(NativeAttemptAccounting, _AffinityAccounting())
+
+
+class TestAffinityOrderedRungs:
+    """Rendezvous ordering under the affinity flag, and the flag-off gate."""
+
+    def test_legacy_modes_keep_the_certified_order_object(self) -> None:
+        """The two shipped modes return the identical route, byte for byte."""
+        for mode in ("maximize_availability", "maximize_cache"):
+            route, wires = _affinity_fixture(mode)
+            ordered, ordered_wires, placement = _affinity_ordered_rungs(
+                route,
+                wires,
+                _session_request("session-1"),
+                accounting=_affinity_accounting(),
+                authorization=route.snapshot.authorization,
+                continuation=None,
+            )
+            assert ordered is route
+            assert ordered_wires is wires
+            assert placement.fingerprint is None
+
+    def test_simulated_workers_order_one_session_identically(self) -> None:
+        """Independent computations of one session agree on the full ladder."""
+        orders = set()
+        for _worker in range(6):
+            route, wires = _affinity_fixture()
+            ordered, _wires_out, _placement = _affinity_ordered_rungs(
+                route,
+                wires,
+                _session_request("session-42"),
+                accounting=_affinity_accounting(),
+                authorization=route.snapshot.authorization,
+                continuation=None,
+            )
+            orders.add(_order(ordered))
+        assert len(orders) == 1
+
+    def test_different_sessions_reach_different_first_rungs(self) -> None:
+        """The rendezvous spreads distinct conversations across rungs."""
+        first_rungs = set()
+        for index in range(64):
+            route, wires = _affinity_fixture()
+            ordered, _wires_out, _placement = _affinity_ordered_rungs(
+                route,
+                wires,
+                _session_request(f"session-{index}"),
+                accounting=_affinity_accounting(),
+                authorization=route.snapshot.authorization,
+                continuation=None,
+            )
+            first_rungs.add(_order(ordered)[0])
+        assert len(first_rungs) > 1
+
+    def test_wires_stay_aligned_with_the_reordered_route(self) -> None:
+        """Each reordered rung keeps its own resolved wire."""
+        route, wires = _affinity_fixture()
+        ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            _session_request("session-7"),
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        for deployment, (profile, _client) in zip(ordered.deployments, ordered_wires, strict=True):
+            assert profile.url == f"https://{deployment.deployment_id}.test"
+
+    def test_continuation_keeps_the_original_turns_placement(self) -> None:
+        """A continued conversation orders exactly like its originating session."""
+        from exp.runtime.gateway.native_responses import ContinuationContext
+        from exp.runtime.openai_protocol.state import ProtocolNamespace
+
+        route, wires = _affinity_fixture()
+        original, _wires_out, _placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            _session_request("session-original"),
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        continuation = ContinuationContext(
+            namespace=ProtocolNamespace(
+                organization_id="organization-one",
+                identity_id="identity-one",
+                alias_revision_id="revision-one",
+            ),
+            episode_key="session-original",
+            response_id="resp-1",
+            messages=(),
+        )
+        continued_route, continued_wires = _affinity_fixture()
+        continued, _wires_out, _placement = _affinity_ordered_rungs(
+            continued_route,
+            continued_wires,
+            _session_request("a-fresh-per-turn-id"),
+            accounting=_affinity_accounting(),
+            authorization=continued_route.snapshot.authorization,
+            continuation=continuation,
+        )
+        assert _order(continued) == _order(original)
+
+    def test_marked_requests_keep_marker_honoring_rungs_first(self) -> None:
+        """#717 composes: markers partition first, rendezvous orders within."""
+        deployments = (
+            _weighted_deployment("dep-shim", 10.0),
+            _weighted_deployment("dep-native-a", 3.0),
+            _weighted_deployment("dep-native-b", 1.0),
+        )
+        route = _mixed_route("maximize_cache_affinity", deployments, GatewayApiSurface.MESSAGES)
+        client = cast(NativeWireClient, object())
+        wires = (
+            (GatewayWireProfile(dialect="openai_compatible", url="https://shim.test"), client),
+            (GatewayWireProfile(dialect="anthropic_messages", url="https://a.test"), client),
+            (GatewayWireProfile(dialect="anthropic_messages", url="https://b.test"), client),
+        )
+        marked = _marked_request().model_copy(update={"client_request_id": "session-1"})
+        ordered, _wires_out, _placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            marked,
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert set(_order(ordered)[:2]) == {"dep-native-a", "dep-native-b"}
+        assert _order(ordered)[2] == "dep-shim"
+        # The markerless order restricted to the native group matches the
+        # within-group order of the marked request: one rendezvous, two views.
+        plain_route, plain_wires = (
+            _mixed_route("maximize_cache_affinity", deployments, GatewayApiSurface.MESSAGES),
+            wires,
+        )
+        plain_ordered, _wires_out, _placement = _affinity_ordered_rungs(
+            plain_route,
+            plain_wires,
+            _session_request("session-1"),
+            accounting=_affinity_accounting(),
+            authorization=plain_route.snapshot.authorization,
+            continuation=None,
+        )
+        plain_native_order = tuple(name for name in _order(plain_ordered) if name != "dep-shim")
+        assert _order(ordered)[:2] == plain_native_order
+
+    def test_sticky_binding_is_honored_bypassed_and_expired(self) -> None:
+        """A live binding leads the order; a suppressed or expired one does not.
+
+        The binding is honored ahead of rendezvous, cleared (and rendezvous
+        restored) when its rung is throttled, and ignored once its authored
+        lifetime passes, so stickiness can never pin a conversation to a lane
+        that cannot serve it or outlive the provider cache it protects.
+        """
+        route, wires = _affinity_fixture()
+        accounting = _affinity_accounting()
+        request = _session_request("session-sticky")
+        rendezvous, _wires_out, rendezvous_placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert rendezvous_placement.fingerprint is not None
+        assert rendezvous_placement.sticky_preferred is False
+        # Bind the conversation to a rung rendezvous did NOT rank first (the
+        # spill target a congested preferred rung shed it onto).
+        spill_target = _order(rendezvous)[1]
+        accounting.sticky.bind(rendezvous_placement.fingerprint, spill_target, ttl_seconds=600.0)
+        sticky, _wires_out, sticky_placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(sticky)[0] == spill_target
+        assert sticky_placement.sticky_preferred is True
+        assert _order(sticky)[1:] == tuple(
+            name for name in _order(rendezvous) if name != spill_target
+        )
+        # The bound rung throttles: the binding is bypassed AND cleared, so
+        # rendezvous order stands again even after the throttle lifts.
+        bound_deployment = next(
+            item for item in route.deployments if item.deployment_id == spill_target
+        )
+        accounting.health.failed(
+            deployment_health_key(route.snapshot.authorization, bound_deployment),
+            GatewayFailure(
+                failure_class=GatewayFailureClass.THROTTLED,
+                safe_message="provider throttled the request",
+            ),
+        )
+        bypassed, _wires_out, bypassed_placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(bypassed) == _order(rendezvous)
+        assert bypassed_placement.sticky_preferred is False
+        assert accounting.sticky.bound_deployment(rendezvous_placement.fingerprint) is None
+        # An expired binding is ignored without needing a suppression event.
+        clock = [0.0]
+        expiring = StickySpillRegistry(clock=lambda: clock[0])
+        expiring.bind(b"fingerprint", "dep-house", ttl_seconds=600.0)
+        clock[0] = 601.0
+        assert expiring.bound_deployment(b"fingerprint") is None

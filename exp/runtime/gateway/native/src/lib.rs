@@ -18,6 +18,8 @@ mod guardrails;
 mod memory;
 mod metrics;
 mod param_attribution;
+mod rate_limit_headers;
+mod rejection_shapes;
 mod relay;
 mod replay;
 mod respond;
@@ -33,6 +35,8 @@ mod server;
 mod settlement;
 mod sse;
 mod stop_sequences;
+mod stream_errors;
+mod tool_serialization;
 mod upstream;
 mod waterfall;
 

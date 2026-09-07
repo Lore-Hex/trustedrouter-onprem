@@ -30,6 +30,7 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.core.files import write_text_atomic
+from exp.common.models.dispatch_policy import FailoverMode, GatewayRungDispatchPolicy
 from exp.common.models.model import (
     BillingSource,
     ModelCapabilities,
@@ -41,26 +42,11 @@ _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
 _AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
-_FIXED_ORIGIN_PROVIDERS = frozenset(
-    {"anthropic", "gemini", "openai", "openrouter", "trustedrouter", "tinker"}
-)
+_FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
+_FIXED_ORIGIN_PROVIDERS |= {"trustedrouter"}
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
 AzureApiSurface = Literal["openai_deployments", "model_inference"]
-
-FailoverMode = Literal["maximize_availability", "maximize_cache"]
-"""How a pool's waterfall reacts to a failed attempt.
-
-``maximize_availability`` (the default, historical behavior) fails over to the
-next rung on any failover-eligible error. ``maximize_cache`` does NOT fail over on
-a throttle (429) -- it returns the throttle so the caller retries the warm rung
-after backoff, preserving its prompt cache rather than restarting cold on another
-provider -- while STILL failing over on operational deadness
-(auth/not-found/5xx/transport) and on a stalled lane (a first-byte or
-header-phase timeout that never answered), for which there is no warm cache to
-preserve. A genuinely retryable timeout (provider 408) redials the warm rung in
-both modes. Client errors reject without failover in both modes.
-"""
 """Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
 
 _FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
@@ -164,6 +150,7 @@ class ConnectionConfig(ContractModel):
     region: str | None = Field(default=None, max_length=64)
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    trusted_custom_origin: bool = False
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
@@ -198,10 +185,17 @@ class ConnectionConfig(ContractModel):
                 "aws_access_key_id_env and bedrock_auth_mode are only accepted for "
                 "provider='bedrock'"
             )
-        if self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
+        if self.trusted_custom_origin:
+            if self.provider not in _FIXED_ORIGIN_PROVIDERS:
+                raise ValueError("trusted_custom_origin applies only to a native provider")
+            if self.base_url is None:
+                raise ValueError("trusted_custom_origin requires an explicit base_url")
+            if urlsplit(self.base_url).scheme != "https":
+                raise ValueError("trusted_custom_origin requires an https base_url")
+        elif self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
             raise ValueError(
                 f"native provider {self.provider!r} uses its built-in official endpoint; "
-                "use provider='openai-compatible' for a trusted custom endpoint"
+                "set trusted_custom_origin=True or use provider='openai-compatible'"
             )
         if self.provider == "azure":
             if self.base_url is None:
@@ -317,6 +311,8 @@ class ConnectionConfig(ContractModel):
             identity["azure_api_surface"] = "model_inference"
         if self.region is not None:
             identity["region"] = self.region
+        if self.trusted_custom_origin:  # endpoint identity; added only when set
+            identity["trusted_custom_origin"] = True
         effective_bedrock_auth_mode = self.bedrock_auth_mode
         if (
             self.provider == "bedrock"
@@ -351,6 +347,8 @@ class ConnectionConfig(ContractModel):
             serialized.pop("aws_access_key_id_env", None)
         if self.bedrock_auth_mode is None:
             serialized.pop("bedrock_auth_mode", None)
+        if not self.trusted_custom_origin:
+            serialized.pop("trusted_custom_origin", None)
         return serialized
 
 
@@ -635,6 +633,8 @@ class GatewayDeploymentMetadata(ContractModel):
     prices: GatewayTokenPrices = Field(default_factory=GatewayTokenPrices)
     pricing_source: str | None = Field(default=None, min_length=1, max_length=512)
     pricing_effective_at: AwareDatetime | None = None
+    dispatch: GatewayRungDispatchPolicy | None = None
+    """Optional dispatch policy for this rung; ``None`` is fully inert."""
 
 
 class GatewayEquivalenceCertification(ContractModel):

@@ -58,6 +58,9 @@ from exp.runtime.gateway.stream_contracts import (
     GatewayFailureClass as GatewayFailureClass,
 )
 from exp.runtime.gateway.stream_contracts import (
+    GatewayRefusalReason as GatewayRefusalReason,
+)
+from exp.runtime.gateway.stream_contracts import (
     GatewayUsage as GatewayUsage,
 )
 
@@ -286,6 +289,23 @@ class GatewayMessage(ContractModel):
     A message carrying it carries nothing else. Excluded from serialization
     like the other carriers so item-free digests are unperturbed; a present
     item joins replay identity through :func:`canonical_request_sha256`.
+    """
+    provider_anthropic_blocks: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
+    """The caller's assistant content blocks in their ORIGINAL order, when a
+    thinking block is among them.
+
+    The flattened fields (``content``, ``tool_calls``, ``provider_reasoning``)
+    lose the order of blocks within one assistant turn; the Anthropic wire
+    re-emits them as thinking, then text, then tool_use. With interleaved
+    thinking a turn is [thinking, tool_use, thinking, text, tool_use ...], and
+    Anthropic verifies the LATEST assistant message byte-for-byte against the
+    signatures it issued: a reordered turn is refused as "thinking or
+    redacted_thinking blocks in the latest assistant message cannot be
+    modified" (134 requests / 48h on one Messages-surface client,
+    2026-09-07). The Anthropic wire replays these verbatim when they are
+    present and the flattened reasoning was not narrowed; every other wire
+    keeps reading the flattened fields. Excluded from serialization like the
+    other carriers.
     """
     provider_anthropic_block: JsonObject | None = Field(default=None, exclude=True)
     """One verbatim Anthropic content block the gateway carries opaquely.
@@ -672,6 +692,10 @@ class GatewayRequest(ContractModel):
     :func:`canonical_request_sha256`: the same body at a different tier is a
     different provider price and schedule."""
     ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
+    """The caller sent ``parallel_tool_calls: false`` and at least one admitted
+    rung has no such wire control: the data plane serializes those rungs' tool
+    calls to one per turn instead. Disclosed through ``ignored_parameters``."""
+    serialize_tool_calls: bool = Field(default=False, exclude=True)
     """Disclosed compatibility decisions applied to this request.
 
     A plain field path names a control accepted but intentionally omitted
@@ -877,6 +901,20 @@ class AuthorizationSnapshot(ContractModel):
     attribution_label: str | None = Field(default=None, max_length=1024)
     """End-user attribution from the OpenAI ``safety_identifier`` (or deprecated
     ``user``) request field: content-free and never a credential."""
+    client_ip: str | None = Field(default=None, max_length=45)
+    """Caller IP from the TRUSTED proxy hop (``X-Real-IP``, else the RIGHTMOST
+    ``X-Forwarded-For`` entry; never the leftmost, which is client-forgeable),
+    for per-key IP allow/deny enforcement by the hosted authority. Content-free
+    and never a credential; ``None`` when no trusted hop yields an address (an
+    allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
+    fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
+    """Relative weight of this organization for fair-share rung admission.
+
+    Populated by the hosted store's ``authorize_request`` from its own org data
+    (paying tiers heavier than promo/free); the default 1 gives every caller an
+    equal share, which is byte-identical to pre-fair-share behavior. Read only
+    on rungs whose ``GatewayRungDispatchPolicy.fair_share`` is authored on.
+    """
 
 
 class ExecutionSnapshot(ContractModel):

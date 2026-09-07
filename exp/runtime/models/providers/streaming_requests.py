@@ -39,6 +39,8 @@ from exp.runtime.models.providers.fireworks import (
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     mid_conversation_system_present,
+    require_assistant_prefill_supported,
+    require_tool_names_supported,
     serves_reasoning_summary,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
@@ -263,9 +265,14 @@ def route_generation_parameter_requests(
             sampling_supported(profile, top_p=top_p) for profile in profiles
         )
 
+    # Sampling a rung cannot carry is DROPPED with disclosure, not refused; the
+    # 400 stays only for a value outside a supporting route's declared range
+    # (2026-09-06: 1,483 rejections / 289 orgs on one alias OpenAI itself refuses).
     if request.temperature is not None:
         if srn_only_block():
             ignore("temperature", "temperature->dropped(set_reasoning_effort_none)")
+        elif not all(sampling_supported(profile) for profile in profiles):
+            ignore("temperature", "temperature->dropped(unsupported_by_provider)")
         else:
             _require_route_numeric_parameter(
                 profiles,
@@ -278,6 +285,8 @@ def route_generation_parameter_requests(
     if request.top_p is not None:
         if srn_only_block(top_p=True):
             ignore("top_p", "top_p->dropped(set_reasoning_effort_none)")
+        elif not all(sampling_supported(profile, top_p=True) for profile in profiles):
+            ignore("top_p", "top_p->dropped(unsupported_by_provider)")
         else:
             _require_route_numeric_parameter(
                 profiles,
@@ -855,8 +864,9 @@ def route_generation_parameter_requests(
             code="invalid_parameter",
         )
 
-    # A system turn after conversation began has positional semantics that
-    # instruction-hoisting wires cannot preserve; those rungs narrow out.
+    require_assistant_prefill_supported(profiles, request)
+    require_tool_names_supported(profiles, request)
+    # A mid-conversation system turn narrows out instruction-hoisting wires.
     if mid_conversation_system_present(request) and any(
         profile.dialect in {"gemini_generate_content", "bedrock_converse_stream"}
         for profile in profiles
@@ -940,18 +950,19 @@ def route_generation_parameter_requests(
         )
     elif request.tool_choice == "none" and request.parallel_tool_calls is not None:
         ignore("parallel_tool_calls")
-    elif request.parallel_tool_calls is not None and any(
+    elif request.parallel_tool_calls is not None and all(
         profile.dialect in _NO_PARALLEL_TOOL_CONTROL_DIALECTS for profile in profiles
     ):
-        raise ProviderParameterError(
-            message=(
-                "The parameter 'parallel_tool_calls' is not supported by this model route. "
-                "Remove the field or choose a provider route with an explicit parallel-tool "
-                "control."
-            ),
-            param="parallel_tool_calls",
-            code="unsupported_parameter",
-        )
+        # No rung carries a parallel-tool control: `true` drops (provider default),
+        # `false` is serialized by the data plane; mixed routes shape per rung.
+        if request.parallel_tool_calls:
+            ignore("parallel_tool_calls", "parallel_tool_calls->dropped(provider_default)")
+        else:
+            ignore(
+                "parallel_tool_calls",
+                "parallel_tool_calls->emulated(serialized_by_gateway)",
+            )
+            provider_updates["serialize_tool_calls"] = True
 
     # A true logprob request changes the requested result. Until the normalized
     # response can return those arrays, reject it rather than pretending it ran.

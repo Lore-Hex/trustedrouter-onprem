@@ -17,6 +17,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 
+from exp.common.models.catalog import GatewayDeploymentCapabilities
+from exp.runtime.gateway.affinity import (
+    affinity_fingerprint,
+    affinity_seed_material,
+    rendezvous_order,
+)
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
@@ -29,6 +35,7 @@ from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.prompt_size import require_prompt_fits_context_window
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
 from exp.runtime.models.providers import (
     emulated_gateway_capabilities,
     preflight_gateway_request,
@@ -89,7 +96,8 @@ def admitted_route_requests(
     *,
     accounting: NativeAttemptAccounting,
     authorization: AuthorizationSnapshot,
-) -> tuple[GatewayRoute, _ResolvedWires, GatewayRequest, GatewayRequest]:
+    continuation: ContinuationContext | None = None,
+) -> tuple[GatewayRoute, _ResolvedWires, GatewayRequest, GatewayRequest, AffinityPlacement]:
     """Narrow one certified route to rungs that serve the admitted request.
 
     Args:
@@ -98,10 +106,14 @@ def admitted_route_requests(
         request: Canonical request produced by the public protocol decoder.
         accounting: Shared accounting owning the coercion counter.
         authorization: Frozen authority for the accepted request.
+        continuation: Responses continuation context when this request
+            continues a stored response; its original episode key keeps the
+            conversation's cache-affinity placement.
 
     Returns:
-        The narrowed route and wires plus the public request (carrying any
-        coercion disclosures) and the streaming-forced provider request.
+        The narrowed route and wires, the public request (carrying any
+        coercion disclosures), the streaming-forced provider request, and the
+        resolved affinity placement.
 
     Raises:
         ProviderParameterError: No rung preserves a generation control and no
@@ -205,6 +217,20 @@ def admitted_route_requests(
                 provider_request,
                 public_stream=public_request.stream,
             )
+    if not protocol_indexes and provider_request.parallel_tool_calls is not None:
+        # LAST resort for parallel_tool_calls: no rung honours the control
+        # natively (and no other coercion freed one), so admit the rungs whose
+        # only objection is that control. The data plane then drops `true`
+        # (the provider's default) or serializes `false` per rung, disclosed
+        # (native_bridge's per-rung shaping). A native rung is always
+        # preferred, which is why this pass runs after everything else.
+        protocol_indexes, protocol_errors = protocol_compatible_indexes(
+            route,
+            resolved_wires,
+            provider_request,
+            public_stream=public_request.stream,
+            emulate_parallel_tool_calls=True,
+        )
     if not protocol_indexes:
         if not protocol_errors:
             raise GatewayRoutingError("authorized route has no compatible deployment")
@@ -250,7 +276,15 @@ def admitted_route_requests(
         )
     provider_request = _with_cache_affinity(provider_request, authorization)
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
-    return route, resolved_wires, public_request, provider_request
+    route, resolved_wires, placement = _affinity_ordered_rungs(
+        route,
+        resolved_wires,
+        provider_request,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=continuation,
+    )
+    return route, resolved_wires, public_request, provider_request, placement
 
 
 def route_rejection(
@@ -318,6 +352,88 @@ def _prefer_cache_capable_rungs(
     return (
         reorder_route_deployments(route, order),
         tuple(resolved_wires[index] for index in order),
+    )
+
+
+def _affinity_ordered_rungs(
+    route: GatewayRoute,
+    resolved_wires: _ResolvedWires,
+    provider_request: GatewayRequest,
+    *,
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+    continuation: ContinuationContext | None,
+) -> tuple[GatewayRoute, _ResolvedWires, AffinityPlacement]:
+    """Dispatch rungs in sticky-then-rendezvous order on affinity pools.
+
+    Under ``maximize_cache_affinity`` the certified order is replaced by the
+    request fingerprint's rendezvous permutation over the surviving rungs, so
+    every worker sends one conversation to the same rung and, when that rung
+    sheds or dies, to the same deterministic alternate. Weights come from each
+    deployment's authored ``GatewayRungDispatchPolicy.affinity_weight``
+    (default 1.0). A live worker-local sticky binding is honored AHEAD of
+    rendezvous order (its rung holds the conversation's warm cache after a
+    spill), except when its rung is suppressed (throttled or circuit-open)
+    right now, in which case the binding is cleared so stickiness can never
+    pin a conversation to a dead lane. The cache-marker guarantee composes: a
+    cache-marked request on a route mixing marker-honoring and marker-dropping
+    wires still dispatches the marker-honoring group first, ordered within
+    each group. The other two failover modes are untouched.
+    """
+    if route.snapshot.failover_mode != "maximize_cache_affinity":
+        return route, resolved_wires, AffinityPlacement()
+    material = affinity_seed_material(
+        provider_request,
+        continuation_episode_key=None if continuation is None else continuation.episode_key,
+        request_id=authorization.request_id,
+    )
+    fingerprint = affinity_fingerprint(
+        organization_id=authorization.organization_id,
+        identity_id=authorization.identity_id,
+        material=material,
+    )
+    if len(resolved_wires) < 2:
+        return route, resolved_wires, AffinityPlacement(fingerprint=fingerprint)
+    weighted_rungs = tuple(
+        (
+            deployment.deployment_id,
+            (
+                1.0
+                if deployment.gateway.dispatch is None
+                or deployment.gateway.dispatch.affinity_weight is None
+                else deployment.gateway.dispatch.affinity_weight
+            ),
+        )
+        for deployment in route.deployments
+    )
+    order = rendezvous_order(fingerprint, weighted_rungs)
+    order, sticky_index = sticky_first_order(
+        order,
+        route,
+        fingerprint=fingerprint,
+        sticky=accounting.sticky,
+        health=accounting.health,
+        authorization=authorization,
+    )
+    if request_carries_cache_markers(provider_request):
+        marker_capable = frozenset(
+            index
+            for index, (profile, _client) in enumerate(resolved_wires)
+            if profile.dialect == "anthropic_messages"
+        )
+        if marker_capable and len(marker_capable) < len(resolved_wires):
+            order = (
+                *(index for index in order if index in marker_capable),
+                *(index for index in order if index not in marker_capable),
+            )
+    placement = AffinityPlacement(
+        fingerprint=fingerprint,
+        sticky_preferred=sticky_index is not None and order[0] == sticky_index,
+    )
+    return (
+        reorder_route_deployments(route, order),
+        tuple(resolved_wires[index] for index in order),
+        placement,
     )
 
 
@@ -396,6 +512,7 @@ def protocol_compatible_indexes(
     provider_request: GatewayRequest,
     *,
     public_stream: bool | None,
+    emulate_parallel_tool_calls: bool = False,
 ) -> tuple[tuple[int, ...], tuple[ProviderParameterError | ProviderCapabilityError, ...]]:
     """Select rungs that pass capability preflight and payload build.
 
@@ -422,7 +539,9 @@ def protocol_compatible_indexes(
                 model_capabilities=deployment.capabilities,
                 public_stream=public_stream,
                 route_provider=deployment.provider,
-                emulated_capabilities=emulated_gateway_capabilities(profile.dialect),
+                emulated_capabilities=emulated_gateway_capabilities(
+                    profile.dialect, emulate_parallel_tool_calls=emulate_parallel_tool_calls
+                ),
             )
             dialect_stream_payload(profile, provider_request)
         except (ProviderParameterError, ProviderCapabilityError) as exc:
@@ -430,6 +549,71 @@ def protocol_compatible_indexes(
             continue
         indexes.append(index)
     return tuple(indexes), tuple(errors)
+
+
+def shape_parallel_tool_calls(
+    request: GatewayRequest,
+    capabilities: GatewayDeploymentCapabilities,
+) -> tuple[GatewayRequest, str | None]:
+    """Shape ``parallel_tool_calls`` for one rung that may lack the control.
+
+    A rung whose wire carries the control forwards it verbatim. One that does
+    not gets ``true`` dropped (parallel calls are the provider's own default)
+    or ``false`` emulated: the data plane serializes that rung's stream to one
+    tool call per turn (``serialize_tool_calls``). Either way the caller reads
+    the disclosure in ``ignored_parameters``.
+
+    Args:
+        request: The streaming-forced provider request.
+        capabilities: The rung's deployment capability declaration.
+
+    Returns:
+        The request to build this rung's payload from, and the disclosure to
+        publish (``None`` when nothing changed).
+    """
+    if request.parallel_tool_calls is None or capabilities.supports_parallel_tool_calls:
+        return request, None
+    if request.parallel_tool_calls:
+        return (
+            request.model_copy(update={"parallel_tool_calls": None}),
+            "parallel_tool_calls->dropped(provider_default)",
+        )
+    return (
+        request.model_copy(update={"parallel_tool_calls": None, "serialize_tool_calls": True}),
+        "parallel_tool_calls->emulated(serialized_by_gateway)",
+    )
+
+
+def fold_parallel_tool_call_disclosures(
+    public_request: GatewayRequest,
+    disclosures: set[str],
+    *,
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+) -> GatewayRequest:
+    """Publish per-rung parallel-tool shaping like any other admission coercion.
+
+    Args:
+        public_request: The public request the admission answer carries.
+        disclosures: Distinct disclosures the per-rung shaping produced.
+        accounting: Shared accounting owning the coercion counter.
+        authorization: Frozen authority for the accepted request.
+
+    Returns:
+        The public request with the disclosures folded into
+        ``ignored_parameters`` (unchanged when there are none).
+    """
+    if not disclosures:
+        return public_request
+    ordered = tuple(sorted(disclosures))
+    record_admission_coercions(accounting, authorization, ordered)
+    return public_request.model_copy(
+        update={
+            "ignored_parameters": tuple(
+                dict.fromkeys((*public_request.ignored_parameters, *ordered))
+            )
+        }
+    )
 
 
 def record_admission_coercions(
