@@ -103,7 +103,7 @@ pub(crate) fn bearer_key(headers: &HeaderMap) -> Result<String, PublicError> {
 /// leftmost XFF token is client-forgeable per request, so it is never trusted;
 /// the rightmost entry is the one our own ingress appended. Content-free (an
 /// address), decoded latin-1 like every other header. `None` when no trusted hop
-/// yields a non-empty address — the hosted authority then treats the IP as
+/// yields a non-empty address. The hosted authority then treats the IP as
 /// unknown (an allowlist fails closed, a denylist open).
 pub(crate) fn client_ip(headers: &HeaderMap) -> Option<String> {
     if let Some(real) = latin1_header(headers, "x-real-ip") {

@@ -1466,7 +1466,7 @@ def test_temperature_narrows_to_a_honoring_rung_over_an_srn_rung() -> None:
 
 def test_genuinely_unsupported_sampling_drops_with_its_own_disclosure() -> None:
     """A route that never declares temperature (Anthropic constrained [1,1]) drops it
-    and says so — there is nothing to honor at any effort, so the disclosure names
+    and says so. There is nothing to honor at any effort, so the disclosure names
     the provider, not a reasoning-effort remedy, and the model still answers."""
     profile = GatewayWireProfile(
         dialect="anthropic_messages",
