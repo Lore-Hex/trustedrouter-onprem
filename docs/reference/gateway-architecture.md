@@ -271,7 +271,7 @@ a binding whose rung is throttled or circuit-open is cleared rather than followe
 deliberately worker-local (the serving edge's keep-alives pin a client to one worker; the
 cross-worker miss costs one cold dispatch). The binding keys on the affinity fingerprint (the
 session identity rendezvous already uses), never on a derived provider cache key: on
-OpenAI-compatible shim lanes (including Experiential Cloud's vLLM boxes) no `prompt_cache_key` is
+OpenAI-compatible shim lanes (including hosted vLLM boxes) no `prompt_cache_key` is
 forwarded and the box's prefix cache is content-addressed, so gateway-side session-to-rung
 consistency is the entire cache-preservation mechanism there. `fresh_session_spill_fraction`
 reserves the top slice

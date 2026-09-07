@@ -53,8 +53,8 @@ _EMPTY_OBSERVATION = RateLimitObservation()
 # Bounds on what a provider header may claim. The raw strings cross the
 # boundary unbounded (Python integers are arbitrary precision), and a value
 # past SQLite's signed 64-bit column would fail every settlement write for the
-# attempt — a wedge one hostile BYOK server header must never be able to
-# cause. A wait is clamped to a week (a longer ask is still "come back much
+# attempt. One hostile BYOK server header must never be able to cause that wedge.
+# A wait is clamped to a week (a longer ask is still "come back much
 # later" for the ledger; the health window clamps far tighter anyway); a
 # limit/remaining count past the sanity ceiling is garbage and reads as absent.
 MAXIMUM_RETRY_AFTER_SECONDS = 7 * 24 * 3_600
