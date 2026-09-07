@@ -1,6 +1,6 @@
 [project]
 name = "trustedrouter-onprem"
-version = "0.7.45"
+version = "0.7.46"
 description = "Run an on-premises model gateway with TrustedRouter as its managed backend."
 readme = "README.md"
 license = { file = "LICENSE" }
