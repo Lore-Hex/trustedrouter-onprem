@@ -8,7 +8,7 @@ layer.
 - Upstream repository: `https://github.com/experientiallabs/experiential`
 - Upstream branch: `main`
 - Initial reviewed commit: `c8220b0543ad6d5f426f831377f9efcd67be0aa1`
-- Last reviewed commit: `421a3b53cbfe32502727bcd97b62478048c84b51`
+- Last reviewed commit: `b3061af6787dfbca011e4782dc26529514206ad3`
 - Fork repository: `https://github.com/Lore-Hex/trustedrouter-onprem`
 
 ## Invariants
@@ -27,3 +27,22 @@ all of these properties:
 
 Each ported commit records the upstream SHA in its commit message. Conflicting or skipped commits
 are reported with a precise reason rather than being silently flattened into a later sync.
+
+## September 9, 2026 Review
+
+Nine commits after `421a3b53` were ported separately through upstream 0.7.60.
+The four release commits retain the `trustedrouter-onprem` distribution name and lockfile
+identity. The Vertex documentation retains the `tr-onprem` command, and tokenizer recovery
+errors name this distribution. No upstream commit was skipped.
+
+The ports accept validated Copilot image MIME hints, support explicitly configured Vertex
+Model Garden connections, reshape Anthropic-family tool schemas with admission disclosure,
+and accept the AI SDK `promptCacheKey` spelling. When both cache-key spellings occur, the
+canonical field wins and the ignored alias is disclosed. These compatibility changes do not
+introduce another default hosted provider or an automatic fallback from TrustedRouter.
+
+Input reservations now use a packaged, digest-checked tokenizer with 15 percent headroom,
+media estimates, and a long-context pricing margin. This is a planning estimate, not a hard
+upper bound; actual usage replaces it at settlement and can exceed the reservation. The
+tokenizer loads locally without a runtime download. Telemetry defaults and Apache attribution
+remain unchanged.
