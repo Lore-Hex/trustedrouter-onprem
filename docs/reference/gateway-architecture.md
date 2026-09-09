@@ -213,7 +213,13 @@ cover the local team, one identity, one alias pool, and each provider deployment
 An exhausted deployment allocation removes only that route from the current certified waterfall.
 If no route can fit the shared team, identity, or total pool allocation, the neutral protocol
 returns HTTP 429 with OpenAI `insufficient_quota` semantics before provider work. Any required
-unknown price makes that route ineligible while a hard limit applies.
+unknown price makes that route ineligible while a hard limit applies. The input half of every
+reservation is a realistic tokenizer estimate, not a byte bound: the prompt text, tool schemas,
+structured-output schema, and replayed provider carriers are counted once with the o200k BPE,
+inline media reserve documented planning constants instead of their base64 length, and the
+total carries fifteen percent headroom plus per-message and per-tool framing. The same number
+feeds the paid worst-case ceiling and the host's free-tier and token-rate windows; settlement
+replaces it with the provider's exact usage.
 
 A rung may author a `GatewayRungDispatchPolicy` on its gateway metadata (all fields inert by
 default). Its `concurrency_bound` is a per-worker in-flight cap enforced by pure in-process
@@ -285,10 +291,10 @@ not buy fair-share weight with prefixes the promotion already made costless).
 A deployment's price schedule may declare a long-context tier: a whole-request premium applied
 once provider-reported input tokens reach its threshold, matching both published tier schedules
 (Gemini reprices `prompts > 200k` entirely; Anthropic's Claude 4.6+ models serve the 1M window at
-standard pricing and carry no tier). Reservation prices the tier fail-safe through the canonical
-byte bound (bytes never undercount tokens), settlement selects the frozen schedule by actual
-input tokens, and a tier missing a required rate keeps threshold-crossing attempts honestly
-unpriced. The wait for each attempt's first provider byte scales with input size (a flat base
+standard pricing and carry no tier). Reservation treats the tier as reachable from a documented
+margin below its threshold (the input reservation is a tokenizer estimate with headroom, not a
+bound), settlement selects the frozen schedule by actual input tokens, and a tier missing a
+required rate keeps threshold-crossing attempts honestly unpriced. The wait for each attempt's first provider byte scales with input size (a flat base
 plus seconds per million approximate input tokens, both serving defaults with per-deployment
 overrides), so a 1M-token prefill is not misread as a dead lane while small requests keep the
 fail-fast bound.
@@ -333,6 +339,17 @@ Responses have separate allowlist decoders and field-specific OpenAI error respo
 convert to one canonical gateway request without conflating their wire contracts. The package also
 owns headers, response assembly, SSE framing, tool-call reconstruction, and official SDK
 compatibility.
+Chat image references accept Copilot's optional `image_url.media_type` MIME hint
+(`image/png`, `image/jpeg`, `image/gif`, or `image/webp`). The hint is validated and
+discarded before provider dispatch and canonical replay identity; the `url` and
+`detail` remain authoritative. A data URL keeps its embedded MIME type, and a
+remote URL is forwarded for the provider to fetch. Unknown image fields and
+malformed URLs or base64 remain rejected.
+Both OpenAI surfaces accept the Vercel AI SDK's camelCase `promptCacheKey` (sent verbatim by
+opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: it is renamed
+before manifest validation and decodes exactly as the documented field. When both spellings
+arrive, `prompt_cache_key` wins and the dropped alias is disclosed through `ignored_parameters`.
+It is the only camelCase spelling admitted; every other unknown top-level field stays a named 400.
 Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
 created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
 are accumulated in original order and validated only at the complete-call boundary.

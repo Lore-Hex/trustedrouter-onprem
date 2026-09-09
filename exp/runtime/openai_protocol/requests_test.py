@@ -972,6 +972,90 @@ def test_responses_decoder_captures_end_user_attribution() -> None:
     assert request.attribution_label == "sid-9"
 
 
+def test_chat_decoder_folds_the_ai_sdk_prompt_cache_key_alias() -> None:
+    """A camelCase-only ``promptCacheKey`` (Vercel AI SDK) decodes as ``prompt_cache_key``."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "promptCacheKey": "opencode-session-1",
+        }
+    )
+    request = decoded.request
+    assert request.prompt_cache_key == "opencode-session-1"
+    assert request.attribution_label is None
+    assert request.ignored_parameters == ()
+
+
+def test_chat_decoder_prefers_snake_case_over_the_alias_and_discloses_the_drop() -> None:
+    """Both spellings present: the documented wire field wins and the alias is disclosed."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "snake",
+            "promptCacheKey": "camel",
+        }
+    )
+    request = decoded.request
+    assert request.prompt_cache_key == "snake"
+    assert request.ignored_parameters == ("promptCacheKey->ignored(explicit_prompt_cache_key)",)
+
+
+def test_chat_decoder_validates_the_alias_value_as_prompt_cache_key() -> None:
+    """The alias is renamed, not trusted: its value meets the canonical field's contract."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "promptCacheKey": ["not", "a", "string"],
+            }
+        )
+    assert captured.value.status_code == 400
+    assert captured.value.detail.param == "prompt_cache_key"
+
+
+@pytest.mark.parametrize("field", ["safetyIdentifier", "maxTokens", "serviceTier"])
+def test_chat_decoder_still_rejects_other_camel_case_fields(field: str) -> None:
+    """Only ``promptCacheKey`` is aliased; every other camelCase field stays a named 400."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                field: "value",
+            }
+        )
+    assert captured.value.status_code == 400
+    assert captured.value.detail.code == "unsupported_parameter"
+    assert captured.value.detail.param == field
+
+
+def test_responses_decoder_folds_the_ai_sdk_prompt_cache_key_alias() -> None:
+    """The Responses surface folds ``promptCacheKey`` the same way as Chat."""
+    decoded = decode_responses(
+        {"model": "coding", "input": "hi", "promptCacheKey": "opencode-session-2"}
+    )
+    assert decoded.request.prompt_cache_key == "opencode-session-2"
+    assert decoded.request.ignored_parameters == ()
+    both = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "prompt_cache_key": "snake",
+            "promptCacheKey": "camel",
+        }
+    )
+    assert both.request.prompt_cache_key == "snake"
+    assert both.request.ignored_parameters == (
+        "promptCacheKey->ignored(explicit_prompt_cache_key)",
+    )
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses({"model": "coding", "input": "hi", "safetyIdentifier": "x"})
+    assert captured.value.detail.param == "safetyIdentifier"
+
+
 def test_responses_decoder_accepts_the_codex_request_shape() -> None:
     """store:false, include, ultra effort, and replayed reasoning all decode."""
     decoded = decode_responses(
@@ -1967,6 +2051,78 @@ def test_chat_decoder_retains_image_parts_in_caller_order() -> None:
     assert image.data == _PNG_BASE64
     assert image.media_type == "image/png"
     assert image.detail == "high"
+
+
+@pytest.mark.parametrize("media_type", ["image/png", "image/jpeg", "image/gif", "image/webp", None])
+@pytest.mark.parametrize(
+    "url", ["https://example.test/attachment", f"data:image/png;base64,{_PNG_BASE64}"]
+)
+def test_chat_image_media_type_hint_preserves_the_url_contract(
+    media_type: str | None, url: str
+) -> None:
+    """Copilot's MIME hint changes neither the image nor canonical replay identity.
+
+    The fourth message reproduces the reported field path. The URL remains
+    authoritative, including when its embedded MIME type differs from the hint.
+    """
+    image_url: JsonObject = {"url": url, "detail": "high"}
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [
+            {"role": "system", "content": "Help with screenshots."},
+            {"role": "user", "content": "Hello."},
+            {"role": "assistant", "content": "Send the screenshot."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": image_url},
+                    {"type": "text", "text": "What is this?"},
+                ],
+            },
+        ],
+    }
+    expected = decode_chat(body).request
+    image_url["media_type"] = media_type
+
+    actual = decode_chat(body).request
+
+    assert actual == expected
+    assert sha256_json(actual) == sha256_json(expected)
+    assert actual.images[0].data_url() == url
+    assert actual.images[0].detail == "high"
+    assert image_url["media_type"] == media_type
+
+
+@pytest.mark.parametrize(
+    ("image_url", "param"),
+    [
+        ({"url": "https://example.test/image", "media_type": 42}, "media_type"),
+        ({"url": "https://example.test/image", "media_type": {}}, "media_type"),
+        ({"url": "https://example.test/image", "media_type": "image/svg+xml"}, "media_type"),
+        ({"url": "https://example.test/image", "media_type": ""}, "media_type"),
+        (
+            {"url": "https://example.test/image", "media_type": "image/png", "unknown": True},
+            "unknown",
+        ),
+        ({"url": "ftp://example.test/image", "media_type": "image/png"}, None),
+        ({"url": "data:image/png;base64,%%%", "media_type": "image/png"}, None),
+    ],
+)
+def test_chat_image_media_type_hint_keeps_image_validation_strict(
+    image_url: JsonObject, param: str | None
+) -> None:
+    """The MIME hint cannot admit malformed images, unsupported hints, or unknown fields."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": [{"type": "image_url", "image_url": image_url}]}
+                ],
+            }
+        )
+    location = "messages.0.content.0.image_url"
+    assert raised.value.detail.param == (f"{location}.{param}" if param else location)
 
 
 def test_an_empty_text_part_beside_an_image_drops() -> None:
