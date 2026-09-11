@@ -8,7 +8,7 @@ layer.
 - Upstream repository: `https://github.com/experientiallabs/experiential`
 - Upstream branch: `main`
 - Initial reviewed commit: `c8220b0543ad6d5f426f831377f9efcd67be0aa1`
-- Last reviewed commit: `b3061af6787dfbca011e4782dc26529514206ad3`
+- Last reviewed and ported commit: `5fc325effb66125246280ea602cfdbfbf28aee98`
 - Fork repository: `https://github.com/Lore-Hex/trustedrouter-onprem`
 
 ## Invariants
@@ -46,3 +46,31 @@ media estimates, and a long-context pricing margin. This is a planning estimate,
 upper bound; actual usage replaces it at settlement and can exceed the reservation. The
 tokenizer loads locally without a runtime download. Telemetry defaults and Apache attribution
 remain unchanged.
+
+## September 11, 2026 Review
+
+Five commits after `b3061af6` were ported separately through upstream 0.7.63.
+Package-version conflicts retain the TrustedRouterOnPrem distribution, native extension
+description, and lockfile identity. DeepSeek's explicitly configured direct endpoint now
+replays assistant reasoning history and supplies empty reasoning fields when absent. Other
+origins, including the native TrustedRouter connection, do not gain that behavior.
+
+The native Chat stream parser withholds bytes after a complete function-argument object.
+It accepts whitespace, exact duplicate objects, and empty literals after an empty object;
+ambiguous trailing content remains an error. This is a disclosed compatibility adaptation,
+not a new provider fallback. Focused provider and native bridge tests cover the behavior.
+
+Six later commits through `b2609b86` are pending, not silently skipped:
+
+- `5235d8ec`: reasoning carriers on Messages and capability-declared reasoning replay.
+- `af2062aa`: release 0.7.64.
+- `43458c15`: explicitly authored cache-based throttle failover controls.
+- `c855f1e8`: release 0.7.65.
+- `0926168b`: Messages adaptation that drops unsupported server-tool declarations,
+  their history, citations, and named tool choices with disclosures instead of rejecting.
+- `b2609b86`: release 0.7.66.
+
+The server-tool adaptation changes request semantics and requires an explicit product-policy
+decision before it lands. The cache-based throttle policy also needs review against the
+prohibition on automatic fallback from TrustedRouter. Keep these commits in chronological
+order; do not import a later release marker while its behavior remains pending.

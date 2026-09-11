@@ -43,6 +43,18 @@ Output guardrail byte limits count the complete serialized completion, including
 tool IDs, tool names, arguments, and JSON framing.
 Provider-specific wire restrictions still apply when routing to a different API dialect.
 
+Streamed function-call arguments must assemble to one JSON object. On OpenAI-compatible
+Chat streams the gateway stops relaying argument deltas at the byte that closes that object:
+whatever the provider streams after it is withheld and judged at completion. A tail that is
+only whitespace, an exact repetition of the whole object, or (after a zero-argument `{}`)
+empty literals such as `""` is dropped and the call completes. Azure Foundry's DeepSeek shim
+can stream `{}` then `""` for zero-argument calls, so the deltas a client receives always
+concatenate to the completed call's bytes. Any other tail, and any syntax error inside the
+object, keeps the strict contract: the attempt fails as `malformed_response` (a provider
+fault, eligible to fail over to a later deployment), the ledger names the parse position and
+byte count, and the operator log names the tool; argument bytes are never logged or repaired
+by guessing.
+
 ## The data plane
 
 The gateway has exactly one data plane: a native Rust HTTP server compiled as
@@ -519,6 +531,25 @@ Route narrowing prefers exposing rungs and discloses
 including routes with no exposing rung. Gateway-issued carriers are recognized by their
 `x-trustedrouter-onprem-hunyuan-reasoning-v1:` scheme prefix and retain strict parsing,
 authentication, and route binding; malformed carriers never become plaintext history.
+
+DeepSeek's own origin (`https://api.deepseek.com`, `is_deepseek_base_url`) is a reasoning-HISTORY
+route by origin, independent of the exposure stamp (`GatewayWireProfile.deepseek_reasoning_history`).
+Its thinking mode, on by default, rejects a request that carries `tools` unless every assistant
+message of the current turn (after the last user message, text-only messages that precede a tool
+call included) carries `reasoning_content` (HTTP 400 ``The `reasoning_content` in the thinking
+mode must be passed back to the API.``), while accepting an empty string exactly like real
+reasoning anywhere, exempt messages included (verified live 2026-09-10). On that rung the Chat
+builder forwards caller plaintext `reasoning_content` verbatim on plain and tool-call turns alike,
+and every assistant message that arrives without the field or with an explicit `null` (a history
+started on another provider, or an OpenAI-compatible SDK that strips the extension) is backfilled
+with `reasoning_content: ""` — tool-call and text-only messages alike, since backfilling only
+tool-call turns left the "text message, then tool-call message" agent shape 400ing in production;
+no other origin is touched. The rung counts as a carrying
+rung for narrowing and disclosure (`replays_plaintext_reasoning`), so no drop is disclosed there.
+`reasoning_output_exposed` keeps its one meaning on DeepSeek: whether the caller SEES the reasoning
+deltas on output. Unstamped, the caller never receives reasoning to replay and the empty backfill
+is what keeps agent loops alive; stamped, the caller replays the real text and the backfill only
+covers turns minted elsewhere.
 
 Route admission preserves caller capabilities in three verbatim-preference layers before any
 coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`), generation
