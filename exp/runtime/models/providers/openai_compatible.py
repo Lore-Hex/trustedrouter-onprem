@@ -78,6 +78,7 @@ def openai_compatible_request(
     reasoning_effort: str | None = None,
     reasoning_wire_format: ReasoningWireFormat = "reasoning_effort",
     sampling_requires_reasoning_none: bool = False,
+    deepseek_reasoning_history: bool = False,
 ) -> JsonObject:
     """Convert a EXP request into one non-streaming Chat Completions payload.
 
@@ -97,6 +98,11 @@ def openai_compatible_request(
         supports_reasoning: Whether this exact model accepts a reasoning control.
         reasoning_effort: Optional catalog-pinned reasoning effort.
         reasoning_wire_format: Provider field used for normalized reasoning effort.
+        deepseek_reasoning_history: Whether this is DeepSeek's own origin, whose
+            thinking mode requires ``reasoning_content`` on every assistant message
+            of the current turn; every assistant message is backfilled with an
+            empty one (the typed request carries no reasoning to forward), the
+            same rule the streaming builder applies in ``openai_chat_message``.
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -106,7 +112,10 @@ def openai_compatible_request(
     """
     payload: JsonObject = {
         "model": model_id,
-        "messages": [_openai_message(message) for message in request.messages],
+        "messages": [
+            _openai_message(message, deepseek_reasoning_history=deepseek_reasoning_history)
+            for message in request.messages
+        ],
         "stream": False,
     }
     if request.tools:
@@ -485,6 +494,10 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._hunyuan_reasoning_route_sha256 = (
             reasoning_content_route_sha256(model) if is_hunyuan_base_url(self._base_url) else None
         )
+        # DeepSeek's own API enforces reasoning_content on every assistant
+        # message of the current turn in thinking mode (400 otherwise); both the
+        # streaming wire profile and the buffered request builder read this.
+        self._deepseek_reasoning_history = is_deepseek_base_url(self._base_url)
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
         """Return the Chat Completions wire profile for this connection."""
@@ -516,12 +529,11 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_output_exposed=(
                 self._reasoning_output_exposed and self._hunyuan_reasoning_route_sha256 is not None
             ),
-            # DeepSeek's own API enforces reasoning_content on assistant
-            # tool-call history in thinking mode (400 otherwise), so its rung
-            # replays caller plaintext and backfills the field WITHOUT the
-            # exposure stamp: a house lane that fails every agent loop by
-            # default is wrong, and the stamp only governs output exposure.
-            deepseek_reasoning_history=is_deepseek_base_url(self._base_url),
+            # The DeepSeek rung replays caller plaintext and backfills the
+            # field WITHOUT the exposure stamp: a house lane that fails every
+            # agent loop by default is wrong, and the stamp only governs
+            # output exposure.
+            deepseek_reasoning_history=self._deepseek_reasoning_history,
             # Tencent's prefix cache is per node behind its load balancer;
             # prompt_cache_key pins a session to one node (verified live
             # 2026-09-05). Other compatible servers may reject unknown fields,
@@ -547,6 +559,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_effort=self._reasoning_effort,
             reasoning_wire_format=self.reasoning_wire_format,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
+            deepseek_reasoning_history=self._deepseek_reasoning_history,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
@@ -566,8 +579,16 @@ class OpenRouterClient(OpenAICompatibleClient):
     reasoning_wire_format: ClassVar[ReasoningWireFormat] = "reasoning"
 
 
-def _openai_message(message: ModelMessage) -> JsonObject:
-    """Convert one EXP message while retaining assistant tool history."""
+def _openai_message(
+    message: ModelMessage, *, deepseek_reasoning_history: bool = False
+) -> JsonObject:
+    """Convert one EXP message while retaining assistant tool history.
+
+    On DeepSeek's own origin every assistant message gains ``reasoning_content: ""``:
+    the provider 400s a tools request when any assistant message of the current
+    turn lacks the field and accepts an empty one everywhere (see
+    ``openai_chat_message`` for the streaming twin of this rule).
+    """
     if message.role == "tool":
         return {
             "role": "tool",
@@ -592,6 +613,8 @@ def _openai_message(message: ModelMessage) -> JsonObject:
             }
             for call in action.tool_calls
         ]
+    if deepseek_reasoning_history:
+        payload["reasoning_content"] = ""
     return payload
 
 
