@@ -25,7 +25,9 @@ if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
 FORBIDDEN_REQUIREMENT = re.compile(
-    r"(?mi)^Requires-Dist:\s*(?:anthropic|environment-capture|gepa|mlx-lm|"
+    # Anthropic is a dev-only SDK drift-test dependency. The exact core set
+    # below still rejects it as a runtime requirement.
+    r"(?mi)^Requires-Dist:\s*(?:environment-capture|gepa|mlx-lm|"
     r"opentelemetry-proto|scikit-learn|transformers)(?:\s|[<>=;~!])"
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
